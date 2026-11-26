@@ -104,8 +104,17 @@ gh workflow run images.yml -f components=classifier
 
 ## Using them in KCM
 
-`kcm/values-ghcr.yaml` is the provider config that points the chart at this
-registry, and `kcm/verify.sh` reports which registry a cluster's sveltos pods
+Two ways in, depending on whether you can change KCM itself.
+
+**In KCM's own chart** -- `josef-hak/kcm@sveltos-images-ghcr` carries the same
+override as `templates/provider/projectsveltos/values.yaml`, one commit on top
+of `k0rdent/kcm@main`. A KCM built from that branch uses these images with no
+further configuration.
+
+**Over an unmodified KCM** -- `kcm/values-ghcr.yaml` is the same thing as
+provider config for `Management.spec.providers[name=projectsveltos].config`.
+
+Either way, `kcm/verify.sh` reports which registry a cluster's sveltos pods
 actually came from.
 
 With [ksm-tests](https://github.com/k0rdent/ksm-tests):
