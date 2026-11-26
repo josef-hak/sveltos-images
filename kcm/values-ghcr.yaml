@@ -1,0 +1,65 @@
+# Point KCM's projectsveltos provider at the images built in this repo.
+#
+# Goes into Management.spec.providers[name=projectsveltos].config, so every key
+# is nested one level under `projectsveltos:` -- the chart KCM installs is a
+# wrapper that declares the upstream chart of the same name as a dependency.
+#
+# The override is per component and not `global.registry`, deliberately.
+# global.registry is also what the chart passes as `--registry` to
+# addon-controller and classifier-manager, and that argument is how those two
+# build the image references for drift-detection-manager and sveltos-agent in
+# every managed cluster. Those two have no public sources and no build here, so
+# moving them to our registry would point them at tags that do not exist.
+# global.registry therefore stays docker.io and only the images we actually
+# publish are redirected.
+projectsveltos:
+  accessManager:
+    manager:
+      image:
+        registry: ghcr.io/josef-hak
+  addonController:
+    initialization:
+      image:
+        registry: ghcr.io/josef-hak
+    controller:
+      image:
+        registry: ghcr.io/josef-hak
+  classifierManager:
+    manager:
+      image:
+        registry: ghcr.io/josef-hak
+  clusterInventory:
+    manager:
+      image:
+        registry: ghcr.io/josef-hak
+  eventManager:
+    manager:
+      image:
+        registry: ghcr.io/josef-hak
+  hcManager:
+    manager:
+      image:
+        registry: ghcr.io/josef-hak
+  crdManagerJob:
+    crdManager:
+      image:
+        registry: ghcr.io/josef-hak
+  registerMgmtClusterJob:
+    registerMgmtCluster:
+      image:
+        registry: ghcr.io/josef-hak
+  scManager:
+    manager:
+      image:
+        registry: ghcr.io/josef-hak
+  shardController:
+    manager:
+      image:
+        registry: ghcr.io/josef-hak
+
+  # No build exists for either, so both stay off -- as KCM's own chart values
+  # already have them.
+  techsupportController:
+    enabled: false
+  mcpServer:
+    enabled: false
