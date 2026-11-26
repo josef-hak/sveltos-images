@@ -81,13 +81,25 @@ them means a build needs no Go toolchain on the host.
 
 ## Use
 
+Publishing is CI's job and only CI's -- `.github/workflows/images.yml` builds
+each component in its own runner and pushes with the job token. Locally you
+vendor and build; you do not push.
+
 ```sh
 bash scripts/vendor.sh                 # all, or name components to limit
-bash scripts/build.sh
-bash scripts/push.sh
+bash scripts/build.sh                  # builds into the local docker daemon
 
-VERSION=v1.18.0 bash scripts/vendor.sh # bump: re-vendor, rebuild, commit
+VERSION=v1.18.0 bash scripts/vendor.sh # bump: re-vendor, commit, let CI publish
 REGISTRY=my.registry/ns bash scripts/build.sh
+```
+
+A push to `main` that touches `src/`, `VERSION`, `components.env` or
+`scripts/` rebuilds and republishes everything. To rebuild without a commit,
+or to redo one component, run the workflow by hand:
+
+```sh
+gh workflow run images.yml                      # all of them
+gh workflow run images.yml -f components=classifier
 ```
 
 ## Using them in KCM
@@ -107,9 +119,10 @@ export SVELTOS_SCALE_ZERO=""     # keep every component up, so each image runs
 KUBECONFIG=./kcfg_k0rdent bash ../sveltos-images/kcm/verify.sh
 ```
 
-Until the images are on GHCR, a local cluster can be fed from the docker
-daemon instead -- the chart sets no `imagePullPolicy` and the tag is not
-`latest`, so `IfNotPresent` applies and a preloaded image is never pulled:
+A cluster can also be fed straight from the local docker daemon, which is how
+an unpublished build gets tested before it is on GHCR -- the chart sets no
+`imagePullPolicy` and the tag is not `latest`, so `IfNotPresent` applies and a
+preloaded image is never pulled:
 
 ```sh
 for i in $(docker images --format '{{.Repository}}:{{.Tag}}' | grep projectsveltos/); do
