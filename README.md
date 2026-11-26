@@ -85,3 +85,30 @@ bash scripts/push.sh
 VERSION=v1.18.0 bash scripts/vendor.sh # bump: re-vendor, rebuild, commit
 REGISTRY=my.registry/ns bash scripts/build.sh
 ```
+
+## Using them in KCM
+
+`kcm/values-ghcr.yaml` is the provider config that points the chart at this
+registry, and `kcm/verify.sh` reports which registry a cluster's sveltos pods
+actually came from.
+
+With [ksm-tests](https://github.com/k0rdent/ksm-tests):
+
+```sh
+cd ../ksm-tests
+eval "$(./scripts/kcm_default.sh --export)"
+export SVELTOS_VALUES="$HOME/sveltos-images/kcm/values-ghcr.yaml"
+export SVELTOS_SCALE_ZERO=""     # keep every component up, so each image runs
+./scripts/deploy_k0rdent.sh
+KUBECONFIG=./kcfg_k0rdent bash ../sveltos-images/kcm/verify.sh
+```
+
+Until the images are on GHCR, a local cluster can be fed from the docker
+daemon instead -- the chart sets no `imagePullPolicy` and the tag is not
+`latest`, so `IfNotPresent` applies and a preloaded image is never pulled:
+
+```sh
+for i in $(docker images --format '{{.Repository}}:{{.Tag}}' | grep projectsveltos/); do
+    docker save "$i" | docker exec -i k0rdent-<KCM> k0s ctr -n k8s.io images import --platform linux/amd64 -
+done
+```
