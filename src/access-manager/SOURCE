@@ -1,5 +1,5 @@
 upstream: https://github.com/projectsveltos/access-manager
-tag: v1.17.0
-commit: ce5ffc8aefb8fb9d4a1be264c3947bf75405fc00
-vendored: 2026-11-26T11:50:37Z
+tag: v1.18.0
+commit: 603ddc3dcdf09f0cf0a2077fb5e542f5ee5cafe6
+vendored: 2026-11-26T19:19:12Z
 pruned: .git doc/

@@ -4,16 +4,16 @@ Independent builds of the [Project Sveltos](https://github.com/projectsveltos)
 images that [k0rdent KCM](https://github.com/k0rdent/kcm) pulls, so KCM can run
 on images we built from sources we hold, instead of on `docker.io/projectsveltos`.
 
-Target version: **v1.17.0** (`VERSION`) -- the appVersion of the
-`projectsveltos` chart KCM 1.17.1 depends on.
+Target version: **v1.18.0** (`VERSION`) -- the appVersion of the
+`projectsveltos` chart 1.18.0 that `k0rdent/kcm@main` depends on.
 
 Images are published as `ghcr.io/josef-hak/projectsveltos/<name>:<version>`,
 publicly pullable, built and pushed by `.github/workflows/images.yml`. The
 name after the last `/` is kept identical to upstream's, so pointing the chart
 at the registry is a one-value change and nothing else has to be renamed.
 
-A KCM 1.14.0-dev install runs its whole sveltos stack on these images and
-passes all 13 ksm-tests scenarios -- see `notes/v1.17.0-test.md`.
+A KCM install runs its whole sveltos stack on these images and passes all 13
+ksm-tests scenarios -- see `notes/`, one file per version.
 
 ## What can and cannot be built
 
@@ -79,6 +79,16 @@ The build calls `docker build` directly instead of upstream's
 manifests in its own tree -- neither is an input to the image, and skipping
 them means a build needs no Go toolchain on the host.
 
+One difference from upstream's own image, since v1.18.0: its Dockerfiles now
+`COPY . .` with `.git` included, so the Go toolchain stamps the main module
+version into the binary's build info. A vendored tree has no `.git` -- it
+cannot, a nested one would make git treat `src/<dir>` as a submodule -- so
+`go version -m` on our binaries reports `(devel)` where upstream's reports the
+tag. Nothing reads that at runtime; where it shows up is image scanners. The
+version and the upstream commit are on the image either way, as the
+`org.opencontainers.image.version` and `.revision` labels, and the exact
+commit is in `src/<dir>/SOURCE`.
+
 ## Use
 
 Publishing is CI's job and only CI's -- `.github/workflows/images.yml` builds
@@ -89,7 +99,7 @@ vendor and build; you do not push.
 bash scripts/vendor.sh                 # all, or name components to limit
 bash scripts/build.sh                  # builds into the local docker daemon
 
-VERSION=v1.18.0 bash scripts/vendor.sh # bump: re-vendor, commit, let CI publish
+VERSION=v1.19.0 bash scripts/vendor.sh # bump: re-vendor, commit, let CI publish
 REGISTRY=my.registry/ns bash scripts/build.sh
 ```
 

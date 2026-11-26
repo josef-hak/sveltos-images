@@ -1,5 +1,5 @@
 upstream: https://github.com/projectsveltos/sveltosctl
-tag: v1.17.0
-commit: 3d4562380e9e55ca13a655d08d1a5c2bc053bba3
-vendored: 2026-11-26T11:50:41Z
+tag: v1.18.0
+commit: d06403dc0ec58e1f29df5d4e4b3a652360696443
+vendored: 2026-11-26T19:19:15Z
 pruned: .git doc/

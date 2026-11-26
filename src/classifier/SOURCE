@@ -1,4 +1,5 @@
 upstream: https://github.com/projectsveltos/classifier
-tag: v1.17.0
-commit: af2f480771c55b29c642eb64dd968c0153c28a0a
-vendored: 2026-11-26T11:48:35Z
+tag: v1.18.0
+commit: c914fc3052d2ae15a8d8bbe47ee52a8f7d7b95ca
+vendored: 2026-11-26T19:19:09Z
+pruned: .git doc/

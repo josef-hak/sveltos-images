@@ -1,5 +1,5 @@
 upstream: https://github.com/projectsveltos/crd-manager
-tag: v1.17.0
-commit: 1d084607c9c7bfcd400bc978fef304c51e732404
-vendored: 2026-11-26T11:50:39Z
+tag: v1.18.0
+commit: ed09e01d7793161ef2f3fcfb1d08bf2e457b00be
+vendored: 2026-11-26T19:19:13Z
 pruned: .git doc/

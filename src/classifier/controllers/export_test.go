@@ -18,6 +18,7 @@ package controllers
 
 import (
 	corev1 "k8s.io/api/core/v1"
+	"sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	libsveltosv1beta1 "github.com/projectsveltos/libsveltos/api/v1beta1"
 )
@@ -48,10 +49,12 @@ var (
 	DeployReloaderCRD                                 = deployReloaderCRD
 	DeployReloaderReportCRD                           = deployReloaderReportCRD
 	DeployDebuggingConfigurationCRD                   = deployDebuggingConfigurationCRD
+	DeployResourceSummaryCRD                          = deployResourceSummaryCRD
 	DeployClassifierInstance                          = deployClassifierInstance
 	DeploySveltosAgentInManagedCluster                = deploySveltosAgentInManagedCluster
 	PrepareSveltosApplierYAML                         = prepareSveltosApplierYAML
 	ClassifierHash                                    = classifierHash
+	AddAgentSettingsToHash                            = addAgentSettingsToHash
 	DeployClassifierInCluster                         = deployClassifierInCluster
 	UndeployClassifierFromCluster                     = undeployClassifierFromCluster
 	RemoveClassifierInstance                          = removeClassifierInstance
@@ -65,6 +68,14 @@ var (
 	GetSveltosAgentLabels                             = getSveltosAgentLabels
 	GetSveltosAgentNamespace                          = getSveltosAgentNamespace
 	GetSveltosAgentPatches                            = getSveltosAgentPatches
+	GetSveltosAgentPatchesForDeployment               = getSveltosAgentPatchesForDeployment
+	DeploySveltosAgentInGroup                         = deploySveltosAgentInGroup
+	DeploySveltosAgentOfCluster                       = deploySveltosAgentOfCluster
+	RemoveClusterFromSveltosAgentGroups               = removeClusterFromSveltosAgentGroups
+	PrepareSveltosAgentGroupYAML                      = prepareSveltosAgentGroupYAML
+	IsSveltosAgentGroupingEnabled                     = isSveltosAgentGroupingEnabled
+	IsSveltosAgentGroupDeployment                     = isSveltosAgentGroupDeployment
+	RemoveStaleGroupMembers                           = removeStaleGroupMembers
 	GetAgentWatchNamespaces                           = getAgentWatchNamespaces
 	GetSveltosApplierPatches                          = getSveltosApplierPatches
 
@@ -76,6 +87,7 @@ var (
 	GetHandlersForFeature = getHandlersForFeature
 
 	ProcessClassifier                      = (*ClassifierReconciler).processClassifier
+	GetCurrentHash                         = (*ClassifierReconciler).getCurrentHash
 	IsAgentHealthy                         = (*ClassifierReconciler).isAgentHealthy
 	RemoveClassifier                       = (*ClassifierReconciler).removeClassifier
 	RequeueClassifierForCluster            = (*ClassifierReconciler).requeueClassifierForCluster
@@ -123,3 +135,42 @@ var (
 	ApplyLabelsToCluster       = applyLabelsToCluster
 	RemoveLabelsFromCluster    = removeLabelsFromCluster
 )
+
+// Metrics exports for unit tests.
+var (
+	ProgramDuration        = programDuration
+	TrackClassifierOutcome = trackClassifierOutcome
+)
+
+// CountClusterMetricSeries returns how many per-cluster series exist for a cluster.
+func CountClusterMetricSeries(clusterNamespace, clusterName string) int {
+	names := map[string]bool{
+		metricNamespace + "_reconcile_duration_seconds":               true,
+		metricNamespace + "_reconcile_outcome_total":                  true,
+		metricNamespace + "_reconcile_last_success_timestamp_seconds": true,
+	}
+
+	families, err := metrics.Registry.Gather()
+	if err != nil {
+		return -1
+	}
+
+	count := 0
+	for _, f := range families {
+		if !names[f.GetName()] {
+			continue
+		}
+		for _, m := range f.GetMetric() {
+			labels := map[string]string{}
+			for _, l := range m.GetLabel() {
+				labels[l.GetName()] = l.GetValue()
+			}
+			if labels[metricClusterNamespaceLabel] == clusterNamespace &&
+				labels[metricClusterNameLabel] == clusterName {
+
+				count++
+			}
+		}
+	}
+	return count
+}

@@ -51,10 +51,13 @@ import (
 )
 
 const (
-	classifierCRDName            = "classifiers.lib.projectsveltos.io"
-	agentWatchNamespacesAnnotKey = "agent.projectsveltos.io/watch-namespaces"
-	watchNamespaceNs1            = "ns1"
-	watchNamespaceNs2            = "ns2"
+	classifierCRDName             = "classifiers.lib.projectsveltos.io"
+	agentWatchNamespacesAnnotKey  = "agent.projectsveltos.io/watch-namespaces"
+	watchNamespaceNs1             = "ns1"
+	watchNamespaceNs2             = "ns2"
+	debuggingConfigurationCRDName = "debuggingconfigurations.lib.projectsveltos.io"
+	resourceSummaryCRDName        = "resourcesummaries.lib.projectsveltos.io"
+	sveltosAgentDeploymentName    = "sveltos-agent-manager"
 )
 
 var _ = Describe("Classifier Deployer", func() {
@@ -106,6 +109,85 @@ var _ = Describe("Classifier Deployer", func() {
 
 		currentHash := controllers.ClassifierHash(classifier)
 		Expect(reflect.DeepEqual(currentHash, hash)).To(BeTrue())
+	})
+
+	It("addAgentSettingsToHash changes the hash when the registry or the NATS watcher change", func() {
+		defer controllers.SetSveltosAgentRegistry("")
+		defer controllers.SetSveltosAgentEnableNATS(false)
+
+		baseHash := controllers.ClassifierHash(getClassifierInstance(randomString()))
+
+		controllers.SetSveltosAgentRegistry("")
+		controllers.SetSveltosAgentEnableNATS(false)
+		// With default values the hash must not change, so an upgrade does not redeploy the agent
+		defaultHash := controllers.AddAgentSettingsToHash(baseHash)
+		Expect(defaultHash).To(Equal(baseHash))
+
+		controllers.SetSveltosAgentRegistry("registry-a.example")
+		registryAHash := controllers.AddAgentSettingsToHash(baseHash)
+		Expect(registryAHash).ToNot(Equal(defaultHash))
+
+		controllers.SetSveltosAgentRegistry("registry-b.example")
+		registryBHash := controllers.AddAgentSettingsToHash(baseHash)
+		Expect(registryBHash).ToNot(Equal(registryAHash))
+
+		// Going back to the default registry is detected as well
+		controllers.SetSveltosAgentRegistry("")
+		Expect(controllers.AddAgentSettingsToHash(baseHash)).To(Equal(defaultHash))
+
+		controllers.SetSveltosAgentEnableNATS(true)
+		Expect(controllers.AddAgentSettingsToHash(baseHash)).ToNot(Equal(defaultHash))
+	})
+
+	It("addAgentSettingsToHash changes the hash when sveltos-agent is disabled", func() {
+		defer controllers.SetSveltosAgentDisabled(false)
+
+		baseHash := controllers.ClassifierHash(getClassifierInstance(randomString()))
+
+		controllers.SetSveltosAgentDisabled(false)
+		// With default values the hash must not change, so an upgrade does not redeploy the agent
+		defaultHash := controllers.AddAgentSettingsToHash(baseHash)
+		Expect(defaultHash).To(Equal(baseHash))
+
+		controllers.SetSveltosAgentDisabled(true)
+		disabledHash := controllers.AddAgentSettingsToHash(baseHash)
+		Expect(disabledHash).ToNot(Equal(defaultHash))
+
+		// Enabling the agent again is detected as well
+		controllers.SetSveltosAgentDisabled(false)
+		Expect(controllers.AddAgentSettingsToHash(baseHash)).To(Equal(defaultHash))
+	})
+
+	It("getCurrentHash does not change with default registry and NATS settings", func() {
+		defer controllers.SetSveltosAgentRegistry("")
+		defer controllers.SetSveltosAgentEnableNATS(false)
+
+		dep := fakedeployer.GetClient(context.TODO(), logger, testEnv.Client)
+		Expect(dep.RegisterFeatureID(libsveltosv1beta1.FeatureClassifier)).To(Succeed())
+
+		cluster := prepareCluster()
+
+		classifierReconciler := getClassifierReconciler(testEnv.Client, dep)
+		classifier := getClassifierInstance(randomString())
+		classifierScope := getClassifierScope(testEnv.Client, logger, classifier)
+		f := controllers.GetHandlersForFeature(libsveltosv1beta1.FeatureClassifier)
+
+		// Hash computed before registry and NATS were part of it
+		expectedHash := controllers.ClassifierHash(classifier)
+
+		controllers.SetSveltosAgentRegistry("")
+		controllers.SetSveltosAgentEnableNATS(false)
+		currentHash, err := controllers.GetCurrentHash(classifierReconciler, context.TODO(), classifierScope, "",
+			getClusterRef(cluster), f, logger)
+		Expect(err).To(BeNil())
+		Expect(currentHash).To(Equal(expectedHash))
+
+		// Non default settings do change it
+		controllers.SetSveltosAgentRegistry("registry-a.example")
+		currentHash, err = controllers.GetCurrentHash(classifierReconciler, context.TODO(), classifierScope, "",
+			getClusterRef(cluster), f, logger)
+		Expect(err).To(BeNil())
+		Expect(currentHash).ToNot(Equal(expectedHash))
 	})
 
 	It("deployClassifierCRD deploys Classifier CRD", func() {
@@ -213,7 +295,21 @@ var _ = Describe("Classifier Deployer", func() {
 		Eventually(func() error {
 			dcCRD := &apiextensionsv1.CustomResourceDefinition{}
 			return testEnv.Get(context.TODO(),
-				types.NamespacedName{Name: "debuggingconfigurations.lib.projectsveltos.io"}, dcCRD)
+				types.NamespacedName{Name: debuggingConfigurationCRDName}, dcCRD)
+		}, timeout, pollingInterval).Should(BeNil())
+	})
+
+	It("deployResourceSummaryCRD deploys ResourceSummary CRD", func() {
+		cluster := prepareCluster()
+
+		Expect(controllers.DeployResourceSummaryCRD(context.TODO(), cluster.Namespace, cluster.Name, randomString(),
+			libsveltosv1beta1.ClusterTypeCapi, false, logger)).To(Succeed())
+
+		// Eventual loop so testEnv Cache is synced
+		Eventually(func() error {
+			rsCRD := &apiextensionsv1.CustomResourceDefinition{}
+			return testEnv.Get(context.TODO(),
+				types.NamespacedName{Name: resourceSummaryCRDName}, rsCRD)
 		}, timeout, pollingInterval).Should(BeNil())
 	})
 
@@ -295,6 +391,51 @@ var _ = Describe("Classifier Deployer", func() {
 		}, timeout, pollingInterval).Should(BeNil())
 	})
 
+	It("deployClassifierInCluster does not deploy sveltos-agent when sveltos-agent is disabled", func() {
+		defer controllers.SetSveltosAgentDisabled(false)
+
+		cluster := prepareCluster()
+		classifier := getClassifierInstance(randomString())
+		Expect(testEnv.Create(context.TODO(), classifier)).To(Succeed())
+		Expect(waitForObject(context.TODO(), testEnv.Client, classifier)).To(Succeed())
+
+		// testEnv simulates the managed cluster: make sure no sveltos-agent is left by other tests
+		agentKey := types.NamespacedName{Namespace: sveltosNamespace, Name: sveltosAgentDeploymentName}
+		currentSveltosAgent := &appsv1.Deployment{}
+		err := testEnv.Get(context.TODO(), agentKey, currentSveltosAgent)
+		if err == nil {
+			Expect(testEnv.Delete(context.TODO(), currentSveltosAgent)).To(Succeed())
+		}
+		Eventually(func() bool {
+			err := testEnv.Get(context.TODO(), agentKey, &appsv1.Deployment{})
+			return err != nil && apierrors.IsNotFound(err)
+		}, timeout, pollingInterval).Should(BeTrue())
+
+		controllers.SetSveltosAgentDisabled(true)
+		Expect(controllers.DeployClassifierInCluster(context.TODO(), testEnv.Client, cluster.Namespace, cluster.Name,
+			classifier.Name, libsveltosv1beta1.FeatureClassifier, libsveltosv1beta1.ClusterTypeCapi, deployer.Options{},
+			logger)).To(Succeed())
+
+		// CRDs consumed by components other than sveltos-agent are deployed
+		for _, crdName := range []string{
+			debuggingConfigurationCRDName,
+			resourceSummaryCRDName,
+		} {
+			Eventually(func() error {
+				return testEnv.Get(context.TODO(), types.NamespacedName{Name: crdName},
+					&apiextensionsv1.CustomResourceDefinition{})
+			}, timeout, pollingInterval).Should(BeNil())
+		}
+
+		// sveltos-agent is not deployed
+		Consistently(func() bool {
+			err := testEnv.Get(context.TODO(), agentKey, &appsv1.Deployment{})
+			return err != nil && apierrors.IsNotFound(err)
+		}, 5*time.Second, pollingInterval).Should(BeTrue())
+
+		removeFinalizersAndDeleteClassifier(classifier.Name)
+	})
+
 	It("processClassifier detects classifier needs to be deployed in cluster", func() {
 		dep := fakedeployer.GetClient(context.TODO(), logger, testEnv.Client)
 		Expect(dep.RegisterFeatureID(libsveltosv1beta1.FeatureClassifier)).To(Succeed())
@@ -333,6 +474,9 @@ var _ = Describe("Classifier Deployer", func() {
 
 		Expect(waitForObject(context.TODO(), testEnv.Client, classifier)).To(Succeed())
 
+		// With default registry and NATS settings, no patches, watch namespaces or kubeconfig, getCurrentHash
+		// returns the plain classifier hash: the one stored by a classifier-manager version that
+		// did not hash those settings (upgrade case).
 		hash := controllers.ClassifierHash(classifier)
 
 		// Create a ClassifierReport for the cluster carrying the current hash and provisioned status
@@ -637,7 +781,7 @@ var _ = Describe("Classifier Deployer", func() {
 		currentSveltosAgent := &appsv1.Deployment{}
 		Eventually(func() error {
 			return testEnv.Get(context.TODO(),
-				types.NamespacedName{Namespace: sveltosNamespace, Name: "sveltos-agent-manager"},
+				types.NamespacedName{Namespace: sveltosNamespace, Name: sveltosAgentDeploymentName},
 				currentSveltosAgent)
 		}, timeout, pollingInterval).Should(BeNil())
 

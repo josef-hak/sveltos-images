@@ -33,6 +33,7 @@ components "$@" | while IFS='|' read -r dir repo image; do
     --build-arg BUILDOS=linux \
     --build-arg TARGETARCH="$ARCH" \
     --build-arg GIT_VERSION="$VERSION" \
+    --build-arg GIT_COMMIT="$(awk '/^commit:/{print $2}' "$ROOT/src/$dir/SOURCE")" \
     --build-arg LDFLAGS="$(ldflags "$dir")" \
     -t "$REGISTRY/$image:$VERSION" \
     "$ROOT/src/$dir"

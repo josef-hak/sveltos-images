@@ -67,6 +67,7 @@ import (
 	"github.com/projectsveltos/addon-controller/controllers/dependencymanager"
 	"github.com/projectsveltos/addon-controller/internal/telemetry"
 	libsveltosv1beta1 "github.com/projectsveltos/libsveltos/api/v1beta1"
+	"github.com/projectsveltos/libsveltos/lib/clusterproxy"
 	"github.com/projectsveltos/libsveltos/lib/crd"
 	"github.com/projectsveltos/libsveltos/lib/deployer"
 	logs "github.com/projectsveltos/libsveltos/lib/logsettings"
@@ -82,10 +83,14 @@ var (
 	workers                      int
 	concurrentReconciles         int
 	agentInMgmtCluster           bool
+	disableSveltosAgent          bool
+	agentClustersPerInstance     int
 	reportMode                   controllers.ReportMode
 	tmpReportMode                int
 	restConfigQPS                float32
 	restConfigBurst              int
+	managedClusterQPS            float32
+	managedClusterBurst          int
 	webhookPort                  int
 	syncPeriod                   time.Duration
 	conflictRetryTime            time.Duration
@@ -113,6 +118,12 @@ const (
 	gibibytes_per_bytes = 1 << 30
 )
 
+// The init container never uses a lower rate towards the management cluster API server than this.
+const (
+	initContainerMinQPS   float32 = 100
+	initContainerMinBurst int     = 200
+)
+
 // Add RBAC for the authorized diagnostics endpoint.
 // +kubebuilder:rbac:groups=authentication.k8s.io,resources=tokenreviews,verbs=create
 // +kubebuilder:rbac:groups=authorization.k8s.io,resources=subjectaccessreviews,verbs=create
@@ -137,17 +148,11 @@ func Run() {
 	ctrlOptions := getCtrlOptions(scheme)
 
 	restConfig := getRestConfig()
+	clusterproxy.SetRestConfigLimits(managedClusterQPS, managedClusterBurst)
 
 	ctx := ctrl.SetupSignalHandler()
 
-	controllers.SetDriftdetectionConfigMap(driftDetectionConfigMap)
-	controllers.SetLuaConfigMap(luaConfigMap)
-	controllers.SetLuaCallStackSize(luaCallStackSize)
-	controllers.SetLuaRegistrySize(luaRegistrySize)
-	controllers.SetCAPIOnboardAnnotation(capiOnboardAnnotation)
-	controllers.SetDriftDetectionRegistry(registry)
-	controllers.SetAgentInMgmtCluster(agentInMgmtCluster)
-	controllers.SetSveltosNamespace(sveltosNamespace)
+	setControllersConfiguration(sveltosNamespace)
 
 	if isInitContainer() {
 		runInitContainerWork(ctx, restConfig, scheme)
@@ -167,6 +172,8 @@ func Run() {
 	}
 	// Setup the context that's going to be used in controllers and for the manager.
 	controllers.SetManagementClusterAccess(mgr.GetClient(), mgr.GetConfig(), dc)
+	// Not served from the cache: used to decide in which group of drift-detection-manager a cluster goes
+	controllers.SetManagementClusterAPIReader(mgr.GetAPIReader())
 
 	// Start dependency manager
 	dependencymanager.InitializeManagerInstance(ctx, mgr.GetClient(), autoDeployDependencies, ctrl.Log.WithName("dependency_manager"))
@@ -231,12 +238,42 @@ func getCacheConfig() (disableFor []client.Object, byObject map[client.Object]ca
 	return
 }
 
+// setControllersConfiguration hands the values of the flags to the controllers package
+func setControllersConfiguration(sveltosNamespace string) {
+	controllers.SetDriftdetectionConfigMap(driftDetectionConfigMap)
+	controllers.SetLuaConfigMap(luaConfigMap)
+	controllers.SetLuaCallStackSize(luaCallStackSize)
+	controllers.SetLuaRegistrySize(luaRegistrySize)
+	controllers.SetCAPIOnboardAnnotation(capiOnboardAnnotation)
+	controllers.SetDriftDetectionRegistry(registry)
+	controllers.SetAgentInMgmtCluster(agentInMgmtCluster)
+	controllers.SetSveltosAgentDisabled(disableSveltosAgent)
+	controllers.SetAgentClustersPerInstance(agentClustersPerInstance)
+	controllers.SetSveltosNamespace(sveltosNamespace)
+}
+
+// initAgentFlags defines the flags about where drift-detection-manager runs
+func initAgentFlags(fs *pflag.FlagSet) {
+	fs.BoolVar(&agentInMgmtCluster, "agent-in-mgmt-cluster", false,
+		"When set, indicates drift-detection-manager needs to be started in the management cluster")
+
+	fs.BoolVar(&disableSveltosAgent, "disable-sveltos-agent", false,
+		"Set when sveltos-agent is not deployed (classifier is started with --disable-sveltos-agent). "+
+			"Features relying on sveltos-agent are disabled: ClusterProfile/Profile healthMonitoring and reloader "+
+			"are ignored.")
+
+	fs.IntVar(&agentClustersPerInstance, "agent-clusters-per-instance", 1,
+		"Agentless mode only (requires --agent-in-mgmt-cluster). How many clusters one drift-detection-manager "+
+			"serves. 1 (the default) starts one drift-detection-manager per cluster. A higher value groups clusters "+
+			"of the same namespace and shard, and requires a Sveltos Enterprise license granting AgentGrouping "+
+			"(enforced by drift-detection-manager).")
+}
+
 func initFlags(fs *pflag.FlagSet) {
 	fs.IntVar(&tmpReportMode, "report-mode", defaulReportMode,
 		"Indicates how ReportSummaries need to be collected")
 
-	fs.BoolVar(&agentInMgmtCluster, "agent-in-mgmt-cluster", false,
-		"When set, indicates drift-detection-manager needs to be started in the management cluster")
+	initAgentFlags(fs)
 
 	fs.BoolVar(&disableCaching, "disable-secret-caching", false,
 		"When set, disable caching secrets and configmaps")
@@ -282,15 +319,25 @@ func initFlags(fs *pflag.FlagSet) {
 	fs.StringVar(&registry, "registry", "",
 		"Container registry for drift-detection images. Defaults to docker.io/ if empty.")
 
-	const defautlRestConfigQPS = 20
+	const defautlRestConfigQPS = 40
 	fs.Float32Var(&restConfigQPS, "kube-api-qps", defautlRestConfigQPS,
-		fmt.Sprintf("Maximum queries per second from the controller client to the Kubernetes API server. Defaults to %d",
-			defautlRestConfigQPS))
+		fmt.Sprintf("Maximum queries per second from the controller client to the management cluster Kubernetes API server. "+
+			"Defaults to %d", defautlRestConfigQPS))
 
-	const defaultRestConfigBurst = 60
+	const defaultRestConfigBurst = 120
 	fs.IntVar(&restConfigBurst, "kube-api-burst", defaultRestConfigBurst,
-		fmt.Sprintf("Maximum number of queries that should be allowed in one burst from the controller client to the Kubernetes API server. Default %d",
-			defaultRestConfigBurst))
+		fmt.Sprintf("Maximum number of queries that should be allowed in one burst from the controller client to the "+
+			"management cluster Kubernetes API server. Default %d", defaultRestConfigBurst))
+
+	const defaultManagedClusterRestConfigQPS = 20
+	fs.Float32Var(&managedClusterQPS, "managed-cluster-kube-api-qps", defaultManagedClusterRestConfigQPS,
+		fmt.Sprintf("Maximum queries per second from the controller client to the Kubernetes API server of each managed cluster. "+
+			"Defaults to %d", defaultManagedClusterRestConfigQPS))
+
+	const defaultManagedClusterRestConfigBurst = 60
+	fs.IntVar(&managedClusterBurst, "managed-cluster-kube-api-burst", defaultManagedClusterRestConfigBurst,
+		fmt.Sprintf("Maximum number of queries that should be allowed in one burst from the controller client to the "+
+			"Kubernetes API server of each managed cluster. Default %d", defaultManagedClusterRestConfigBurst))
 
 	const defaultWebhookPort = 9443
 	fs.IntVar(&webhookPort, "webhook-port", defaultWebhookPort,
@@ -802,22 +849,36 @@ func isInitContainer() bool {
 	return os.Getenv("IS_INITIALIZATION") == "true"
 }
 
+// getInitContainerRestConfig returns the rest config used by the init container. The init container
+// runs to completion before the manager starts and it only reads (and updates the status of)
+// ClusterSummary instances, so unlike the manager it can afford a higher rate towards the management
+// cluster API server: kube-api-qps and kube-api-burst are the rate limit it would otherwise be bound by.
+// A value configured above the init container minimums is never lowered.
+func getInitContainerRestConfig(config *rest.Config) *rest.Config {
+	initConfig := rest.CopyConfig(config)
+	initConfig.QPS = max(config.QPS, initContainerMinQPS)
+	initConfig.Burst = max(config.Burst, initContainerMinBurst)
+	return initConfig
+}
+
 func runInitContainerWork(ctx context.Context, config *rest.Config,
 	scheme *apimachineryruntime.Scheme) {
 
-	directClient, err := client.New(config, client.Options{Scheme: scheme})
+	initConfig := getInitContainerRestConfig(config)
+
+	directClient, err := client.New(initConfig, client.Options{Scheme: scheme})
 	if err != nil {
 		return
 	}
 
-	dc, err := discovery.NewDiscoveryClientForConfig(config)
+	dc, err := discovery.NewDiscoveryClientForConfig(initConfig)
 	if err != nil {
 		setupLog.Error(err, "unable to get discovery client")
 		os.Exit(1)
 	}
 
-	controllers.SetManagementClusterAccess(directClient, config, dc)
-	controllers.Initialization(ctx, config, scheme, shardKey,
+	controllers.SetManagementClusterAccess(controllers.NewInitCachingClient(directClient), initConfig, dc)
+	controllers.Initialization(ctx, initConfig, scheme, shardKey,
 		ctrl.Log.WithName("initialization"))
 }
 

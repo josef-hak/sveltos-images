@@ -647,6 +647,168 @@ var _ = Describe("ClustersummaryController", func() {
 		Expect(featureResourcesVerified).To(BeTrue())
 	})
 
+	It("getDependentClusterSummaryKeys returns the ClusterSummaries of the dependents for the same cluster", func() {
+		dependents := []corev1.ObjectReference{
+			{Kind: configv1beta1.ClusterProfileKind, Name: randomString(), APIVersion: configv1beta1.GroupVersion.String()},
+			{Kind: configv1beta1.ProfileKind, Name: randomString(), Namespace: namespace,
+				APIVersion: configv1beta1.GroupVersion.String()},
+		}
+
+		keys := controllers.GetDependentClusterSummaryKeys(clusterSummary, dependents)
+		Expect(keys).To(HaveLen(len(dependents)))
+		for i := range dependents {
+			Expect(keys[i].Namespace).To(Equal(clusterSummary.Namespace))
+			Expect(keys[i].Name).To(Equal(clusterops.GetClusterSummaryName(dependents[i].Kind, dependents[i].Name,
+				clusterName, false)))
+		}
+	})
+
+	It("retriggerClusterSummaries expires the cooldown and updates the retrigger annotation", func() {
+		dependent := &configv1beta1.ClusterSummary{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      randomString(),
+				Namespace: namespace,
+			},
+			Spec: configv1beta1.ClusterSummarySpec{
+				ClusterNamespace: cluster.Namespace,
+				ClusterName:      cluster.Name,
+				ClusterType:      libsveltosv1beta1.ClusterTypeCapi,
+			},
+		}
+		Expect(testEnv.Create(context.TODO(), dependent)).To(Succeed())
+		Expect(waitForObject(context.TODO(), testEnv.Client, dependent)).To(Succeed())
+
+		dependentKey := types.NamespacedName{Namespace: dependent.Namespace, Name: dependent.Name}
+		missingKey := types.NamespacedName{Namespace: namespace, Name: randomString()}
+
+		reconciler := &controllers.ClusterSummaryReconciler{
+			Client:       testEnv.Client,
+			Scheme:       scheme,
+			PolicyMux:    sync.Mutex{},
+			ClusterMap:   make(map[corev1.ObjectReference]*libsveltosset.Set),
+			ReferenceMap: make(map[corev1.ObjectReference]*libsveltosset.Set),
+			NextReconcileTimes: map[types.NamespacedName]controllers.ReconcileCooldown{
+				dependentKey: {Until: time.Now().Add(time.Hour), Generation: dependent.Generation},
+			},
+		}
+
+		// A ClusterSummary that does not exist anymore is skipped
+		controllers.RetriggerClusterSummaries(reconciler, context.TODO(), []types.NamespacedName{missingKey, dependentKey},
+			textlogger.NewLogger(textlogger.NewConfig()))
+
+		reconciler.PolicyMux.Lock()
+		cooldown, ok := reconciler.NextReconcileTimes[dependentKey]
+		reconciler.PolicyMux.Unlock()
+		// The entry is kept, but it is not in the future anymore
+		Expect(ok).To(BeTrue())
+		Expect(cooldown.Until.After(time.Now())).To(BeFalse())
+
+		Eventually(func() string {
+			currentDependent := &configv1beta1.ClusterSummary{}
+			err := testEnv.Get(context.TODO(), dependentKey, currentDependent)
+			if err != nil {
+				return ""
+			}
+			return currentDependent.Annotations["projectsveltos.io/retrigger"]
+		}, timeout, pollingInterval).ShouldNot(BeEmpty())
+	})
+
+	It("getPrerequisiteClusterSummaryKeys returns the ClusterSummaries of the profiles it depends on", func() {
+		prerequisites := []string{randomString(), randomString()}
+		clusterSummary.Spec.ClusterProfileSpec.DependsOn = prerequisites
+
+		keys := controllers.GetPrerequisiteClusterSummaryKeys(clusterSummary)
+		Expect(keys).To(HaveLen(len(prerequisites)))
+		for i := range prerequisites {
+			Expect(keys[i].Namespace).To(Equal(clusterSummary.Namespace))
+			Expect(keys[i].Name).To(Equal(clusterops.GetClusterSummaryName(configv1beta1.ClusterProfileKind,
+				prerequisites[i], clusterName, false)))
+		}
+	})
+
+	It("requeuePrerequisites retriggers only the prerequisites being deleted", func() {
+		deletingProfile := randomString()
+		activeProfile := randomString()
+		deletingName := clusterops.GetClusterSummaryName(configv1beta1.ClusterProfileKind, deletingProfile, clusterName, false)
+		activeName := clusterops.GetClusterSummaryName(configv1beta1.ClusterProfileKind, activeProfile, clusterName, false)
+
+		// The finalizer keeps the deleting ClusterSummary around with a DeletionTimestamp
+		deleting := &configv1beta1.ClusterSummary{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       deletingName,
+				Namespace:  namespace,
+				Finalizers: []string{configv1beta1.ClusterSummaryFinalizer},
+			},
+			Spec: configv1beta1.ClusterSummarySpec{
+				ClusterNamespace: cluster.Namespace,
+				ClusterName:      cluster.Name,
+				ClusterType:      libsveltosv1beta1.ClusterTypeCapi,
+			},
+		}
+		active := &configv1beta1.ClusterSummary{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      activeName,
+				Namespace: namespace,
+			},
+			Spec: configv1beta1.ClusterSummarySpec{
+				ClusterNamespace: cluster.Namespace,
+				ClusterName:      cluster.Name,
+				ClusterType:      libsveltosv1beta1.ClusterTypeCapi,
+			},
+		}
+		Expect(testEnv.Create(context.TODO(), deleting)).To(Succeed())
+		Expect(testEnv.Create(context.TODO(), active)).To(Succeed())
+		Expect(testEnv.Delete(context.TODO(), deleting)).To(Succeed())
+		Expect(waitForObject(context.TODO(), testEnv.Client, active)).To(Succeed())
+		Eventually(func() bool {
+			current := &configv1beta1.ClusterSummary{}
+			err := testEnv.Get(context.TODO(), types.NamespacedName{Namespace: namespace, Name: deletingName}, current)
+			return err == nil && !current.DeletionTimestamp.IsZero()
+		}, timeout, pollingInterval).Should(BeTrue())
+
+		deletingKey := types.NamespacedName{Namespace: namespace, Name: deletingName}
+		activeKey := types.NamespacedName{Namespace: namespace, Name: activeName}
+
+		reconciler := &controllers.ClusterSummaryReconciler{
+			Client:       testEnv.Client,
+			Scheme:       scheme,
+			PolicyMux:    sync.Mutex{},
+			ClusterMap:   make(map[corev1.ObjectReference]*libsveltosset.Set),
+			ReferenceMap: make(map[corev1.ObjectReference]*libsveltosset.Set),
+			DeletedInstances: map[types.NamespacedName]time.Time{
+				deletingKey: time.Now(),
+			},
+		}
+
+		// clusterSummary depends on the two ClusterSummaries above and on one that does not exist
+		clusterSummary.Spec.ClusterProfileSpec.DependsOn = []string{deletingProfile, activeProfile, randomString()}
+		controllers.RequeuePrerequisites(reconciler, context.TODO(), clusterSummary,
+			textlogger.NewLogger(textlogger.NewConfig()))
+
+		reconciler.PolicyMux.Lock()
+		_, ok := reconciler.DeletedInstances[deletingKey]
+		reconciler.PolicyMux.Unlock()
+		Expect(ok).To(BeFalse(), "the deleting ClusterSummary can be reconciled right away")
+
+		Eventually(func() string {
+			current := &configv1beta1.ClusterSummary{}
+			err := testEnv.Get(context.TODO(), deletingKey, current)
+			if err != nil {
+				return ""
+			}
+			return current.Annotations["projectsveltos.io/retrigger"]
+		}, timeout, pollingInterval).ShouldNot(BeEmpty())
+
+		Consistently(func() string {
+			current := &configv1beta1.ClusterSummary{}
+			err := testEnv.Get(context.TODO(), activeKey, current)
+			if err != nil {
+				return "error"
+			}
+			return current.Annotations["projectsveltos.io/retrigger"]
+		}, "2s", pollingInterval).Should(BeEmpty())
+	})
+
 	It("shouldReconcile returns true when mode is OneTime but not all helm charts are deployed", func() {
 		clusterSummary.Spec.ClusterProfileSpec.SyncMode = configv1beta1.SyncModeOneTime
 		clusterSummary.Spec.ClusterProfileSpec.HelmCharts = []configv1beta1.HelmChart{
@@ -1348,6 +1510,177 @@ var _ = Describe("ClustersummaryController", func() {
 		}
 	})
 
+	It("reconcileDelete removes the metrics of a deleted cluster", func() {
+		// No cluster.
+		initObjects := []client.Object{
+			clusterProfile,
+			clusterSummary,
+		}
+
+		c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(initObjects...).WithObjects(initObjects...).Build()
+
+		dep := fakedeployer.GetClient(context.TODO(), textlogger.NewLogger(textlogger.NewConfig()), c)
+		clusterSummaryReconciler := getClusterSummaryReconciler(c, dep)
+
+		logger := textlogger.NewLogger(textlogger.NewConfig())
+		clusterSummaryScope, err := scope.NewClusterSummaryScope(&scope.ClusterSummaryScopeParams{
+			Client:         c,
+			Logger:         logger,
+			ClusterSummary: clusterSummary,
+			ControllerName: testControllerNameSummary,
+		})
+		Expect(err).To(BeNil())
+
+		otherClusterName := randomString()
+		for _, name := range []string{cluster.Name, otherClusterName} {
+			for _, featureID := range []libsveltosv1beta1.FeatureID{
+				libsveltosv1beta1.FeatureHelm,
+				libsveltosv1beta1.FeatureResources,
+				libsveltosv1beta1.FeatureKustomize,
+			} {
+				controllers.ProgramDeployMetrics(time.Second, cluster.Namespace, name, string(featureID),
+					libsveltosv1beta1.ClusterTypeCapi, logger)
+			}
+		}
+
+		clusterLabels := clusterMetricLabels(cluster.Namespace, cluster.Name)
+		otherClusterLabels := clusterMetricLabels(cluster.Namespace, otherClusterName)
+		for _, name := range clusterMetrics {
+			Expect(hasMetricSeries(name, clusterLabels)).To(BeTrue(), name)
+			Expect(hasMetricSeries(name, otherClusterLabels)).To(BeTrue(), name)
+		}
+
+		result, err := controllers.ReconcileDelete(clusterSummaryReconciler, context.TODO(), clusterSummaryScope, logger)
+		Expect(err).To(BeNil())
+		Expect(result.RequeueAfter).To(BeZero())
+
+		for _, name := range clusterMetrics {
+			Expect(hasMetricSeries(name, clusterLabels)).To(BeFalse(), name)
+			Expect(hasMetricSeries(name, otherClusterLabels)).To(BeTrue(), name)
+		}
+	})
+
+	It("reconcileDelete waits for running deployer requests before removing the metrics of a deleted cluster", func() {
+		// No cluster.
+		initObjects := []client.Object{
+			clusterProfile,
+			clusterSummary,
+		}
+
+		c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(initObjects...).WithObjects(initObjects...).Build()
+
+		dep := fakedeployer.GetClient(context.TODO(), textlogger.NewLogger(textlogger.NewConfig()), c)
+		dep.StoreInProgress(cluster.Namespace, cluster.Name, clusterSummary.Name, string(libsveltosv1beta1.FeatureHelm),
+			libsveltosv1beta1.ClusterTypeCapi, false)
+		clusterSummaryReconciler := getClusterSummaryReconciler(c, dep)
+
+		logger := textlogger.NewLogger(textlogger.NewConfig())
+		clusterSummaryScope, err := scope.NewClusterSummaryScope(&scope.ClusterSummaryScopeParams{
+			Client:         c,
+			Logger:         logger,
+			ClusterSummary: clusterSummary,
+			ControllerName: testControllerNameSummary,
+		})
+		Expect(err).To(BeNil())
+
+		controllers.ProgramDeployMetrics(time.Second, cluster.Namespace, cluster.Name,
+			string(libsveltosv1beta1.FeatureHelm), libsveltosv1beta1.ClusterTypeCapi, logger)
+
+		result, err := controllers.ReconcileDelete(clusterSummaryReconciler, context.TODO(), clusterSummaryScope, logger)
+		Expect(err).To(BeNil())
+		Expect(result.RequeueAfter).ToNot(BeZero())
+
+		// The deploy finishes and records its metrics.
+		controllers.ProgramDeployMetrics(time.Second, cluster.Namespace, cluster.Name,
+			string(libsveltosv1beta1.FeatureHelm), libsveltosv1beta1.ClusterTypeCapi, logger)
+		clusterSummaryReconciler.Deployer = fakedeployer.GetClient(context.TODO(), logger, c)
+
+		result, err = controllers.ReconcileDelete(clusterSummaryReconciler, context.TODO(), clusterSummaryScope, logger)
+		Expect(err).To(BeNil())
+		Expect(result.RequeueAfter).To(BeZero())
+
+		clusterLabels := clusterMetricLabels(cluster.Namespace, cluster.Name)
+		for _, name := range clusterMetrics {
+			Expect(hasMetricSeries(name, clusterLabels)).To(BeFalse(), name)
+		}
+	})
+
+	It("reconcileDelete removes the metrics of a cluster once its last ClusterSummary is gone", func() {
+		// The cluster stays: both profiles stop matching it.
+		otherClusterProfile := &configv1beta1.ClusterProfile{
+			ObjectMeta: metav1.ObjectMeta{Name: clusterProfileNamePrefix + randomString()},
+		}
+		otherClusterSummary := getClusterSummaryWithFinalizer(configv1beta1.ClusterProfileKind, otherClusterProfile,
+			cluster)
+
+		controllerutil.AddFinalizer(clusterSummary, configv1beta1.ClusterSummaryFinalizer)
+		now := metav1.NewTime(time.Now())
+		clusterSummary.DeletionTimestamp = &now
+
+		initObjects := []client.Object{
+			clusterProfile,
+			otherClusterProfile,
+			clusterSummary,
+			otherClusterSummary,
+			cluster,
+		}
+
+		c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(initObjects...).WithObjects(initObjects...).Build()
+
+		dep := fakedeployer.GetClient(context.TODO(), textlogger.NewLogger(textlogger.NewConfig()), c)
+		clusterSummaryReconciler := getClusterSummaryReconciler(c, dep)
+
+		logger := textlogger.NewLogger(textlogger.NewConfig())
+
+		// reconcileDelete undeploys nothing: every feature is already removed.
+		reconcileDelete := func(cs *configv1beta1.ClusterSummary) {
+			noResourceSummary := false
+			for _, featureID := range []libsveltosv1beta1.FeatureID{
+				libsveltosv1beta1.FeatureHelm,
+				libsveltosv1beta1.FeatureResources,
+				libsveltosv1beta1.FeatureKustomize,
+			} {
+				cs.Status.FeatureSummaries = append(cs.Status.FeatureSummaries, configv1beta1.FeatureSummary{
+					FeatureID:               featureID,
+					Status:                  libsveltosv1beta1.FeatureStatusRemoved,
+					ResourceSummaryDeployed: &noResourceSummary,
+				})
+			}
+
+			clusterSummaryScope, err := scope.NewClusterSummaryScope(&scope.ClusterSummaryScopeParams{
+				Client:         c,
+				Logger:         logger,
+				ClusterSummary: cs,
+				ControllerName: testControllerNameSummary,
+			})
+			Expect(err).To(BeNil())
+
+			result, err := controllers.ReconcileDelete(clusterSummaryReconciler, context.TODO(), clusterSummaryScope,
+				logger)
+			Expect(err).To(BeNil())
+			Expect(result.RequeueAfter).To(BeZero())
+		}
+
+		controllers.ProgramDeployMetrics(time.Second, cluster.Namespace, cluster.Name,
+			string(libsveltosv1beta1.FeatureHelm), libsveltosv1beta1.ClusterTypeCapi, logger)
+		clusterLabels := clusterMetricLabels(cluster.Namespace, cluster.Name)
+
+		// otherClusterSummary still updates them.
+		reconcileDelete(clusterSummary)
+		for _, name := range clusterMetrics {
+			Expect(hasMetricSeries(name, clusterLabels)).To(BeTrue(), name)
+		}
+
+		Expect(c.Delete(context.TODO(), otherClusterSummary)).To(Succeed())
+		Expect(c.Get(context.TODO(), types.NamespacedName{Namespace: otherClusterSummary.Namespace,
+			Name: otherClusterSummary.Name}, otherClusterSummary)).To(Succeed())
+
+		reconcileDelete(otherClusterSummary)
+		for _, name := range clusterMetrics {
+			Expect(hasMetricSeries(name, clusterLabels)).To(BeFalse(), name)
+		}
+	})
+
 	It("reconcileDelete requeues and does not remove finalizer when cluster is present but not ready", func() {
 		controllerutil.AddFinalizer(clusterSummary, configv1beta1.ClusterSummaryFinalizer)
 		now := metav1.NewTime(time.Now())
@@ -1423,16 +1756,26 @@ var _ = Describe("ClustersummaryController", func() {
 		controllers.UpdateFeatureStatus(clusterSummaryReconciler, clusterSummaryScope, libsveltosv1beta1.FeatureHelm,
 			&failed, nil, fmt.Errorf("failed to install chart"), logger)
 
+		controllers.ProgramDeployMetrics(time.Second, cluster.Namespace, cluster.Name,
+			string(libsveltosv1beta1.FeatureHelm), libsveltosv1beta1.ClusterTypeCapi, logger)
+
 		clusterSummaryLabels := clusterSummaryMetricLabels(clusterSummary, configv1beta1.ClusterProfileKind, "",
 			clusterProfile.Name)
+		clusterLabels := clusterMetricLabels(cluster.Namespace, cluster.Name)
 		Expect(hasMetricSeries("projectsveltos_reconcile_consecutive_failures", clusterSummaryLabels)).To(BeTrue())
+		for _, name := range clusterMetrics {
+			Expect(hasMetricSeries(name, clusterLabels)).To(BeTrue(), name)
+		}
 
 		result, err := controllers.ReconcileDelete(clusterSummaryReconciler, context.TODO(), clusterSummaryScope, logger)
 		Expect(err).To(BeNil())
 		Expect(result.RequeueAfter).ToNot(BeZero())
 
-		// The ClusterSummary still exists, so its metrics keep reporting the failure.
+		// The ClusterSummary and its cluster still exist, so their metrics keep reporting.
 		Expect(hasMetricSeries("projectsveltos_reconcile_consecutive_failures", clusterSummaryLabels)).To(BeTrue())
+		for _, name := range clusterMetrics {
+			Expect(hasMetricSeries(name, clusterLabels)).To(BeTrue(), name)
+		}
 	})
 
 	It("areDependenciesDeployed returns true when all dependencies are deployed", func() {

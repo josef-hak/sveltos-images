@@ -15,9 +15,9 @@ jobs:
     - name: checkout
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
     - name: Set up Go
-      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
       with:
-        go-version: 1.27.3
+        go-version: 1.27.4
     - name: Build
       run: make build
     - name: FMT
@@ -34,9 +34,9 @@ jobs:
     - name: checkout
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
     - name: Set up Go
-      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
       with:
-        go-version: 1.27.3
+        go-version: 1.27.4
     - name: ut
       run: make test
       env:
@@ -47,9 +47,9 @@ jobs:
     - name: checkout
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
     - name: Set up Go
-      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
       with:
-        go-version: 1.27.3
+        go-version: 1.27.4
     - name: fv
       run: make create-cluster fv
       env:
@@ -60,9 +60,9 @@ jobs:
     - name: checkout
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
     - name: Set up Go
-      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
       with:
-        go-version: 1.27.3
+        go-version: 1.27.4
     - name: fv
       run: make create-cluster new-fv
       env:
@@ -73,9 +73,9 @@ jobs:
     - name: checkout
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
     - name: Set up Go
-      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
       with:
-        go-version: 1.27.3
+        go-version: 1.27.4
     - name: fv-sharding
       run: make create-cluster fv-sharding
       env:
@@ -86,11 +86,24 @@ jobs:
     - name: checkout
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
     - name: Set up Go
-      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
       with:
-        go-version: 1.27.3
+        go-version: 1.27.4
     - name: fv-agentless
       run: make create-cluster fv-agentless
+      env:
+        FV: true
+  FV_SVELTOS_AGENT_DISABLED:
+    runs-on: ubuntu-24.04
+    steps:
+    - name: checkout
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    - name: Set up Go
+      uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+      with:
+        go-version: 1.27.4
+    - name: fv-sveltos-agent-disabled
+      run: make create-cluster fv-sveltos-agent-disabled
       env:
         FV: true
   FV_OIDC:
@@ -99,9 +112,9 @@ jobs:
     - name: checkout
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
     - name: Set up Go
-      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
       with:
-        go-version: 1.27.3
+        go-version: 1.27.4
     - name: fv-oidc
       run: make create-cluster create-cluster-oidc fv-oidc
       env:
@@ -112,9 +125,9 @@ jobs:
     - name: checkout
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
     - name: Set up Go
-      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
       with:
-        go-version: 1.27.3
+        go-version: 1.27.4
     - name: fv-pullmode
       run: make create-cluster-pullmode fv-pullmode
       env:
@@ -125,9 +138,9 @@ jobs:
     - name: checkout
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
     - name: Set up Go
-      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
       with:
-        go-version: 1.27.3
+        go-version: 1.27.4
     - name: new-fv-pullmode
       run: make create-cluster-pullmode new-fv-pullmode
       env:
@@ -138,10 +151,29 @@ jobs:
     - name: checkout
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
     - name: Set up Go
-      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
       with:
-        go-version: 1.27.3
+        go-version: 1.27.4
     - name: fv
       run: make create-cluster-infra fv-namespace
       env:
         FV: true
+  FV_AGENTLESS_GROUPING:
+    # Post-merge only: the job needs the license in SVELTOS_FV_LICENSE, and environment secrets
+    # are never released to pull_request runs from a fork, so on a PR it would just fail.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    # Required so the SVELTOS_FV_LICENSE environment secret (below) is injected into this job.
+    environment: SVELTOS_FV_LICENSE
+    steps:
+    - name: checkout
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    - name: Set up Go
+      uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+      with:
+        go-version: 1.27.4
+    - name: fv-agentless-grouping
+      run: make create-cluster-agentless-grouping fv-agentless-grouping
+      env:
+        FV: true
+        SVELTOS_FV_LICENSE: ${{ secrets.SVELTOS_FV_LICENSE }}

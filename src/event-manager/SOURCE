@@ -1,4 +1,5 @@
 upstream: https://github.com/projectsveltos/event-manager
-tag: v1.17.0
-commit: 0155e43efb80baca3ea7709db34a23608c4771ee
-vendored: 2026-11-26T11:48:36Z
+tag: v1.18.0
+commit: 48c5168b174a187cf99657786bfd054bf79b3b80
+vendored: 2026-11-26T19:19:10Z
+pruned: .git doc/

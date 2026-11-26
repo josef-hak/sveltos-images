@@ -104,6 +104,10 @@ var (
 	SetFailureMessage                    = (*ClusterSummaryReconciler).setFailureMessage
 	ResetFeatureStatus                   = (*ClusterSummaryReconciler).resetFeatureStatus
 	PrepareForDeployment                 = (*ClusterSummaryReconciler).prepareForDeployment
+	GetDependentClusterSummaryKeys       = getDependentClusterSummaryKeys
+	RetriggerClusterSummaries            = (*ClusterSummaryReconciler).retriggerClusterSummaries
+	GetPrerequisiteClusterSummaryKeys    = getPrerequisiteClusterSummaryKeys
+	RequeuePrerequisites                 = (*ClusterSummaryReconciler).requeuePrerequisites
 
 	ConvertResultStatus                 = (*ClusterSummaryReconciler).convertResultStatus
 	RequeueClusterSummaryForReference   = (*ClusterSummaryReconciler).requeueClusterSummaryForReference
@@ -197,6 +201,7 @@ var (
 	DesiredValuesAreSubset                   = desiredValuesAreSubset
 	GetCredentialsAndCAFiles                 = getCredentialsAndCAFiles
 	GetInstantiatedChartIdentity             = getInstantiatedChartIdentity
+	ChartNameForResourceSummary              = chartNameForResourceSummary
 	GetHelmChartValuesFrom                   = getHelmChartValuesFrom
 	GetHelmChartInstantiatedValues           = getHelmChartInstantiatedValues
 	LocateChartWithTimeout                   = locateChartWithTimeout
@@ -256,6 +261,14 @@ var (
 	GetGlobalDriftDetectionManagerPatches            = getGlobalDriftDetectionManagerPatches
 	GetAgentWatchNamespaces                          = getAgentWatchNamespaces
 	PrepareDriftDetectionManagerYAML                 = prepareDriftDetectionManagerYAML
+	PrepareDriftDetectionManagerGroupYAML            = prepareDriftDetectionManagerGroupYAML
+	DeployDriftDetectionManagerInGroup               = deployDriftDetectionManagerInGroup
+	DeployDriftDetectionManagerOfCluster             = deployDriftDetectionManagerOfCluster
+	RemoveClusterFromDriftDetectionManagerGroups     = removeClusterFromDriftDetectionManagerGroups
+	GetDriftDetectionManagerPatches                  = getDriftDetectionManagerPatches
+	IsDriftDetectionGroupingEnabled                  = isDriftDetectionGroupingEnabled
+	IsDriftDetectionGroupDeployment                  = isDriftDetectionGroupDeployment
+	RemoveStaleGroupMembers                          = removeStaleGroupMembers
 )
 
 const (
@@ -311,6 +324,7 @@ var (
 var (
 	TrackDrifts           = trackDrifts
 	TrackMatchingClusters = trackMatchingClusters
+	ProgramDeployMetrics  = programDeployMetrics
 )
 
 var (
@@ -321,13 +335,15 @@ var (
 )
 
 var (
-	IsCRDEstablished      = isCRDEstablished
-	GetCRDObjects         = getCRDObjects
-	GetExistingCRDsPolicy = getExistingCRDsPolicy
-	InstallMissingCRDs    = installMissingCRDs
-	InstallChartCRDs      = installChartCRDs
-	WithRestConfig        = withRestConfig
-	GetHelmUpgradeClient  = getHelmUpgradeClient
+	IsCRDEstablished       = isCRDEstablished
+	GetCRDObjects          = getCRDObjects
+	GetExistingCRDsPolicy  = getExistingCRDsPolicy
+	InstallMissingCRDs     = installMissingCRDs
+	InstallChartCRDs       = installChartCRDs
+	UpgradeCRDs            = upgradeCRDs
+	FindRemovedCRDVersions = findRemovedCRDVersions
+	WithRestConfig         = withRestConfig
+	GetHelmUpgradeClient   = getHelmUpgradeClient
 )
 
 type (
@@ -343,7 +359,12 @@ func NewRestConfigGetter(cfg *rest.Config, namespace string) *RestConfigGetter {
 var (
 	UpdateClusterSummaryHelmHashes = updateClusterSummaryHelmHashes
 	SetHelmChartsPatchesHash       = setHelmChartsPatchesHash
+	GetInitWorkerCount             = getInitWorkerCount
+	RunConcurrently                = runConcurrently
+	WithInitPassCache              = withInitPassCache
 )
+
+const MaxInitWorkers = maxInitWorkers
 
 // SetManagementClusterConfigForTest overrides the cached management cluster rest.Config,
 // leaving managementClusterClient untouched, and returns the previous value so a test can
@@ -399,7 +420,9 @@ var (
 	BuildMonitoringHealthCheck         = buildMonitoringHealthCheck
 	BuildMonitoringClusterHealthCheck  = buildMonitoringClusterHealthCheck
 	QuoteLuaString                     = quoteLuaString
+	InstantiateWithLuaScript           = instantiateWithLuaScript
 	ReconcileHealthMonitoring          = (*ClusterSummaryReconciler).reconcileHealthMonitoring
+	IsReloaderEnabled                  = isReloaderEnabled
 	RemoveHealthMonitoring             = (*ClusterSummaryReconciler).removeHealthMonitoring
 	DefaultHealthCheckLivenessName     = defaultHealthCheckLivenessName
 	HealthMonitoringFlappingEvaluation = healthMonitoringFlappingEvaluations

@@ -1,4 +1,5 @@
 upstream: https://github.com/projectsveltos/healthcheck-manager
-tag: v1.17.0
-commit: 6eb4af6139635550252e9e32005cb8c185bfface
-vendored: 2026-11-26T11:48:37Z
+tag: v1.18.0
+commit: 06e84499c776d2e02e2249a7fd0b238c5f9b5e92
+vendored: 2026-11-26T19:19:10Z
+pruned: .git doc/

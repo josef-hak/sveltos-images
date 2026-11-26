@@ -38,6 +38,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
+	"k8s.io/client-go/rest"
 	cliflag "k8s.io/component-base/cli/flag"
 	"k8s.io/klog/v2"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
@@ -53,6 +54,7 @@ import (
 
 	"github.com/projectsveltos/classifier/controllers"
 	libsveltosv1beta1 "github.com/projectsveltos/libsveltos/api/v1beta1"
+	"github.com/projectsveltos/libsveltos/lib/clusterproxy"
 	"github.com/projectsveltos/libsveltos/lib/crd"
 	"github.com/projectsveltos/libsveltos/lib/deployer"
 	logs "github.com/projectsveltos/libsveltos/lib/logsettings"
@@ -67,12 +69,16 @@ var (
 	concurrentReconciles                  int
 	workers                               int
 	agentInMgmtCluster                    bool
+	disableSveltosAgent                   bool
+	agentClustersPerInstance              int
 	reportMode                            controllers.ReportMode
 	shardKey                              string
 	tmpReportMode                         int
 	managementClusterControlPlaneEndpoint string
 	restConfigQPS                         float32
 	restConfigBurst                       int
+	managedClusterQPS                     float32
+	managedClusterBurst                   int
 	webhookPort                           int
 	syncPeriod                            time.Duration
 	version                               string
@@ -113,9 +119,8 @@ func main() {
 
 	ctrlOptions := getCtrlOptions(scheme)
 
-	restConfig := ctrl.GetConfigOrDie()
-	restConfig.QPS = restConfigQPS
-	restConfig.Burst = restConfigBurst
+	restConfig := getRestConfig()
+	clusterproxy.SetRestConfigLimits(managedClusterQPS, managedClusterBurst)
 
 	mgr, err := ctrl.NewManager(restConfig, ctrlOptions)
 	if err != nil {
@@ -188,6 +193,18 @@ func initFlags(fs *pflag.FlagSet) {
 	fs.BoolVar(&agentInMgmtCluster, "agent-in-mgmt-cluster", false,
 		"When set, indicates drift-detection-manager needs to be started in the management cluster")
 
+	fs.BoolVar(&disableSveltosAgent, "disable-sveltos-agent", false,
+		"When set, sveltos-agent is not deployed. Only the CRDs needed by other Sveltos components "+
+			"(DebuggingConfiguration, ResourceSummary) are deployed in the managed clusters. Classifier, "+
+			"EventSource/EventTrigger, HealthCheck/ClusterHealthCheck and ClusterProfile.spec.reloader "+
+			"will not work, as they all rely on sveltos-agent.")
+
+	fs.IntVar(&agentClustersPerInstance, "agent-clusters-per-instance", 1,
+		"Agentless mode only (requires --agent-in-mgmt-cluster). How many clusters one sveltos-agent serves. "+
+			"1 (the default) starts one sveltos-agent per cluster. A higher value groups clusters of the same "+
+			"namespace, and requires a Sveltos Enterprise license granting AgentGrouping "+
+			"(enforced by sveltos-agent).")
+
 	fs.StringVar(&shardKey, "shard-key", "",
 		"If set, and report-mode is set to collect, this deployment will fetch only from clusters matching this shard")
 
@@ -229,15 +246,25 @@ func initFlags(fs *pflag.FlagSet) {
 	fs.BoolVar(&enableNatsWatcher, "enable-nats-watcher", false,
 		"Enable NATS.io configuration watcher on sveltos-agents to listen for cloud events. Disabled by default.")
 
-	const defautlRestConfigQPS = 20
+	const defautlRestConfigQPS = 40
 	fs.Float32Var(&restConfigQPS, "kube-api-qps", defautlRestConfigQPS,
-		fmt.Sprintf("Maximum queries per second from the controller client to the Kubernetes API server. Defaults to %d",
-			defautlRestConfigQPS))
+		fmt.Sprintf("Maximum queries per second from the controller client to the management cluster Kubernetes API server. "+
+			"Defaults to %d", defautlRestConfigQPS))
 
-	const defaultRestConfigBurst = 30
+	const defaultRestConfigBurst = 120
 	fs.IntVar(&restConfigBurst, "kube-api-burst", defaultRestConfigBurst,
-		fmt.Sprintf("Maximum number of queries that should be allowed in one burst from the controller client to the Kubernetes API server. Default %d",
-			defaultRestConfigBurst))
+		fmt.Sprintf("Maximum number of queries that should be allowed in one burst from the controller client to the "+
+			"management cluster Kubernetes API server. Default %d", defaultRestConfigBurst))
+
+	const defaultManagedClusterRestConfigQPS = 20
+	fs.Float32Var(&managedClusterQPS, "managed-cluster-kube-api-qps", defaultManagedClusterRestConfigQPS,
+		fmt.Sprintf("Maximum queries per second from the controller client to the Kubernetes API server of each managed cluster. "+
+			"Defaults to %d", defaultManagedClusterRestConfigQPS))
+
+	const defaultManagedClusterRestConfigBurst = 60
+	fs.IntVar(&managedClusterBurst, "managed-cluster-kube-api-burst", defaultManagedClusterRestConfigBurst,
+		fmt.Sprintf("Maximum number of queries that should be allowed in one burst from the controller client to the "+
+			"Kubernetes API server of each managed cluster. Default %d", defaultManagedClusterRestConfigBurst))
 
 	const defaultWebhookPort = 9443
 	fs.IntVar(&webhookPort, "webhook-port", defaultWebhookPort,
@@ -270,10 +297,14 @@ func isInitContainer() bool {
 // Extracted to keep main() within the funlen limit.
 func configureGlobalState(mgr ctrl.Manager, sveltosNamespace string) {
 	controllers.SetManagementClusterAccess(mgr.GetConfig(), mgr.GetClient())
+	// Not served from the cache: used to decide in which group of sveltos-agent a cluster goes
+	controllers.SetManagementClusterAPIReader(mgr.GetAPIReader())
 	controllers.SetSveltosAgentConfigMap(sveltosAgentConfigMap)
 	controllers.SetSveltosApplierConfigMap(sveltosApplierConfigMap)
 	controllers.SetSveltosAgentRegistry(registry)
 	controllers.SetAgentInMgmtCluster(agentInMgmtCluster)
+	controllers.SetSveltosAgentDisabled(disableSveltosAgent)
+	controllers.SetAgentClustersPerInstance(agentClustersPerInstance)
 	controllers.SetSveltosNamespace(sveltosNamespace)
 }
 
@@ -423,6 +454,14 @@ func getDiagnosticsOptions() metricsserver.Options {
 		SecureServing:  true,
 		FilterProvider: filters.WithAuthenticationAndAuthorization,
 	}
+}
+
+// getRestConfig returns the rest.Config for the management cluster, with the configured QPS and burst.
+func getRestConfig() *rest.Config {
+	restConfig := ctrl.GetConfigOrDie()
+	restConfig.QPS = restConfigQPS
+	restConfig.Burst = restConfigBurst
+	return restConfig
 }
 
 func getCtrlOptions(scheme *runtime.Scheme) ctrl.Options {
