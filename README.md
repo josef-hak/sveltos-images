@@ -7,9 +7,13 @@ on images we built from sources we hold, instead of on `docker.io/projectsveltos
 Target version: **v1.17.0** (`VERSION`) -- the appVersion of the
 `projectsveltos` chart KCM 1.17.1 depends on.
 
-Images are published as `ghcr.io/josef-hak/projectsveltos/<name>:<version>`.
-The name after the last `/` is kept identical to upstream's, so pointing the
-chart at the registry is a one-value change and nothing else has to be renamed.
+Images are published as `ghcr.io/josef-hak/projectsveltos/<name>:<version>`,
+publicly pullable, built and pushed by `.github/workflows/images.yml`. The
+name after the last `/` is kept identical to upstream's, so pointing the chart
+at the registry is a one-value change and nothing else has to be renamed.
+
+A KCM 1.14.0-dev install runs its whole sveltos stack on these images and
+passes all 13 ksm-tests scenarios -- see `notes/v1.17.0-test.md`.
 
 ## What can and cannot be built
 
