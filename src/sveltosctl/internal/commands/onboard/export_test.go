@@ -1,0 +1,59 @@
+/*
+Copyright 2022. projectsveltos.io. All rights reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package onboard
+
+var (
+	OnboardSveltosCluster                     = onboardSveltosCluster
+	OnboardSveltosClusterInPullMode           = onboardSveltosClusterInPullMode
+	OnboardSveltosClusterWithWorkloadIdentity = onboardSveltosClusterWithWorkloadIdentity
+	BuildEKSWorkloadIdentityConfig            = buildEKSWorkloadIdentityConfig
+	BuildGKEWorkloadIdentityConfig            = buildGKEWorkloadIdentityConfig
+	BuildAKSWorkloadIdentityConfig            = buildAKSWorkloadIdentityConfig
+	PrepareApplierYAML                        = prepareApplierYAML
+	DeregisterSveltosCluster                  = deregisterSveltosCluster
+	DeletePullModeResources                   = deletePullModeResources
+	DeletePushModeResources                   = deletePushModeResources
+	DeleteWorkloadIdentityResources           = deleteWorkloadIdentityResources
+	DeleteServiceAccount                      = deleteServiceAccount
+	DeleteSecret                              = deleteSecret
+	DeleteRole                                = deleteRole
+	DeleteRoleBinding                         = deleteRoleBinding
+	DeleteClusterRole                         = deleteClusterRole
+	DeleteClusterRoleBinding                  = deleteClusterRoleBinding
+	CreateTokenRenewalRole                    = createTokenRenewalRole
+	CreateTokenRenewalRoleBinding             = createTokenRenewalRoleBinding
+	CreateSveltosCluster                      = createSveltosCluster
+	UpdateSveltosClusterLabelsAndAnnotations  = updateSveltosClusterLabelsAndAnnotations
+	CreateManagementClusterURLConfigMap       = createManagementClusterURLConfigMap
+	DeleteConfigMap                           = deleteConfigMap
+	ValidateManagementClusterURL              = validateManagementClusterURL
+	ParsePullModeArgs                         = parsePullModeArgs
+)
+
+const (
+	SveltosKubeconfigSecretNamePostfix    = sveltosKubeconfigSecretNamePostfix
+	SveltosCASecretNamePostfix            = sveltosCASecretNamePostfix
+	Kubeconfig                            = kubeconfig
+	CAKey                                 = caKey
+	TokenRenewalRBACNamePostfix           = tokenRenewalRBACNamePostfix
+	SveltosClusterManagerServiceAccount   = sveltosClusterManagerServiceAccount
+	SveltosClusterManagerNamespaceDefault = sveltosClusterManagerNamespaceDefault
+	ManagementClusterURLConfigMapKey      = managementClusterURLConfigMapKey
+	ManagementClusterCAConfigMapKey       = managementClusterCAConfigMapKey
+	ShardingAnnotationKey                 = shardingAnnotationKey
+	WatchNamespacesAnnotationKey          = watchNamespacesAnnotationKey
+)

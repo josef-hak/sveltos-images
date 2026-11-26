@@ -1,0 +1,2291 @@
+/*
+Copyright 2022-23. projectsveltos.io. All rights reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package controllers
+
+import (
+	"context"
+	"crypto/rand"
+	"errors"
+	"fmt"
+	"math/big"
+	"sync"
+	"syscall"
+	"time"
+
+	sourcev1 "github.com/fluxcd/source-controller/api/v1"
+	"github.com/go-logr/logr"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/events"
+	"k8s.io/client-go/util/workqueue"
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
+	"sigs.k8s.io/cluster-api/util/annotations"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/controller-runtime/pkg/source"
+
+	configv1beta1 "github.com/projectsveltos/addon-controller/api/v1beta1"
+	"github.com/projectsveltos/addon-controller/controllers/chartmanager"
+	"github.com/projectsveltos/addon-controller/lib/clusterops"
+	"github.com/projectsveltos/addon-controller/pkg/scope"
+	libsveltosv1beta1 "github.com/projectsveltos/libsveltos/api/v1beta1"
+	"github.com/projectsveltos/libsveltos/lib/clusterproxy"
+	"github.com/projectsveltos/libsveltos/lib/deployer"
+	"github.com/projectsveltos/libsveltos/lib/eventreasons"
+	license "github.com/projectsveltos/libsveltos/lib/licenses"
+	logs "github.com/projectsveltos/libsveltos/lib/logsettings"
+	predicates "github.com/projectsveltos/libsveltos/lib/predicates"
+	"github.com/projectsveltos/libsveltos/lib/pullmode"
+	libsveltosset "github.com/projectsveltos/libsveltos/lib/set"
+	"github.com/projectsveltos/libsveltos/lib/sharding"
+	libsveltostemplate "github.com/projectsveltos/libsveltos/lib/template"
+)
+
+const (
+	// deleteRequeueAfter is how long to wait before checking again during delete
+	deleteRequeueAfter = 10 * time.Second
+
+	// pausedClustersRequeueAfter is how long a ClusterProfile/Profile being deleted waits before checking again
+	// when all its remaining ClusterSummaries are for paused clusters. Unpausing a cluster reconciles the
+	// ClusterProfile/Profile right away: this is only a safety net.
+	pausedClustersRequeueAfter = 10 * time.Minute
+
+	// deleteHandOverRequeueAfter is how long to wait before checking again during an hand over
+	deleteHandOverRequeueAfter = 2 * time.Minute
+
+	// normalRequeueAfter is how long to wait before checking again to see if the cluster can be moved
+	// to ready after or workload features (for instance ingress or reporter) have failed
+	normalRequeueAfter = 10 * time.Second
+
+	// dryRunRequeueAfter is how long to wait before reconciling a ClusterSummary in DryRun mode
+	dryRunRequeueAfter = 60 * time.Second
+
+	// licenseRequeueAfter is how long to wait before retrying after a license fetch error
+	licenseRequeueAfter = 60 * time.Second
+)
+
+type ReportMode int
+
+const (
+	// Default mode. In this mode, addon-controller running
+	// in the management cluster periodically collects/processes
+	// ResourceSummaries from Sveltos/CAPI Clusters
+	CollectFromManagementCluster ReportMode = iota
+
+	// In this mode, drift detection manager sends ResourceSummaries
+	// updates to management cluster.
+	AgentSendUpdatesNoGateway
+)
+
+const (
+	clusterPausedMessage = "Cluster is paused"
+
+	rateLimiterBaseDelay = 1 * time.Second
+	rateLimiterMaxDelay  = 5 * time.Minute
+)
+
+// ClusterSummaryReconciler reconciles a ClusterSummary object
+type ClusterSummaryReconciler struct {
+	*rest.Config
+	client.Client
+	Scheme               *runtime.Scheme
+	Logger               logr.Logger
+	ReportMode           ReportMode
+	ShardKey             string // when set, only clusters matching the ShardKey will be reconciled
+	Version              string
+	Deployer             deployer.DeployerInterface
+	ConcurrentReconciles int
+	PolicyMux            sync.Mutex                                    // use a Mutex to update Map as MaxConcurrentReconciles is higher than one
+	ReferenceMap         map[corev1.ObjectReference]*libsveltosset.Set // key: Referenced object; value: set of all ClusterSummaries referencing the resource
+	ClusterMap           map[corev1.ObjectReference]*libsveltosset.Set // key: Sveltos/Cluster; value: set of all ClusterSummaries for that Cluster
+
+	ConflictRetryTime    time.Duration
+	HealthErrorRetryTime time.Duration
+	ctrl                 controller.Controller
+
+	eventRecorder events.EventRecorder
+
+	DeletedInstances   map[types.NamespacedName]time.Time
+	NextReconcileTimes map[types.NamespacedName]reconcileCooldown // in-memory cooldown, survives status-patch conflicts
+}
+
+// reconcileCooldown tracks when a ClusterSummary may next be reconciled and the spec
+// generation that was current when the cooldown was set. If the generation has advanced
+// (i.e. the spec changed) the cooldown is discarded so the new spec takes effect
+// immediately.
+type reconcileCooldown struct {
+	Until      time.Time
+	Generation int64
+}
+
+// If the drift-detection component is deployed in the management cluster, the addon-controller will deploy ResourceSummaries within the same cluster,
+// thus requiring the necessary permissions.
+
+//+kubebuilder:rbac:groups=config.projectsveltos.io,resources=clustersummaries,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups=config.projectsveltos.io,resources=clustersummaries/status,verbs=get;update;patch
+//+kubebuilder:rbac:groups=config.projectsveltos.io,resources=clustersummaries/finalizers,verbs=update;patch
+//+kubebuilder:rbac:groups=config.projectsveltos.io,resources=clusterconfigurations,verbs=get;list;watch
+//+kubebuilder:rbac:groups=config.projectsveltos.io,resources=clusterconfigurations/status,verbs=get;list;update
+//+kubebuilder:rbac:groups=config.projectsveltos.io,resources=clusterreports,verbs=get;list;watch
+//+kubebuilder:rbac:groups=config.projectsveltos.io,resources=clusterreports/status,verbs=get;list;update
+//+kubebuilder:rbac:groups=lib.projectsveltos.io,resources=resourcesummaries,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups=lib.projectsveltos.io,resources=resourcesummaries/status,verbs=get;list;update
+//+kubebuilder:rbac:groups=lib.projectsveltos.io,resources=reloaders,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups="events.k8s.io",resources=events,verbs=create;update;patch
+//+kubebuilder:rbac:groups=lib.projectsveltos.io,resources=configurationgroups,verbs=get;list;watch;create;delete;update;patch
+//+kubebuilder:rbac:groups=lib.projectsveltos.io,resources=configurationgroups/status,verbs=get;list;watch
+//+kubebuilder:rbac:groups=lib.projectsveltos.io,resources=configurationbundles,verbs=get;list;watch;create;delete;update;patch
+//+kubebuilder:rbac:groups=lib.projectsveltos.io,resources=configurationbundles/status,verbs=get;list;watch;update
+//+kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
+//+kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;delete
+//+kubebuilder:rbac:groups=controlplane.cluster.x-k8s.io,resources=kubeadmcontrolplanes,verbs=get;watch;list
+//+kubebuilder:rbac:groups="infrastructure.cluster.x-k8s.io",resources="*",verbs=get;watch;list
+//+kubebuilder:rbac:groups="source.toolkit.fluxcd.io",resources=gitrepositories,verbs=get;watch;list
+//+kubebuilder:rbac:groups="source.toolkit.fluxcd.io",resources=gitrepositories/status,verbs=get;watch;list
+//+kubebuilder:rbac:groups="source.toolkit.fluxcd.io",resources=ocirepositories,verbs=get;watch;list
+//+kubebuilder:rbac:groups="source.toolkit.fluxcd.io",resources=ocirepositories/status,verbs=get;watch;list
+//+kubebuilder:rbac:groups="source.toolkit.fluxcd.io",resources=buckets,verbs=get;watch;list
+//+kubebuilder:rbac:groups="source.toolkit.fluxcd.io",resources=buckets/status,verbs=get;watch;list
+
+func (r *ClusterSummaryReconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ctrl.Result, reterr error) {
+	logger := ctrl.LoggerFrom(ctx)
+	logger.V(logs.LogDebug).Info("Reconciling")
+
+	// Fecth the clusterSummary instance
+	clusterSummary := &configv1beta1.ClusterSummary{}
+	if err := r.Get(ctx, req.NamespacedName, clusterSummary); err != nil {
+		if apierrors.IsNotFound(err) {
+			return reconcile.Result{}, nil
+		}
+		logger.Error(err, "Failed to fetch clusterSummary")
+		return reconcile.Result{}, fmt.Errorf(
+			"failed to fetch clusterSummary %s: %w",
+			req.NamespacedName, err,
+		)
+	}
+
+	clusterSummaryScope, err := r.getClusterSummaryScope(ctx, clusterSummary, logger)
+	if err != nil {
+		logger.Error(err, "Failed to create clusterProfileScope")
+		return reconcile.Result{}, fmt.Errorf(
+			"unable to create clusterprofile scope for %s: %w",
+			req.NamespacedName, err,
+		)
+	}
+
+	if r.skipReconciliation(clusterSummaryScope, req) {
+		logger.V(logs.LogInfo).Info("ignore update")
+		return reconcile.Result{RequeueAfter: r.remainingCooldown(clusterSummaryScope, req)}, nil
+	}
+
+	var isMatch bool
+	isMatch, err = isClusterAShardMatch(ctx, r.Client, r.ShardKey, clusterSummary, logger)
+	if err != nil {
+		msg := err.Error()
+		logger.Error(err, msg)
+		clusterSummary.Status.FailureMessage = &msg
+		return reconcile.Result{RequeueAfter: normalRequeueAfter}, nil
+	} else if !isMatch {
+		// This addon-controller pod is not a shard match, yet we need to refresh internal state by:
+		// - removing any helm chart registration made by this ClusterSummary
+		// - update internal maps. This is needed cause when cluster changes, shard annotation changes,
+		// this addon-controller might become the new shard match and so it must reconcile this ClusterSummary instance
+		return reconcile.Result{}, r.refreshInternalState(ctx, clusterSummaryScope, logger)
+	}
+
+	err = r.updateClusterShardPair(ctx, clusterSummary, logger)
+	if err != nil {
+		msg := err.Error()
+		logger.Error(err, msg)
+		clusterSummary.Status.FailureMessage = &msg
+		return reconcile.Result{RequeueAfter: normalRequeueAfter}, nil
+	}
+
+	// Always close the scope when exiting this function so we can persist any ClusterSummary
+	// changes. Conflict errors are swallowed and a 1-minute requeue is scheduled instead of
+	// propagating the error (which would cause controller-runtime to immediately requeue,
+	// bypassing the intended NextReconcileTime backoff). We cannot rely solely on a watch event
+	// to re-enqueue because the conflict may be caused by the controller's own logic (e.g. a
+	// tier change), in which case no further watch event will arrive.
+	defer func() {
+		if err = clusterSummaryScope.Close(ctx); err != nil {
+			if apierrors.IsConflict(err) {
+				logger.V(logs.LogDebug).Info("conflict patching ClusterSummary status, will retry in 1 minute")
+				r.setNextReconcileTime(clusterSummaryScope, time.Minute)
+				result = ctrl.Result{RequeueAfter: time.Minute}
+				return
+			}
+			reterr = err
+		}
+	}()
+
+	// Handle deleted clusterSummary
+	if !clusterSummary.DeletionTimestamp.IsZero() {
+		return r.reconcileDelete(ctx, clusterSummaryScope, logger)
+	}
+
+	proceed, err := r.checkClusterHealth(ctx, clusterSummaryScope, logger)
+	if err != nil {
+		msg := err.Error()
+		logger.Error(err, msg)
+		clusterSummaryScope.ClusterSummary.Status.FailureMessage = &msg
+		return reconcile.Result{RequeueAfter: normalRequeueAfter}, nil
+	}
+	if !proceed {
+		return reconcile.Result{}, nil
+	}
+
+	clusterSummary.Status.FailureMessage = nil
+
+	// Handle non-deleted clusterSummary
+	return r.reconcileNormal(ctx, clusterSummaryScope, logger)
+}
+
+// checkClusterHealth checks if the cluster is ready and the agent is healthy.
+// Returns (proceed, result, error)
+func (r *ClusterSummaryReconciler) checkClusterHealth(ctx context.Context,
+	clusterSummaryScope *scope.ClusterSummaryScope, logger logr.Logger) (bool, error) {
+
+	clusterSummary := clusterSummaryScope.ClusterSummary
+
+	// 1. Check if Cluster is Ready
+	isReady, err := r.isReady(ctx, clusterSummary, logger)
+	if err != nil {
+		return false, err
+	}
+	if !isReady {
+		logger.V(logs.LogInfo).Info("cluster is not ready.")
+		r.handleClusterNotUsable(ctx, clusterSummaryScope, "cluster is not ready", logger)
+		return false, nil
+	}
+
+	// 2. Check if Agent is Healthy (Pull Mode Heartbeat)
+	isHealthy, err := r.isAgentHealthy(ctx, clusterSummary, logger)
+	if err != nil {
+		return false, err
+	}
+	if !isHealthy {
+		logger.V(logs.LogInfo).Info("agent in managed cluster is not healthy.")
+		r.handleClusterNotUsable(ctx, clusterSummaryScope, "agent in managed cluster is not healthy.", logger)
+		return false, nil
+	}
+
+	return true, nil
+}
+
+// Helper to avoid repeating the "Not Ready/Not Healthy" boilerplate
+func (r *ClusterSummaryReconciler) handleClusterNotUsable(ctx context.Context,
+	clusterSummaryScope *scope.ClusterSummaryScope, msg string, logger logr.Logger) {
+
+	r.setFailureMessage(clusterSummaryScope, msg)
+	r.resetFeatureStatus(clusterSummaryScope, libsveltosv1beta1.FeatureStatusFailed)
+	_ = r.updateMaps(ctx, clusterSummaryScope, logger)
+}
+
+func (r *ClusterSummaryReconciler) updateDeletedInstancs(clusterSummaryScope *scope.ClusterSummaryScope) {
+	r.PolicyMux.Lock()
+	defer r.PolicyMux.Unlock()
+
+	r.DeletedInstances[types.NamespacedName{
+		Namespace: clusterSummaryScope.Namespace(),
+		Name:      clusterSummaryScope.Name(),
+	}] = time.Now()
+
+	delete(r.NextReconcileTimes, types.NamespacedName{
+		Namespace: clusterSummaryScope.Namespace(),
+		Name:      clusterSummaryScope.Name(),
+	})
+}
+
+func (r *ClusterSummaryReconciler) reconcileDelete(
+	ctx context.Context,
+	clusterSummaryScope *scope.ClusterSummaryScope,
+	logger logr.Logger,
+) (reconcile.Result, error) {
+
+	logger.V(logs.LogDebug).Info("Reconciling ClusterSummary delete")
+
+	r.updateDeletedInstancs(clusterSummaryScope)
+
+	// HealthCheck and ClusterHealthCheck live in the management cluster: they can be removed
+	// whatever the state of the managed cluster is.
+	if err := r.removeHealthMonitoring(ctx, clusterSummaryScope.ClusterSummary, logger); err != nil {
+		logger.V(logs.LogInfo).Error(err, "failed to remove health monitoring resources")
+		return reconcile.Result{RequeueAfter: deleteRequeueAfter}, nil
+	}
+
+	isReady, err := r.isReady(ctx, clusterSummaryScope.ClusterSummary, logger)
+	if err != nil {
+		return reconcile.Result{RequeueAfter: deleteRequeueAfter}, nil
+	}
+
+	// If Sveltos/Cluster is not found, there is nothing to clean up.
+	isPresent, isDeleted, err := r.isClusterPresent(ctx, clusterSummaryScope)
+	if err != nil {
+		return reconcile.Result{RequeueAfter: deleteRequeueAfter}, nil
+	}
+	if isPresent && isReady { // if cluster is not ready, do not try to clean up. It would fail.
+		if result, cleanupErr, done := r.cleanupBeforeFinalizerRemoval(ctx, clusterSummaryScope, isDeleted, logger); done {
+			return result, cleanupErr
+		}
+	} else if isPresent && !isDeleted {
+		// Cluster exists, is not marked for deletion, but is not ready yet (e.g. a heartbeat
+		// gap). Cleanup was skipped above because it would fail against a cluster that is not
+		// ready. Wait for it rather than falling through to removeFinalizer below with nothing
+		// actually cleaned up - that would orphan whatever was previously deployed.
+		logger.V(logs.LogInfo).Info("cluster is not ready yet. Do not remove finalizer.")
+		return reconcile.Result{RequeueAfter: deleteRequeueAfter}, nil
+	}
+
+	// If cluster is not present anymore or is it marked for deletion
+	if !isPresent || isDeleted {
+		err = r.handleDeletedCluster(ctx, clusterSummaryScope, logger)
+		if err != nil {
+			return reconcile.Result{RequeueAfter: deleteRequeueAfter}, nil
+		}
+	}
+
+	// Cluster is not present anymore or cleanup succeeded
+	err = r.removeFinalizer(clusterSummaryScope, logger)
+	if err != nil {
+		return reconcile.Result{}, fmt.Errorf("failed to remove finalizer")
+	}
+
+	if err := r.postFinalizerCleanup(ctx, clusterSummaryScope, logger); err != nil {
+		return reconcile.Result{}, err
+	}
+
+	logger.V(logs.LogDebug).Info("Reconcile delete success")
+
+	return reconcile.Result{}, nil
+}
+
+// cleanupBeforeFinalizerRemoval runs the delete-path cleanup for a cluster that is present and
+// ready: honors a paused cluster, removes ResourceSummaries where appropriate, waits for
+// dependent ClusterSummaries to be removed first, undeploys, and checks whether the finalizer
+// can be removed yet.
+//
+// done is true whenever reconcileDelete should return (result, err) immediately as-is, whether
+// that means stopping reconciliation (paused), requeuing to wait on some condition, or
+// surfacing an undeploy error. done is false only once cleanup has fully succeeded, in which
+// case reconcileDelete should continue on to remove the finalizer.
+func (r *ClusterSummaryReconciler) cleanupBeforeFinalizerRemoval(ctx context.Context,
+	clusterSummaryScope *scope.ClusterSummaryScope, isDeleted bool, logger logr.Logger,
+) (result reconcile.Result, err error, done bool) {
+
+	paused, err := r.isPaused(ctx, clusterSummaryScope.ClusterSummary)
+	if err != nil {
+		return reconcile.Result{}, err, true
+	}
+	if paused {
+		logger.V(logs.LogInfo).Info("cluster is paused. Do nothing.")
+		clusterSummaryScope.ClusterSummary.Status.ReconciliationSuspended = true
+		suspensionReason := clusterPausedMessage
+		clusterSummaryScope.ClusterSummary.Status.SuspensionReason = &suspensionReason
+		return reconcile.Result{}, nil, true
+	}
+
+	clusterSummaryScope.ClusterSummary.Status.ReconciliationSuspended = false
+	clusterSummaryScope.ClusterSummary.Status.SuspensionReason = nil
+
+	if !isDeleted {
+		// if cluster is marked for deletion do not try to remove ResourceSummaries.
+		// those are only deployed in the managed cluster so no need to cleanup on a deleted cluster
+		if r.anyFeatureNeedsResourceSummaryRemoval(clusterSummaryScope) {
+			err = r.removeResourceSummary(ctx, clusterSummaryScope, logger)
+			if err != nil {
+				logger.V(logs.LogInfo).Error(err, "failed to remove ResourceSummary.")
+				// See the matching comment in prepareForDeployment: surface it as a failure
+				// rather than leaving status wherever it last was.
+				r.setFailureMessage(clusterSummaryScope, err.Error())
+				r.resetFeatureStatus(clusterSummaryScope, libsveltosv1beta1.FeatureStatusFailed)
+				return reconcile.Result{RequeueAfter: deleteRequeueAfter}, nil, true
+			}
+			r.markResourceSummaryRemovedForAllFeatures(clusterSummaryScope)
+		}
+	}
+
+	// Mirror the dependsOn ordering enforced on deploy: do not undeploy a prerequisite
+	// while a dependent ClusterSummary for the same cluster still exists and still
+	// requires it.
+	allRemoved, dependentMsg, err := r.areDependentsRemoved(ctx, clusterSummaryScope, logger)
+	if err != nil {
+		return reconcile.Result{RequeueAfter: deleteRequeueAfter}, nil, true
+	}
+	clusterSummaryScope.SetDependenciesMessage(&dependentMsg)
+	if !allRemoved {
+		// Teardown is deferred, not in progress: reflect that in featureSummaries instead of
+		// leaving it frozen at whatever status it last had (e.g. a stale Provisioning).
+		r.resetFeatureStatus(clusterSummaryScope, libsveltosv1beta1.FeatureStatusBlocked)
+		return reconcile.Result{RequeueAfter: deleteRequeueAfter}, nil, true
+	}
+
+	// TransitionFrom support: do not undeploy this profile's resources on this cluster while
+	// a successor profile that currently matches this cluster and names this profile in
+	// TransitionFrom has not yet reached Provisioned. Lets the successor take over shared
+	// resources in place instead of undeploy-then-redeploy.
+	allProvisioned, transitionMsg, err := r.areSuccessorsProvisioned(ctx, clusterSummaryScope, logger)
+	if err != nil {
+		return reconcile.Result{RequeueAfter: deleteRequeueAfter}, nil, true
+	}
+	clusterSummaryScope.SetDependenciesMessage(&transitionMsg)
+	if !allProvisioned {
+		// Same as the DependsOn gate above: teardown is deferred, not in progress.
+		r.resetFeatureStatus(clusterSummaryScope, libsveltosv1beta1.FeatureStatusBlocked)
+		return reconcile.Result{RequeueAfter: deleteRequeueAfter}, nil, true
+	}
+
+	// still call undeploy even if cluster is deleted. Sveltos might have deployed resources
+	// in the management cluster and those need to be removed.
+	err = r.undeploy(ctx, clusterSummaryScope, logger)
+	if err != nil {
+		result, err = r.processUndeployError(clusterSummaryScope, err, logger)
+		return result, err, true
+	}
+
+	if !r.canRemoveFinalizer(ctx, clusterSummaryScope, logger) {
+		logger.V(logs.LogInfo).Error(err, "cannot remove finalizer yet")
+		return reconcile.Result{RequeueAfter: deleteRequeueAfter}, nil, true
+	}
+
+	return reconcile.Result{}, nil, false
+}
+
+func (r *ClusterSummaryReconciler) postFinalizerCleanup(ctx context.Context,
+	clusterSummaryScope *scope.ClusterSummaryScope, logger logr.Logger) error {
+
+	if err := r.deleteChartMap(ctx, clusterSummaryScope, logger); err != nil {
+		return err
+	}
+
+	r.cleanMaps(clusterSummaryScope)
+
+	clearClusterSummaryMetrics(clusterSummaryScope.ClusterSummary, logger)
+
+	cs := clusterSummaryScope.ClusterSummary
+	if err := sharding.UnregisterClusterShard(ctx, r.Client, libsveltosv1beta1.ComponentAddonManager,
+		getSveltosNamespace(), string(libsveltosv1beta1.FeatureHelm), cs.Spec.ClusterNamespace, cs.Spec.ClusterName,
+		cs.Spec.ClusterType); err != nil {
+		logger.V(logs.LogInfo).Info(fmt.Sprintf("failed to unregister cluster shard: %v", err))
+		return err
+	}
+
+	manager := getManager()
+	manager.stopStaleWatchForTemplateResourceRef(ctx, clusterSummaryScope.ClusterSummary, true)
+
+	return nil
+}
+
+func (r *ClusterSummaryReconciler) reconcileNormal(ctx context.Context,
+	clusterSummaryScope *scope.ClusterSummaryScope, logger logr.Logger) (reconcile.Result, error) {
+
+	logger.V(logs.LogDebug).Info("Reconciling ClusterSummary")
+
+	if !controllerutil.ContainsFinalizer(clusterSummaryScope.ClusterSummary, configv1beta1.ClusterSummaryFinalizer) {
+		if err := r.addFinalizer(ctx, clusterSummaryScope); err != nil {
+			logger.V(logs.LogInfo).Error(err, "failed to add finalizer")
+			return reconcile.Result{}, err
+		}
+	}
+
+	// Health monitoring is independent from deployment: it must be reconciled even when
+	// the ClusterSummary has nothing left to deploy (see shouldReconcile)
+	if err := r.reconcileHealthMonitoring(ctx, clusterSummaryScope.ClusterSummary, logger); err != nil {
+		logger.V(logs.LogInfo).Error(err, "failed to reconcile health monitoring")
+		r.setNextReconcileTime(clusterSummaryScope, normalRequeueAfter)
+		return reconcile.Result{RequeueAfter: normalRequeueAfter}, nil
+	}
+
+	if !r.shouldReconcile(clusterSummaryScope, logger) {
+		logger.V(logs.LogInfo).Info("ClusterSummary does not need a reconciliation")
+		return reconcile.Result{}, nil
+	}
+
+	isEligible, err := r.verifyPullModeEligibility(ctx, clusterSummaryScope, logger)
+	if err != nil {
+		return reconcile.Result{}, err
+	}
+
+	if !isEligible {
+		r.updateStatusWithMissingLicenseError(clusterSummaryScope, logger)
+		return reconcile.Result{RequeueAfter: licenseRequeueAfter}, nil
+	}
+
+	updateMapErrs := r.updateMaps(ctx, clusterSummaryScope, logger)
+	if updateMapErrs != nil {
+		logger.V(logs.LogInfo).Error(updateMapErrs, "failed to get referenced resources")
+	}
+
+	paused, err := r.isPaused(ctx, clusterSummaryScope.ClusterSummary)
+	if err != nil {
+		return reconcile.Result{}, err
+	}
+	if paused {
+		logger.V(logs.LogInfo).Info("cluster is paused. Do nothing.")
+		clusterSummaryScope.ClusterSummary.Status.ReconciliationSuspended = true
+		suspensionReason := clusterPausedMessage
+		clusterSummaryScope.ClusterSummary.Status.SuspensionReason = &suspensionReason
+		return reconcile.Result{}, nil
+	}
+
+	clusterSummaryScope.ClusterSummary.Status.ReconciliationSuspended = false
+	clusterSummaryScope.ClusterSummary.Status.SuspensionReason = nil
+
+	if result := r.prepareForDeployment(ctx, clusterSummaryScope, logger); result.RequeueAfter > 0 {
+		return result, nil
+	}
+
+	return r.proceedDeployingClusterSummary(ctx, clusterSummaryScope, logger)
+}
+
+func (r *ClusterSummaryReconciler) prepareForDeployment(ctx context.Context,
+	clusterSummaryScope *scope.ClusterSummaryScope, logger logr.Logger) reconcile.Result {
+
+	err := r.startWatcherForTemplateResourceRefs(ctx, clusterSummaryScope.ClusterSummary)
+	if err != nil {
+		logger.V(logs.LogInfo).Error(err, "failed to start watcher on resources referenced in TemplateResourceRefs.")
+		r.setNextReconcileTime(clusterSummaryScope, deleteRequeueAfter)
+		return reconcile.Result{RequeueAfter: deleteRequeueAfter}
+	}
+
+	allDeployed, msg, err := r.areDependenciesDeployed(ctx, clusterSummaryScope, logger)
+	if err != nil {
+		r.setNextReconcileTime(clusterSummaryScope, normalRequeueAfter)
+		return reconcile.Result{RequeueAfter: normalRequeueAfter}
+	}
+	clusterSummaryScope.SetDependenciesMessage(&msg)
+	if !allDeployed {
+		// Deploy is deferred, not in progress: reflect that in featureSummaries instead of
+		// leaving it empty (a fresh ClusterSummary) or frozen at whatever it last had, the
+		// same way the mirroring dependsOn/transitionFrom gates on the delete side already do.
+		r.resetFeatureStatus(clusterSummaryScope, libsveltosv1beta1.FeatureStatusBlocked)
+		r.setNextReconcileTime(clusterSummaryScope, normalRequeueAfter)
+		return reconcile.Result{RequeueAfter: normalRequeueAfter}
+	}
+
+	err = r.updateChartMap(ctx, clusterSummaryScope, logger)
+	if err != nil {
+		// Whether this is a missing (non-optional) templateResourceRef, a Helm chart field
+		// that fails Sveltos template instantiation, or anything else updateChartMap can
+		// return: surface it as a failure so the operator can see why deployment is blocked
+		// from `kubectl get clustersummary` alone, instead of only in the controller logs.
+		r.setFailureMessage(clusterSummaryScope, err.Error())
+		r.resetFeatureStatus(clusterSummaryScope, libsveltosv1beta1.FeatureStatusFailedNonRetriable)
+		r.setNextReconcileTime(clusterSummaryScope, normalRequeueAfter)
+		return reconcile.Result{RequeueAfter: normalRequeueAfter}
+	}
+
+	if !clusterSummaryScope.IsContinuousWithDriftDetection() {
+		if r.anyFeatureNeedsResourceSummaryRemoval(clusterSummaryScope) {
+			err = r.removeResourceSummary(ctx, clusterSummaryScope, logger)
+			if err != nil {
+				logger.V(logs.LogInfo).Error(err, "failed to remove ResourceSummary.")
+				// Surface it as a failure so an ongoing connectivity or auth problem is
+				// visible in status instead of ClusterSummary silently sitting wherever it
+				// last was (often Provisioning) while this keeps failing every reconcile.
+				// Retriable: this is generally a transient condition that clears on its own.
+				r.setFailureMessage(clusterSummaryScope, err.Error())
+				r.resetFeatureStatus(clusterSummaryScope, libsveltosv1beta1.FeatureStatusFailed)
+				r.setNextReconcileTime(clusterSummaryScope, normalRequeueAfter)
+				return reconcile.Result{RequeueAfter: normalRequeueAfter}
+			}
+			r.markResourceSummaryRemovedForAllFeatures(clusterSummaryScope)
+		}
+	}
+
+	return reconcile.Result{}
+}
+
+func (r *ClusterSummaryReconciler) proceedDeployingClusterSummary(ctx context.Context,
+	clusterSummaryScope *scope.ClusterSummaryScope, logger logr.Logger) (reconcile.Result, error) {
+
+	err := r.deploy(ctx, clusterSummaryScope, logger)
+	if err != nil {
+		var conflictErr *deployer.ConflictError
+		ok := errors.As(err, &conflictErr)
+		if ok {
+			// The ProfileConflict event is recorded by updateFeatureStatus, when the conflict is persisted
+			logger.V(logs.LogInfo).Error(err, "failed to deploy because of conflict")
+			r.setNextReconcileTime(clusterSummaryScope, r.ConflictRetryTime)
+			return reconcile.Result{RequeueAfter: r.ConflictRetryTime}, nil
+		}
+
+		var healthCheckError *clusterops.HealthCheckError
+		ok = errors.As(err, &healthCheckError)
+		if ok {
+			logger.V(logs.LogInfo).Info("failed to deploy health check not passing",
+				"feature", healthCheckError.FeatureID,
+				"checkName", healthCheckError.CheckName,
+				"reason", healthCheckError.InternalErr.Error(),
+				"requeueAfter", r.HealthErrorRetryTime.String())
+			r.setNextReconcileTime(clusterSummaryScope, r.HealthErrorRetryTime)
+			return reconcile.Result{RequeueAfter: r.HealthErrorRetryTime}, nil
+		}
+
+		requeueAfter := normalRequeueAfter
+		maxFailures := r.getMaxConsecutiveFailures(clusterSummaryScope)
+
+		if maxFailures > 1 {
+			const (
+				minMultiplier = 2
+				maxMultiplier = 6
+			)
+
+			// 1. Determine the ceiling safely.
+			// By checking if maxFailures (uint) is less than maxMultiplier (6),
+			// we ensure the value is small enough to cast to int64 without overflow.
+			currentMax := int64(maxMultiplier)
+			if uint64(maxFailures) < uint64(maxMultiplier) {
+				currentMax = int64(maxFailures)
+			}
+
+			// 2. Calculate the range (delta) for the random generator
+			delta := currentMax - minMultiplier + 1
+			multiplier := int64(minMultiplier)
+
+			if delta > 0 {
+				// Use crypto/rand for gosec compliance
+				n, err := rand.Int(rand.Reader, big.NewInt(delta))
+				if err == nil {
+					multiplier = n.Int64() + minMultiplier
+				}
+			}
+
+			// 3. Apply the multiplier to the duration
+			requeueAfter = time.Duration(multiplier) * normalRequeueAfter
+
+			logger.V(logs.LogDebug).Info("increasing backoff due to consecutive failures",
+				"consecutiveFailures", maxFailures,
+				"multiplier", multiplier,
+				"requeueAfter", requeueAfter)
+		}
+
+		logger.V(logs.LogInfo).Error(err, "failed to deploy")
+		r.setNextReconcileTime(clusterSummaryScope, requeueAfter)
+		return reconcile.Result{RequeueAfter: requeueAfter}, nil
+	}
+
+	logger.V(logs.LogDebug).Info("Reconciling ClusterSummary success")
+
+	if clusterSummaryScope.IsDryRunSync() {
+		r.resetFeatureStatusToProvisioning(clusterSummaryScope)
+		// we need to keep retrying in DryRun ClusterSummaries
+		r.setNextReconcileTime(clusterSummaryScope, dryRunRequeueAfter)
+		return reconcile.Result{RequeueAfter: dryRunRequeueAfter}, nil
+	}
+
+	// If any PolicyRef or KustomizationRef uses a URL source, schedule a periodic
+	// re-fetch so that remote content changes are detected even without a Kubernetes
+	// watch event.
+	// We deliberately do NOT call setNextReconcileTime here: the interval is a
+	// polling floor, not a cooldown — external events should still trigger
+	// immediate reconciliation.
+	policyRefInterval := minURLInterval(clusterSummaryScope.ClusterSummary.Spec.ClusterProfileSpec.PolicyRefs)
+	kustomizeRefInterval := minKustomizeURLInterval(clusterSummaryScope.ClusterSummary.Spec.ClusterProfileSpec.KustomizationRefs)
+	interval := policyRefInterval
+	if interval == 0 || (kustomizeRefInterval > 0 && kustomizeRefInterval < interval) {
+		interval = kustomizeRefInterval
+	}
+	if interval > 0 {
+		return reconcile.Result{RequeueAfter: interval}, nil
+	}
+
+	return reconcile.Result{}, nil
+}
+
+// setNextReconcileTime sets NextReconcileTime on the ClusterSummary status
+// so that skipReconciliation() can honor the intended backoff period
+// even when a watch event re-enqueues the item before RequeueAfter fires.
+// It also records the cooldown in the reconciler's in-memory map so that the
+// guard works even if the status patch fails (e.g. due to a conflict).
+func (r *ClusterSummaryReconciler) setNextReconcileTime(
+	clusterSummaryScope *scope.ClusterSummaryScope, d time.Duration) {
+
+	cs := clusterSummaryScope.ClusterSummary
+	nextTime := time.Now().Add(d)
+	cs.Status.NextReconcileTime = &metav1.Time{Time: nextTime}
+
+	// Mirror in the in-memory map so skipReconciliation works even if scope.Close()
+	// encounters a conflict and the status field is never persisted.
+	key := types.NamespacedName{Namespace: cs.Namespace, Name: cs.Name}
+	r.PolicyMux.Lock()
+	r.NextReconcileTimes[key] = reconcileCooldown{Until: nextTime, Generation: cs.Generation}
+	r.PolicyMux.Unlock()
+}
+
+// remainingCooldown returns the time remaining before the next reconciliation
+// should proceed, checking both the persisted status field and the in-memory map.
+func (r *ClusterSummaryReconciler) remainingCooldown(
+	clusterSummaryScope *scope.ClusterSummaryScope, req ctrl.Request) time.Duration {
+
+	requeueAfter := normalRequeueAfter
+	if nrt := clusterSummaryScope.ClusterSummary.Status.NextReconcileTime; nrt != nil {
+		if remaining := time.Until(nrt.Time); remaining > 0 {
+			requeueAfter = remaining
+		}
+	}
+
+	r.PolicyMux.Lock()
+	if cd, ok := r.NextReconcileTimes[req.NamespacedName]; ok {
+		if remaining := time.Until(cd.Until); remaining > requeueAfter {
+			requeueAfter = remaining
+		}
+	}
+	r.PolicyMux.Unlock()
+
+	return requeueAfter
+}
+
+// SetupWithManager sets up the controller with the Manager.
+func (r *ClusterSummaryReconciler) SetupWithManager(ctx context.Context, mgr ctrl.Manager) error {
+	c, err := ctrl.NewControllerManagedBy(mgr).
+		For(&configv1beta1.ClusterSummary{},
+			builder.WithPredicates(
+				ClusterSummaryPredicate{Logger: r.Logger.WithName("clusterSummaryPredicate")}),
+		).
+		WithOptions(controller.Options{
+			MaxConcurrentReconciles: r.ConcurrentReconciles,
+			RateLimiter: workqueue.NewTypedItemExponentialFailureRateLimiter[reconcile.Request](
+				rateLimiterBaseDelay,
+				rateLimiterMaxDelay,
+			),
+		}).
+		Watches(&libsveltosv1beta1.SveltosCluster{},
+			handler.EnqueueRequestsFromMapFunc(r.requeueClusterSummaryForSveltosCluster),
+			builder.WithPredicates(
+				predicates.SveltosClusterPredicates(mgr.GetLogger().WithValues("predicate", "sveltosclusterpredicate")),
+			),
+		).
+		Watches(&corev1.ConfigMap{},
+			handler.EnqueueRequestsFromMapFunc(r.requeueClusterSummaryForReference),
+			builder.WithPredicates(
+				ConfigMapPredicates(mgr.GetLogger().WithValues("predicate", "configmappredicate")),
+			),
+		).
+		Watches(&corev1.Secret{},
+			handler.EnqueueRequestsFromMapFunc(r.requeueClusterSummaryForReference),
+			builder.WithPredicates(
+				SecretPredicates(mgr.GetLogger().WithValues("predicate", "secretpredicate")),
+			),
+		).
+		Build(r)
+	if err != nil {
+		return fmt.Errorf("error creating controller: %w", err)
+	}
+
+	// At this point we don't know yet whether CAPI is present in the cluster.
+	// Later on, in main, we detect that and if CAPI is present WatchForCAPI will be invoked.
+
+	if r.ReportMode == CollectFromManagementCluster {
+		go collectAndProcessResourceSummaries(ctx, mgr.GetClient(), r.ShardKey, r.Version, mgr.GetLogger())
+	}
+
+	if getAgentInMgmtCluster() {
+		go removeStaleDriftDetectionResources(ctx, r.Logger)
+	}
+
+	// This is one time operation that upgrades drift detection instances in all managed cluster
+	// where drift detection has been deployed
+	go upgradeDriftDetection(ctx, r.ShardKey, r.Logger)
+
+	initializeManager(ctrl.Log.WithName("watchers"), mgr.GetConfig(), mgr.GetClient())
+
+	r.DeletedInstances = make(map[types.NamespacedName]time.Time)
+	r.NextReconcileTimes = make(map[types.NamespacedName]reconcileCooldown)
+	r.eventRecorder = mgr.GetEventRecorder("event-recorder")
+	r.ctrl = c
+
+	return err
+}
+
+func (r *ClusterSummaryReconciler) WatchForCAPI(mgr ctrl.Manager, c controller.Controller) error {
+	sourceCluster := source.Kind[*clusterv1.Cluster](
+		mgr.GetCache(),
+		&clusterv1.Cluster{},
+		handler.TypedEnqueueRequestsFromMapFunc(r.requeueClusterSummaryForCluster),
+		predicates.ClusterPredicate{Logger: mgr.GetLogger().WithValues("predicate", "clusterpredicate")},
+	)
+
+	// When cluster-api cluster changes, according to ClusterPredicates,
+	// one or more ClusterProfiles need to be reconciled.
+	if err := c.Watch(sourceCluster); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (r *ClusterSummaryReconciler) WatchForFlux(mgr ctrl.Manager, c controller.Controller) error {
+	// When a Flux source (GitRepository/OCIRepository/Bucket) changes, one or more ClusterSummaries
+	// need to be reconciled.
+
+	sourceGitRepository := source.Kind[*sourcev1.GitRepository](
+		mgr.GetCache(),
+		&sourcev1.GitRepository{},
+		handler.TypedEnqueueRequestsFromMapFunc(r.requeueClusterSummaryForFluxGitRepository),
+		FluxGitRepositoryPredicate{Logger: mgr.GetLogger().WithValues("predicate", "fluxsourcepredicate")},
+	)
+	if err := c.Watch(sourceGitRepository); err != nil {
+		return err
+	}
+
+	sourceOCIRepository := source.Kind[*sourcev1.OCIRepository](
+		mgr.GetCache(),
+		&sourcev1.OCIRepository{},
+		handler.TypedEnqueueRequestsFromMapFunc(r.requeueClusterSummaryForFluxOCIRepository),
+		FluxOCIRepositoryPredicate{Logger: mgr.GetLogger().WithValues("predicate", "fluxsourcepredicate")},
+	)
+	if err := c.Watch(sourceOCIRepository); err != nil {
+		return err
+	}
+
+	sourceBucket := source.Kind[*sourcev1.Bucket](
+		mgr.GetCache(),
+		&sourcev1.Bucket{},
+		handler.TypedEnqueueRequestsFromMapFunc(r.requeueClusterSummaryForFluxBucket),
+		FluxBucketPredicate{Logger: mgr.GetLogger().WithValues("predicate", "fluxsourcepredicate")},
+	)
+	if err := c.Watch(sourceBucket); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (r *ClusterSummaryReconciler) addFinalizer(ctx context.Context, clusterSummaryScope *scope.ClusterSummaryScope) error {
+	// If the ClusterSummary doesn't have our finalizer, add it.
+	controllerutil.AddFinalizer(clusterSummaryScope.ClusterSummary, configv1beta1.ClusterSummaryFinalizer)
+	// Register the finalizer immediately to avoid orphaning resources on managed cluster on delete
+	if err := clusterSummaryScope.PatchObject(ctx); err != nil {
+		clusterSummaryScope.Error(err, "Failed to add finalizer")
+		return fmt.Errorf(
+			"failed to add finalizer for %s: %w",
+			clusterSummaryScope.Name(), err,
+		)
+	}
+	return nil
+}
+
+func (r *ClusterSummaryReconciler) deploy(ctx context.Context, clusterSummaryScope *scope.ClusterSummaryScope, logger logr.Logger) error {
+	clusterSummary := clusterSummaryScope.ClusterSummary
+	logger = logger.WithValues("clusternamespace", clusterSummary.Spec.ClusterNamespace, "clustername", clusterSummary.Spec.ClusterName)
+
+	var errs []error
+
+	resourceErr := r.deployResources(ctx, clusterSummaryScope, logger)
+
+	helmErr := r.deployHelm(ctx, clusterSummaryScope, logger)
+
+	kustomizeError := r.deployKustomizeRefs(ctx, clusterSummaryScope, logger)
+
+	if resourceErr != nil {
+		errs = append(errs, fmt.Errorf("deploying resources failed: %w", resourceErr))
+	}
+
+	if helmErr != nil {
+		errs = append(errs, fmt.Errorf("deploying helm charts failed: %w", helmErr))
+	}
+
+	if kustomizeError != nil {
+		errs = append(errs, fmt.Errorf("deploying kustomize resources failed: %w", kustomizeError))
+	}
+
+	if len(errs) > 0 {
+		return errors.Join(errs...)
+	}
+
+	return nil
+}
+
+func (r *ClusterSummaryReconciler) deployKustomizeRefs(
+	ctx context.Context,
+	clusterSummaryScope *scope.ClusterSummaryScope,
+	logger logr.Logger,
+) error {
+
+	if clusterSummaryScope.ClusterSummary.Spec.ClusterProfileSpec.KustomizationRefs == nil {
+		logger.V(logs.LogDebug).Info("no kustomize policy configuration")
+		if !r.isFeatureStatusPresent(clusterSummaryScope.ClusterSummary, libsveltosv1beta1.FeatureKustomize) {
+			logger.V(logs.LogDebug).Info("no policy status. Do not reconcile this")
+			return nil
+		}
+	}
+
+	f := getHandlersForFeature(libsveltosv1beta1.FeatureKustomize)
+
+	return r.deployFeature(ctx, clusterSummaryScope, f, logger)
+}
+
+func (r *ClusterSummaryReconciler) deployResources(
+	ctx context.Context,
+	clusterSummaryScope *scope.ClusterSummaryScope,
+	logger logr.Logger,
+) error {
+
+	if clusterSummaryScope.ClusterSummary.Spec.ClusterProfileSpec.PolicyRefs == nil {
+		logger.V(logs.LogDebug).Info("no policy configuration")
+		if !r.isFeatureStatusPresent(clusterSummaryScope.ClusterSummary, libsveltosv1beta1.FeatureResources) {
+			logger.V(logs.LogDebug).Info("no policy status. Do not reconcile this")
+			return nil
+		}
+	}
+
+	f := getHandlersForFeature(libsveltosv1beta1.FeatureResources)
+
+	return r.deployFeature(ctx, clusterSummaryScope, f, logger)
+}
+
+func (r *ClusterSummaryReconciler) deployHelm(
+	ctx context.Context,
+	clusterSummaryScope *scope.ClusterSummaryScope,
+	logger logr.Logger,
+) error {
+
+	if clusterSummaryScope.ClusterSummary.Spec.ClusterProfileSpec.HelmCharts == nil {
+		logger.V(logs.LogDebug).Info("no helm configuration")
+		if !r.isFeatureStatusPresent(clusterSummaryScope.ClusterSummary, libsveltosv1beta1.FeatureHelm) {
+			logger.V(logs.LogDebug).Info("no helm status. Do not reconcile this")
+			return nil
+		}
+	}
+
+	f := getHandlersForFeature(libsveltosv1beta1.FeatureHelm)
+
+	return r.deployFeature(ctx, clusterSummaryScope, f, logger)
+}
+
+func (r *ClusterSummaryReconciler) isClusterPresent(ctx context.Context,
+	clusterSummaryScope *scope.ClusterSummaryScope) (present, deleted bool, err error) {
+
+	cs := clusterSummaryScope.ClusterSummary
+
+	cluster, err := clusterproxy.GetCluster(ctx, r.Client, cs.Spec.ClusterNamespace, cs.Spec.ClusterName, cs.Spec.ClusterType)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, false, nil
+		}
+		return false, false, err
+	}
+
+	return true, !cluster.GetDeletionTimestamp().IsZero(), nil
+}
+
+func (r *ClusterSummaryReconciler) undeploy(ctx context.Context, clusterSummaryScope *scope.ClusterSummaryScope,
+	logger logr.Logger) error {
+
+	resourceErr := r.undeployResources(ctx, clusterSummaryScope, logger)
+
+	kustomizeResourceErr := r.undeployKustomizeResources(ctx, clusterSummaryScope, logger)
+
+	helmErr := r.undeployHelm(ctx, clusterSummaryScope, logger)
+
+	if resourceErr != nil {
+		return resourceErr
+	}
+
+	if kustomizeResourceErr != nil {
+		return kustomizeResourceErr
+	}
+
+	if helmErr != nil {
+		return helmErr
+	}
+
+	return nil
+}
+
+func (r *ClusterSummaryReconciler) undeployResources(
+	ctx context.Context,
+	clusterSummaryScope *scope.ClusterSummaryScope,
+	logger logr.Logger,
+) error {
+
+	f := getHandlersForFeature(libsveltosv1beta1.FeatureResources)
+	return r.undeployFeature(ctx, clusterSummaryScope, f, logger)
+}
+
+func (r *ClusterSummaryReconciler) undeployKustomizeResources(
+	ctx context.Context,
+	clusterSummaryScope *scope.ClusterSummaryScope,
+	logger logr.Logger,
+) error {
+
+	f := getHandlersForFeature(libsveltosv1beta1.FeatureKustomize)
+	return r.undeployFeature(ctx, clusterSummaryScope, f, logger)
+}
+
+func (r *ClusterSummaryReconciler) undeployHelm(
+	ctx context.Context,
+	clusterSummaryScope *scope.ClusterSummaryScope,
+	logger logr.Logger,
+) error {
+
+	f := getHandlersForFeature(libsveltosv1beta1.FeatureHelm)
+	return r.undeployFeature(ctx, clusterSummaryScope, f, logger)
+}
+
+func (r *ClusterSummaryReconciler) updateChartMap(ctx context.Context, clusterSummaryScope *scope.ClusterSummaryScope,
+	logger logr.Logger) error {
+
+	// When in DryRun mode, ClusterSummary won't update (install/upgrade/uninstall) any helm chart.
+	// So it does not update helm chart registration. Whatever registrations it had, are still there (if it was
+	// managing an helm chart, that information still holds as dryrun means change nothing).
+	// Let's say currently no ClusterProfile is managing an helm chart, if we allowed a ClusterSummary in DryRun to
+	// register then:
+	// 1) this ClusterSummary would be elected as manager
+	// 2) ClusterSummary is in DryRun mode so it actually won't deploy anything
+	// 3) If another ClusterProfile in not DryRun mode tried to manage same helm chart, it would not be allowed.
+	if clusterSummaryScope.ClusterSummary.Spec.ClusterProfileSpec.SyncMode == configv1beta1.SyncModeDryRun {
+		return nil
+	}
+
+	chartManager, err := chartmanager.GetChartManagerInstance(ctx, r.Client)
+	if err != nil {
+		return err
+	}
+
+	mgmtResources, err := collectTemplateResourceRefs(ctx, clusterSummaryScope.ClusterSummary)
+	if err != nil {
+		return err
+	}
+
+	csCopy, err := getClusterSummaryWithInstantiatedCharts(ctx, clusterSummaryScope.ClusterSummary,
+		mgmtResources, logger)
+	if err != nil {
+		logger.V(logs.LogInfo).Error(err, "failed to get instantiated charts")
+		return err
+	}
+
+	// First try to be elected manager. Only if that succeeds, manage an helm chart.
+	logger.V(logs.LogDebug).Info("register clustersummary with helm chart manager")
+	chartManager.RegisterClusterSummaryForCharts(csCopy)
+
+	// Registration for helm chart not referenced anymore, are cleaned only after such helm
+	// chart are removed from Sveltos/Cluster. That is done as part of deployHelmCharts and
+	// undeployHelmCharts (RemoveStaleRegistrations).
+	// That is because we need to make sure managed helm charts are successfully uninstalled
+	// before any registration with chartManager is cleared.
+
+	return nil
+}
+
+// deleteChartMap removes any registration with chartManager.
+// Call it only when ClusterSummary is ready to be deleted (finalizer is removed)
+func (r *ClusterSummaryReconciler) deleteChartMap(ctx context.Context, clusterSummaryScope *scope.ClusterSummaryScope,
+	logger logr.Logger) error {
+
+	chartManager, err := chartmanager.GetChartManagerInstance(ctx, r.Client)
+	if err != nil {
+		return err
+	}
+
+	logger.V(logs.LogDebug).Info("remove clustersummary with helm chart manager")
+	chartManager.RemoveAllRegistrations(clusterSummaryScope.ClusterSummary)
+
+	return nil
+}
+
+func (r *ClusterSummaryReconciler) cleanMaps(clusterSummaryScope *scope.ClusterSummaryScope) {
+	r.PolicyMux.Lock()
+	defer r.PolicyMux.Unlock()
+
+	clusterSummaryInfo := getKeyFromObject(r.Scheme, clusterSummaryScope.ClusterSummary)
+
+	for i := range r.ClusterMap {
+		clusterSummarySet := r.ClusterMap[i]
+		clusterSummarySet.Erase(clusterSummaryInfo)
+	}
+
+	for i := range r.ReferenceMap {
+		clusterSummarySet := r.ReferenceMap[i]
+		clusterSummarySet.Erase(clusterSummaryInfo)
+	}
+
+	delete(r.DeletedInstances, types.NamespacedName{
+		Namespace: clusterSummaryScope.Namespace(),
+		Name:      clusterSummaryScope.Name(),
+	})
+}
+
+func (r *ClusterSummaryReconciler) updateMaps(ctx context.Context, clusterSummaryScope *scope.ClusterSummaryScope,
+	logger logr.Logger) error {
+
+	if clusterSummaryScope.ClusterSummary.Spec.ClusterProfileSpec.SyncMode == configv1beta1.SyncModeOneTime {
+		logger.V(logs.LogDebug).Info("sync mode is one time. No need to reconcile on policies change.")
+		return nil
+	}
+	logger.V(logs.LogDebug).Info("update policy map")
+	currentReferences, err := r.getCurrentReferences(ctx, clusterSummaryScope)
+	if err != nil {
+		logger.V(logs.LogInfo).Info(fmt.Sprintf("failed to get current references: %v", err))
+		return err
+	}
+
+	// If there is a ConfigMap with drift-detection-manager configuration, if the syncMode is ContinuousWithDriftDetection
+	// this clusterSummary needs to be redeployed when the ConfigMap changes
+	if clusterSummaryScope.IsContinuousWithDriftDetection() {
+		if driftDetectionConfigMap := getDriftDetectionConfigMap(); driftDetectionConfigMap != "" {
+			currentReferences.Insert(&corev1.ObjectReference{
+				APIVersion: corev1.SchemeGroupVersion.String(),
+				Kind:       string(libsveltosv1beta1.ConfigMapReferencedResourceKind),
+				Namespace:  getSveltosNamespace(),
+				Name:       driftDetectionConfigMap,
+			})
+		}
+	}
+
+	cs := clusterSummaryScope.ClusterSummary
+	var kind, apiVersion string
+	if cs.Spec.ClusterType == libsveltosv1beta1.ClusterTypeSveltos {
+		kind = libsveltosv1beta1.SveltosClusterKind
+		apiVersion = libsveltosv1beta1.GroupVersion.String()
+	} else {
+		kind = clusterv1.ClusterKind
+		apiVersion = clusterv1.GroupVersion.String()
+	}
+
+	clusterInfo := &corev1.ObjectReference{
+		Namespace:  cs.Spec.ClusterNamespace,
+		Name:       cs.Spec.ClusterName,
+		Kind:       kind,
+		APIVersion: apiVersion,
+	}
+
+	r.PolicyMux.Lock()
+	defer r.PolicyMux.Unlock()
+
+	clusterSummaryInfo := corev1.ObjectReference{APIVersion: configv1beta1.GroupVersion.String(),
+		Kind: configv1beta1.ClusterSummaryKind, Namespace: clusterSummaryScope.Namespace(),
+		Name: clusterSummaryScope.Name()}
+	r.getClusterMapForEntry(clusterInfo).Insert(&clusterSummaryInfo)
+
+	for k, l := range r.ReferenceMap {
+		l.Erase(&clusterSummaryInfo)
+		if l.Len() == 0 {
+			delete(r.ReferenceMap, k)
+		}
+	}
+
+	// For each currently referenced instance, add ClusterSummary as consumer
+	for _, referencedResource := range currentReferences.Items() {
+		tmpResource := referencedResource
+		r.getReferenceMapForEntry(&tmpResource).Insert(
+			&corev1.ObjectReference{
+				APIVersion: configv1beta1.GroupVersion.String(),
+				Kind:       configv1beta1.ClusterSummaryKind,
+				Namespace:  clusterSummaryScope.Namespace(),
+				Name:       clusterSummaryScope.Name(),
+			},
+		)
+	}
+	return nil
+}
+
+func (r *ClusterSummaryReconciler) getClusterMapForEntry(entry *corev1.ObjectReference) *libsveltosset.Set {
+	s := r.ClusterMap[*entry]
+	if s == nil {
+		s = &libsveltosset.Set{}
+		r.ClusterMap[*entry] = s
+	}
+	return s
+}
+
+// shouldReconcile returns true if a reconciliation is needed.
+// When syncMode is set to one time, if features are marked as provisioned, no reconciliation is needed.
+func (r *ClusterSummaryReconciler) shouldReconcile(clusterSummaryScope *scope.ClusterSummaryScope, logger logr.Logger) bool {
+	clusterSummary := clusterSummaryScope.ClusterSummary
+
+	if clusterSummary.Spec.ClusterProfileSpec.SyncMode == configv1beta1.SyncModeContinuous ||
+		clusterSummary.Spec.ClusterProfileSpec.SyncMode == configv1beta1.SyncModeContinuousWithDriftDetection {
+
+		logger.V(logs.LogDebug).Info(fmt.Sprintf("Mode set to %s. Reconciliation is needed.",
+			clusterSummary.Spec.ClusterProfileSpec.SyncMode))
+		return true
+	}
+
+	if clusterSummary.Spec.ClusterProfileSpec.SyncMode == configv1beta1.SyncModeDryRun {
+		logger.V(logs.LogDebug).Info("Mode set to dryRun. Reconciliation is needed.")
+		return true
+	}
+
+	if len(clusterSummary.Spec.ClusterProfileSpec.PolicyRefs) != 0 {
+		if !r.isFeatureDeployed(clusterSummaryScope.ClusterSummary, libsveltosv1beta1.FeatureResources) {
+			logger.V(logs.LogDebug).Info("Mode set to one time. Resources not deployed yet. Reconciliation is needed.")
+			return true
+		}
+	}
+
+	if len(clusterSummary.Spec.ClusterProfileSpec.HelmCharts) != 0 {
+		if !r.isFeatureDeployed(clusterSummaryScope.ClusterSummary, libsveltosv1beta1.FeatureHelm) {
+			logger.V(logs.LogDebug).Info("Mode set to one time. Helm Charts not deployed yet. Reconciliation is needed.")
+			return true
+		}
+	}
+
+	if len(clusterSummary.Spec.ClusterProfileSpec.KustomizationRefs) != 0 {
+		if !r.isFeatureDeployed(clusterSummaryScope.ClusterSummary, libsveltosv1beta1.FeatureKustomize) {
+			logger.V(logs.LogDebug).Info("Mode set to one time. Kustomization resources not deployed yet. Reconciliation is needed.")
+			return true
+		}
+	}
+
+	return false
+}
+
+func (r *ClusterSummaryReconciler) getCurrentReferences(ctx context.Context,
+	clusterSummaryScope *scope.ClusterSummaryScope) (*libsveltosset.Set, error) {
+
+	currentReferences, err := r.getPolicyRefReferences(ctx, clusterSummaryScope)
+	if err != nil {
+		return nil, err
+	}
+
+	kustomizationRefs, err := r.getKustomizationRefReferences(ctx, clusterSummaryScope)
+	if err != nil {
+		return nil, err
+	}
+	currentReferences.Append(kustomizationRefs)
+
+	helmRefs, err := r.getHelmChartsReferences(ctx, clusterSummaryScope)
+	if err != nil {
+		return nil, err
+	}
+	currentReferences.Append(helmRefs)
+
+	patchesFromReferences, err := getPatchesFrom(ctx, clusterSummaryScope.ClusterSummary)
+	if err != nil {
+		return nil, err
+	}
+	currentReferences.Append(patchesFromReferences)
+
+	return currentReferences, nil
+}
+
+// getPolicyRefReferences get all references considering the PolicyRef section
+func (r *ClusterSummaryReconciler) getPolicyRefReferences(ctx context.Context,
+	clusterSummaryScope *scope.ClusterSummaryScope) (*libsveltosset.Set, error) {
+
+	cs := clusterSummaryScope.ClusterSummary
+	currentReferences := &libsveltosset.Set{}
+	for i := range clusterSummaryScope.ClusterSummary.Spec.ClusterProfileSpec.PolicyRefs {
+		referencedNamespace := clusterSummaryScope.ClusterSummary.Spec.ClusterProfileSpec.PolicyRefs[i].Namespace
+		namespace, err := libsveltostemplate.GetReferenceResourceNamespace(ctx, getManagementClusterClient(),
+			cs.Spec.ClusterNamespace, cs.Spec.ClusterName, referencedNamespace, cs.Spec.ClusterType)
+		if err != nil {
+			return nil, err
+		}
+
+		referencedName, err := libsveltostemplate.GetReferenceResourceName(ctx, getManagementClusterClient(),
+			cs.Spec.ClusterNamespace, cs.Spec.ClusterName,
+			clusterSummaryScope.ClusterSummary.Spec.ClusterProfileSpec.PolicyRefs[i].Name, cs.Spec.ClusterType)
+		if err != nil {
+			return nil, err
+		}
+
+		var apiVersion, kind string
+		gvk := getPolicyRefGroupVersionKind(&clusterSummaryScope.ClusterSummary.Spec.ClusterProfileSpec.PolicyRefs[i])
+		if gvk != nil {
+			apiVersion, kind = gvk.ToAPIVersionAndKind()
+		}
+
+		currentReferences.Insert(&corev1.ObjectReference{
+			APIVersion: apiVersion,
+			Kind:       kind,
+			Namespace:  namespace,
+			Name:       referencedName,
+		})
+	}
+	return currentReferences, nil
+}
+
+func getPolicyRefGroupVersionKind(ref *configv1beta1.PolicyRef) *schema.GroupVersionKind {
+	switch ref.Kind {
+	case string(libsveltosv1beta1.SecretReferencedResourceKind),
+		string(libsveltosv1beta1.ConfigMapReferencedResourceKind):
+		return &schema.GroupVersionKind{Group: "", Version: coreAPIVersion, Kind: ref.Kind}
+	case sourcev1.GitRepositoryKind:
+		return &schema.GroupVersionKind{Group: sourcev1.GroupVersion.Group,
+			Version: sourcev1.GroupVersion.Version, Kind: ref.Kind}
+	case sourcev1.BucketKind, sourcev1.OCIRepositoryKind:
+		return &schema.GroupVersionKind{Group: sourcev1.GroupVersion.Group,
+			Version: sourcev1.GroupVersion.Version, Kind: ref.Kind}
+	}
+
+	return nil
+}
+
+// getKustomizationRefReferences get all references considering the KustomizationRef section
+func (r *ClusterSummaryReconciler) getKustomizationRefReferences(ctx context.Context,
+	clusterSummaryScope *scope.ClusterSummaryScope) (*libsveltosset.Set, error) {
+
+	cs := clusterSummaryScope.ClusterSummary
+	currentReferences := &libsveltosset.Set{}
+	for i := range clusterSummaryScope.ClusterSummary.Spec.ClusterProfileSpec.KustomizationRefs {
+		kr := &clusterSummaryScope.ClusterSummary.Spec.ClusterProfileSpec.KustomizationRefs[i]
+
+		referencedNamespace := kr.Namespace
+
+		namespace, err := libsveltostemplate.GetReferenceResourceNamespace(ctx, getManagementClusterClient(),
+			cs.Spec.ClusterNamespace, cs.Spec.ClusterName, referencedNamespace, cs.Spec.ClusterType)
+		if err != nil {
+			return nil, err
+		}
+
+		referencedName, err := libsveltostemplate.GetReferenceResourceName(ctx, getManagementClusterClient(),
+			cs.Spec.ClusterNamespace, cs.Spec.ClusterName, kr.Name, cs.Spec.ClusterType)
+		if err != nil {
+			return nil, err
+		}
+
+		var apiVersion string
+		switch kr.Kind {
+		case sourcev1.GitRepositoryKind:
+			apiVersion = sourcev1.GroupVersion.String()
+		case sourcev1.OCIRepositoryKind:
+			apiVersion = sourcev1.GroupVersion.String()
+		case sourcev1.BucketKind:
+			apiVersion = sourcev1.GroupVersion.String()
+		default:
+			apiVersion = corev1.SchemeGroupVersion.String()
+		}
+		currentReferences.Insert(&corev1.ObjectReference{
+			APIVersion: apiVersion,
+			Kind:       kr.Kind,
+			Namespace:  namespace,
+			Name:       referencedName,
+		})
+
+		valuesFromReferences, err := getKustomizationValueFrom(ctx, clusterSummaryScope, kr)
+		if err != nil {
+			if kr.Optional {
+				continue
+			}
+			return nil, err
+		}
+		currentReferences.Append(valuesFromReferences)
+	}
+	return currentReferences, nil
+}
+
+// getKustomizationValueFrom gets referenced ConfigMap/Secret in a KustomizationRef.
+// KustomizationRef can reference both ConfigMap/Secret each containing key-value pairs that will be used, if defined,
+// to replace placeholder value in the output generated by Kustomize SDK.
+func getKustomizationValueFrom(ctx context.Context, clusterSummaryScope *scope.ClusterSummaryScope,
+	kr *configv1beta1.KustomizationRef) (*libsveltosset.Set, error) {
+
+	currentValuesFromReferences := &libsveltosset.Set{}
+
+	cs := clusterSummaryScope.ClusterSummary
+	for i := range kr.ValuesFrom {
+		referencedNamespace := kr.ValuesFrom[i].Namespace
+		namespace, err := libsveltostemplate.GetReferenceResourceNamespace(ctx, getManagementClusterClient(),
+			cs.Spec.ClusterNamespace, cs.Spec.ClusterName, referencedNamespace, cs.Spec.ClusterType)
+		if err != nil {
+			return nil, err
+		}
+
+		referencedName, err := libsveltostemplate.GetReferenceResourceName(ctx, getManagementClusterClient(),
+			cs.Spec.ClusterNamespace, cs.Spec.ClusterName, kr.ValuesFrom[i].Name, cs.Spec.ClusterType)
+		if err != nil {
+			return nil, err
+		}
+
+		currentValuesFromReferences.Insert(&corev1.ObjectReference{
+			APIVersion: corev1.SchemeGroupVersion.String(),
+			Kind:       kr.ValuesFrom[i].Kind,
+			Namespace:  namespace,
+			Name:       referencedName,
+		})
+	}
+
+	return currentValuesFromReferences, nil
+}
+
+// getHelmChartsReferences get all references considering the HelmChart section
+func (r *ClusterSummaryReconciler) getHelmChartsReferences(ctx context.Context,
+	clusterSummaryScope *scope.ClusterSummaryScope) (*libsveltosset.Set, error) {
+
+	currentReferences := &libsveltosset.Set{}
+	for i := range clusterSummaryScope.ClusterSummary.Spec.ClusterProfileSpec.HelmCharts {
+		hc := &clusterSummaryScope.ClusterSummary.Spec.ClusterProfileSpec.HelmCharts[i]
+
+		if isReferencingFluxSource(hc) {
+			sourceRef, _, err := getReferencedFluxSourceFromURL(hc)
+			if err != nil {
+				return nil, err
+			}
+			currentReferences.Insert(sourceRef)
+		}
+
+		valuesFromReferences, err := getHelmChartValueFrom(ctx, clusterSummaryScope, hc)
+		if err != nil {
+			return nil, err
+		}
+		currentReferences.Append(valuesFromReferences)
+	}
+	return currentReferences, nil
+}
+
+// getHelmChartValueFrom gets referenced ConfigMap/Secret in a HelmChart.
+// HelmChart can reference both ConfigMap/Secret each containing configuration for the helm release.
+func getHelmChartValueFrom(ctx context.Context, clusterSummaryScope *scope.ClusterSummaryScope,
+	hc *configv1beta1.HelmChart) (*libsveltosset.Set, error) {
+
+	currentValuesFromReferences := &libsveltosset.Set{}
+
+	cs := clusterSummaryScope.ClusterSummary
+	for i := range hc.ValuesFrom {
+		referencedNamespace := hc.ValuesFrom[i].Namespace
+		namespace, err := libsveltostemplate.GetReferenceResourceNamespace(ctx, getManagementClusterClient(),
+			cs.Spec.ClusterNamespace, cs.Spec.ClusterName, referencedNamespace, cs.Spec.ClusterType)
+		if err != nil {
+			return nil, err
+		}
+
+		referencedName, err := libsveltostemplate.GetReferenceResourceName(ctx, getManagementClusterClient(),
+			cs.Spec.ClusterNamespace, cs.Spec.ClusterName, hc.ValuesFrom[i].Name, cs.Spec.ClusterType)
+		if err != nil {
+			return nil, err
+		}
+
+		currentValuesFromReferences.Insert(&corev1.ObjectReference{
+			APIVersion: corev1.SchemeGroupVersion.String(),
+			Kind:       hc.ValuesFrom[i].Kind,
+			Namespace:  namespace,
+			Name:       referencedName,
+		})
+	}
+
+	return currentValuesFromReferences, nil
+}
+
+func (r *ClusterSummaryReconciler) getReferenceMapForEntry(entry *corev1.ObjectReference) *libsveltosset.Set {
+	s := r.ReferenceMap[*entry]
+	if s == nil {
+		s = &libsveltosset.Set{}
+		r.ReferenceMap[*entry] = s
+	}
+	return s
+}
+
+// isReady returns true if Sveltos/Cluster is ready
+func (r *ClusterSummaryReconciler) isReady(ctx context.Context,
+	clusterSummary *configv1beta1.ClusterSummary, logger logr.Logger) (bool, error) {
+
+	clusterRef := &corev1.ObjectReference{
+		Namespace: clusterSummary.Spec.ClusterNamespace,
+		Name:      clusterSummary.Spec.ClusterName,
+	}
+	if clusterSummary.Spec.ClusterType == libsveltosv1beta1.ClusterTypeSveltos {
+		clusterRef.Kind = libsveltosv1beta1.SveltosClusterKind
+		clusterRef.APIVersion = libsveltosv1beta1.GroupVersion.String()
+	} else {
+		clusterRef.Kind = clusterKind
+		clusterRef.APIVersion = clusterv1.GroupVersion.String()
+	}
+
+	isClusterReady, err := clusterproxy.IsClusterReadyToBeConfigured(ctx, r.Client, clusterRef,
+		logger)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+
+	return isClusterReady, nil
+}
+
+// isPaused returns true if Sveltos/Cluster is paused or ClusterSummary has paused annotation.
+func (r *ClusterSummaryReconciler) isPaused(ctx context.Context,
+	clusterSummary *configv1beta1.ClusterSummary) (bool, error) {
+
+	isClusterPaused, err := clusterproxy.IsClusterPaused(ctx, r.Client, clusterSummary.Spec.ClusterNamespace,
+		clusterSummary.Spec.ClusterName, clusterSummary.Spec.ClusterType)
+
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+
+	if isClusterPaused {
+		return true, nil
+	}
+
+	return annotations.HasPaused(clusterSummary), nil
+}
+
+// isAgentHealthy returns true if the cluster is NOT in pull mode,
+// OR if it is in pull mode and the heartbeat is current.
+func (r *ClusterSummaryReconciler) isAgentHealthy(ctx context.Context,
+	clusterSummary *configv1beta1.ClusterSummary, logger logr.Logger) (bool, error) {
+
+	if clusterSummary.Spec.ClusterType != libsveltosv1beta1.ClusterTypeSveltos {
+		return true, nil
+	}
+
+	isPullMode, err := clusterproxy.IsClusterInPullMode(ctx, r.Client, clusterSummary.Spec.ClusterNamespace,
+		clusterSummary.Spec.ClusterName, clusterSummary.Spec.ClusterType, logger)
+	if err != nil {
+		msg := fmt.Sprintf("failed to verify if Cluster is in pull mode: %v", err)
+		logger.V(logs.LogDebug).Info(msg)
+		return false, err
+	}
+
+	if !isPullMode {
+		return true, nil
+	}
+
+	sveltosCluster := &libsveltosv1beta1.SveltosCluster{}
+	err = r.Get(ctx,
+		types.NamespacedName{
+			Namespace: clusterSummary.Spec.ClusterNamespace,
+			Name:      clusterSummary.Spec.ClusterName,
+		}, sveltosCluster)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+
+	// Check if the failure message indicates a heartbeat timeout
+	if pullmode.IsAgentTimeoutError(sveltosCluster) {
+		return false, nil
+	}
+
+	return true, nil
+}
+
+// canRemoveFinalizer returns true if finalizer can be removed.
+// A ClusterSummary in DryRun mode can be removed if deleted and ClusterProfile is also marked for deletion.
+// A ClusterSummary in not DryRun mode can be removed if deleted and all features are undeployed.
+func (r *ClusterSummaryReconciler) canRemoveFinalizer(ctx context.Context,
+	clusterSummaryScope *scope.ClusterSummaryScope, logger logr.Logger) bool {
+
+	clusterSummary := clusterSummaryScope.ClusterSummary
+
+	if clusterSummaryScope.ClusterSummary.DeletionTimestamp.IsZero() {
+		logger.V(logs.LogDebug).Info("ClusterSummary not marked for deletion")
+		return false
+	}
+
+	_, err := clusterproxy.GetCluster(ctx, r.Client, clusterSummary.Spec.ClusterNamespace,
+		clusterSummary.Spec.ClusterName, clusterSummary.Spec.ClusterType)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			logger.V(logs.LogInfo).Info(fmt.Sprintf("cluster %s/%s not found. Nothing to do.",
+				clusterSummary.Spec.ClusterNamespace, clusterSummary.Spec.ClusterName))
+			return true
+		}
+		return false
+	}
+
+	if clusterSummaryScope.IsDryRunSync() {
+		logger.V(logs.LogInfo).Info("DryRun mode. Can only be deleted if Profile/ClusterProfile is marked for deletion.")
+		// A ClusterSummary in DryRun mode can only be removed if also ClusterProfile is marked
+		// for deletion. Otherwise ClusterSummary has to stay and list what would happen if owning
+		// ClusterProfile is moved away from DryRun mode.
+		profile, _, err := configv1beta1.GetProfileOwnerAndTier(ctx, r.Client, clusterSummaryScope.ClusterSummary)
+		if err != nil {
+			logger.V(logs.LogInfo).Info(fmt.Sprintf("failed to get ClusterProfile %v", err))
+			return false
+		}
+
+		if profile == nil {
+			logger.V(logs.LogInfo).Info("failed to get ClusterProfile")
+			return false
+		}
+
+		if !profile.GetDeletionTimestamp().IsZero() {
+			return true
+		}
+		logger.V(logs.LogInfo).Info("ClusterProfile not marked for deletion")
+		return false
+	}
+
+	for i := range clusterSummaryScope.ClusterSummary.Status.FeatureSummaries {
+		fs := &clusterSummaryScope.ClusterSummary.Status.FeatureSummaries[i]
+		if fs.Status != libsveltosv1beta1.FeatureStatusRemoved {
+			logger.V(logs.LogInfo).Info("Not all features marked as removed")
+			return false
+		}
+	}
+	return true
+}
+
+// anyFeatureNeedsResourceSummaryRemoval returns true if any of the known features
+// has a ResourceSummary section that may still exist in the managed cluster.
+func (r *ClusterSummaryReconciler) anyFeatureNeedsResourceSummaryRemoval(
+	clusterSummaryScope *scope.ClusterSummaryScope) bool {
+
+	for _, fID := range []libsveltosv1beta1.FeatureID{
+		libsveltosv1beta1.FeatureHelm,
+		libsveltosv1beta1.FeatureResources,
+		libsveltosv1beta1.FeatureKustomize,
+	} {
+		if clusterSummaryScope.ShouldRemoveResourceSummary(fID) {
+			return true
+		}
+	}
+	return false
+}
+
+// markResourceSummaryRemovedForAllFeatures sets ResourceSummaryDeployed to false
+// for every known feature, recording that no ResourceSummary exists in the managed cluster.
+func (r *ClusterSummaryReconciler) markResourceSummaryRemovedForAllFeatures(
+	clusterSummaryScope *scope.ClusterSummaryScope) {
+
+	for _, fID := range []libsveltosv1beta1.FeatureID{
+		libsveltosv1beta1.FeatureHelm,
+		libsveltosv1beta1.FeatureResources,
+		libsveltosv1beta1.FeatureKustomize,
+	} {
+		clusterSummaryScope.SetResourceSummaryDeployed(fID, false)
+	}
+}
+
+// removeResourceSummary removes, if still present, ResourceSummary corresponding
+// to this ClusterSummary instance
+func (r *ClusterSummaryReconciler) removeResourceSummary(ctx context.Context,
+	clusterSummaryScope *scope.ClusterSummaryScope, logger logr.Logger) error {
+
+	// ResourceSummary is a Sveltos resource deployed in managed clusters.
+	// Such resources are always created, removed using cluster-admin roles.
+	cs := clusterSummaryScope.ClusterSummary
+
+	err := unDeployResourceSummaryInstance(ctx, cs.Spec.ClusterNamespace, cs.Spec.ClusterName,
+		cs.Name, cs.Spec.ClusterType, logger)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		// ResourceSummaries are only installed when in ContinuousWithDriftDetection mode
+		if meta.IsNoMatchError(err) {
+			return nil
+		}
+	}
+	return err
+}
+
+func (r *ClusterSummaryReconciler) updateClusterShardPair(ctx context.Context,
+	clusterSummary *configv1beta1.ClusterSummary, logger logr.Logger) error {
+
+	// When the cluster no longer exists every pod is considered a shard match (so cleanup can
+	// proceed), but that also means every pod would write its own ShardKey for the same clusterId
+	// to the shared ConfigMap. Whichever pod reads back a key written by a different pod would see
+	// hasShardChanged=true and restart — causing a restart storm at scale. Skip shard tracking for
+	// non-existent clusters; the cleanup path does not need it.
+	_, err := clusterproxy.GetCluster(ctx, r.Client, clusterSummary.Spec.ClusterNamespace,
+		clusterSummary.Spec.ClusterName, clusterSummary.Spec.ClusterType)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+
+	if hasShardChanged, err := sharding.RegisterClusterShard(ctx, r.Client, libsveltosv1beta1.ComponentAddonManager,
+		getSveltosNamespace(), string(libsveltosv1beta1.FeatureHelm), r.ShardKey, clusterSummary.Spec.ClusterNamespace,
+		clusterSummary.Spec.ClusterName, clusterSummary.Spec.ClusterType); err != nil {
+		logger.V(logs.LogDebug).Info(fmt.Sprintf("failed to check/update cluster:shard pair %v", err))
+		return err
+	} else if hasShardChanged {
+		// internal in-memory state must be rebuilt. Restart pod
+		logger.V(logs.LogInfo).Info("restarting pod to rebuild internal state")
+		if killErr := syscall.Kill(syscall.Getpid(), syscall.SIGTERM); killErr != nil {
+			panic("kill -TERM failed")
+		}
+	}
+
+	return nil
+}
+
+// isClusterAShardMatch checks if cluster is matching this addon-controller deployment shard.
+func isClusterAShardMatch(ctx context.Context, c client.Client, shardKey string,
+	clusterSummary *configv1beta1.ClusterSummary, logger logr.Logger) (bool, error) {
+
+	cluster, err := clusterproxy.GetCluster(ctx, c, clusterSummary.Spec.ClusterNamespace,
+		clusterSummary.Spec.ClusterName, clusterSummary.Spec.ClusterType)
+	if err != nil {
+		// If Cluster does not exist anymore, make it match any shard
+		if apierrors.IsNotFound(err) {
+			return true, nil
+		}
+
+		logger.V(logs.LogDebug).Info(fmt.Sprintf("failed to get cluster: %v", err))
+		return false, err
+	}
+
+	if !sharding.IsShardAMatch(shardKey, cluster) {
+		logger.V(logs.LogDebug).Info("not a shard match")
+		return false, nil
+	}
+
+	return true, nil
+}
+
+// refreshInternalState updates internal maps in this addon-controller pod:
+// - remove any chart subscription handled by the clusterSummary
+// - update cluster to clusterSummary maps. This is needed cause if cluster shard changes,
+// we want this clusterSummary to be reconciled)
+func (r *ClusterSummaryReconciler) refreshInternalState(ctx context.Context,
+	clusterSummaryScope *scope.ClusterSummaryScope, logger logr.Logger) error {
+
+	if err := r.deleteChartMap(ctx, clusterSummaryScope, logger); err != nil {
+		return err
+	}
+
+	clusterInfo := &corev1.ObjectReference{
+		Namespace: clusterSummaryScope.ClusterSummary.Spec.ClusterNamespace,
+		Name:      clusterSummaryScope.ClusterSummary.Spec.ClusterName,
+	}
+
+	switch clusterSummaryScope.ClusterSummary.Spec.ClusterType {
+	case libsveltosv1beta1.ClusterTypeSveltos:
+		clusterInfo.Kind = string(libsveltosv1beta1.ClusterTypeSveltos)
+		clusterInfo.APIVersion = libsveltosv1beta1.GroupVersion.String()
+	case libsveltosv1beta1.ClusterTypeCapi:
+		clusterInfo.Kind = clusterKind
+		clusterInfo.APIVersion = clusterv1.GroupVersion.String()
+	}
+
+	clusterSummaryInfo := corev1.ObjectReference{APIVersion: configv1beta1.GroupVersion.String(),
+		Kind: configv1beta1.ClusterProfileKind, Namespace: clusterSummaryScope.Namespace(),
+		Name: clusterSummaryScope.Name()}
+
+	r.PolicyMux.Lock()
+	defer r.PolicyMux.Unlock()
+
+	// Even if this addon-controller is not a shard match now, we need to keep internal map
+	// updated. If cluster sharding annotation, all addon-controllers (including this one)
+	// needs to be requeued. For instance, this specific addon-controller might become the new
+	// shard match and it has to take it over.
+	r.getClusterMapForEntry(clusterInfo).Insert(&clusterSummaryInfo)
+
+	return nil
+}
+
+// areDependenciesDeployed checks dependencies. All must be provisioned for this ClusterSummary to proceed further
+// reconciling add-ons and applications
+func (r *ClusterSummaryReconciler) areDependenciesDeployed(ctx context.Context, clusterSummaryScope *scope.ClusterSummaryScope,
+	logger logr.Logger) (allDeployed bool, dependencyMessage string, err error) {
+
+	profileReference, err := configv1beta1.GetProfileOwnerReference(clusterSummaryScope.ClusterSummary)
+	if err != nil {
+		logger.V(logs.LogInfo).Info(fmt.Sprintf("failed to get profile owner: %v", err))
+		return false, "", fmt.Errorf("failed to get profile owner: %w", err)
+	}
+
+	if profileReference == nil {
+		return false, "", fmt.Errorf("profile owner not found: %w", err)
+	}
+
+	for i := range clusterSummaryScope.ClusterSummary.Spec.ClusterProfileSpec.DependsOn {
+		profileName := clusterSummaryScope.ClusterSummary.Spec.ClusterProfileSpec.DependsOn[i]
+		logger.V(logs.LogDebug).Info(fmt.Sprintf("Considering %s %s", profileReference.Kind, profileName))
+		var cs *configv1beta1.ClusterSummary
+		cs, err = clusterops.GetClusterSummary(ctx, r.Client, profileReference.Kind, profileName,
+			clusterSummaryScope.ClusterSummary.Spec.ClusterNamespace, clusterSummaryScope.ClusterSummary.Spec.ClusterName,
+			clusterSummaryScope.ClusterSummary.Spec.ClusterType)
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				msg := fmt.Sprintf("%s %s is a dependency. The ClusterSummary instance for this profile/cluster was not found",
+					profileReference.Kind, profileName)
+				logger.V(logs.LogInfo).Info(msg)
+				return false, msg, nil
+			}
+
+			return false, "", err
+		}
+
+		if !isCluterSummaryProvisioned(cs) {
+			msg := fmt.Sprintf("%s %s is a dependency and it is not fully deployed yet",
+				profileReference.Kind, profileName)
+			logger.V(logs.LogInfo).Info(msg)
+			return false, msg, nil
+		}
+	}
+
+	dependencyMessage = "All dependencies deployed"
+	if clusterSummaryScope.ClusterSummary.Spec.ClusterProfileSpec.DependsOn == nil {
+		dependencyMessage = "no dependencies"
+	}
+
+	return true, dependencyMessage, nil
+}
+
+// areDependentsRemoved is the mirror check of areDependenciesDeployed, run on delete instead of
+// deploy. dependsOn is a two-way contract, not just a one-time deploy-ordering hint:
+// prepareForDeployment blocks a dependent from deploying until its prerequisites are Provisioned,
+// and symmetrically, a prerequisite (e.g. cert-manager) must not be undeployed while a dependent
+// that still needs it (e.g. kyverno) is still around - deleting it out from under a live dependent
+// would silently break that dependent, with no error at the moment that actually caused it. This
+// mirrors how Kubernetes itself protects still-referenced objects (a CRD while CRs of that type
+// exist, a PVC while a pod mounts it): the block is deliberate, and lifts once the dependent is
+// gone or no longer lists this profile as a dependency.
+//
+// Returns false, with a message, if another ClusterSummary for the same cluster still exists and
+// still lists this ClusterSummary's profile in its own DependsOn.
+func (r *ClusterSummaryReconciler) areDependentsRemoved(ctx context.Context, clusterSummaryScope *scope.ClusterSummaryScope,
+	logger logr.Logger) (allRemoved bool, dependentMessage string, err error) {
+
+	profileReference, err := configv1beta1.GetProfileOwnerReference(clusterSummaryScope.ClusterSummary)
+	if err != nil {
+		logger.V(logs.LogInfo).Info(fmt.Sprintf("failed to get profile owner: %v", err))
+		return false, "", fmt.Errorf("failed to get profile owner: %w", err)
+	}
+
+	if profileReference == nil {
+		return false, "", fmt.Errorf("profile owner not found: %w", err)
+	}
+
+	clusterSummary := clusterSummaryScope.ClusterSummary
+
+	listOptions := []client.ListOption{
+		client.InNamespace(clusterSummary.Spec.ClusterNamespace),
+		client.MatchingLabels{
+			configv1beta1.ClusterNameLabel: clusterSummary.Spec.ClusterName,
+			configv1beta1.ClusterTypeLabel: string(clusterSummary.Spec.ClusterType),
+		},
+	}
+
+	clusterSummaryList := &configv1beta1.ClusterSummaryList{}
+	if err := r.List(ctx, clusterSummaryList, listOptions...); err != nil {
+		return false, "", err
+	}
+
+	for i := range clusterSummaryList.Items {
+		other := &clusterSummaryList.Items[i]
+		if other.Name == clusterSummary.Name {
+			continue
+		}
+
+		for j := range other.Spec.ClusterProfileSpec.DependsOn {
+			if other.Spec.ClusterProfileSpec.DependsOn[j] == profileReference.Name {
+				msg := fmt.Sprintf("%s still depends on this profile and has not been removed yet", other.Name)
+				logger.V(logs.LogInfo).Info(msg)
+				return false, msg, nil
+			}
+		}
+	}
+
+	return true, "", nil
+}
+
+func (r *ClusterSummaryReconciler) setFailureMessage(clusterSummaryScope *scope.ClusterSummaryScope, failureMessage string) {
+	if clusterSummaryScope.ClusterSummary.Spec.ClusterProfileSpec.HelmCharts != nil {
+		clusterSummaryScope.SetFailureMessage(libsveltosv1beta1.FeatureHelm, &failureMessage)
+	}
+	if clusterSummaryScope.ClusterSummary.Spec.ClusterProfileSpec.PolicyRefs != nil {
+		clusterSummaryScope.SetFailureMessage(libsveltosv1beta1.FeatureResources, &failureMessage)
+	}
+	if clusterSummaryScope.ClusterSummary.Spec.ClusterProfileSpec.KustomizationRefs != nil {
+		clusterSummaryScope.SetFailureMessage(libsveltosv1beta1.FeatureKustomize, &failureMessage)
+	}
+}
+
+func (r *ClusterSummaryReconciler) resetFeatureStatus(
+	clusterSummaryScope *scope.ClusterSummaryScope,
+	status libsveltosv1beta1.FeatureStatus,
+) {
+
+	if clusterSummaryScope.ClusterSummary.Spec.ClusterProfileSpec.HelmCharts != nil {
+		clusterSummaryScope.SetFeatureStatus(libsveltosv1beta1.FeatureHelm, status, nil, nil)
+	}
+	if clusterSummaryScope.ClusterSummary.Spec.ClusterProfileSpec.PolicyRefs != nil {
+		clusterSummaryScope.SetFeatureStatus(libsveltosv1beta1.FeatureResources, status, nil, nil)
+	}
+	if clusterSummaryScope.ClusterSummary.Spec.ClusterProfileSpec.KustomizationRefs != nil {
+		clusterSummaryScope.SetFeatureStatus(libsveltosv1beta1.FeatureKustomize, status, nil, nil)
+	}
+}
+
+func (r *ClusterSummaryReconciler) GetController() controller.Controller {
+	return r.ctrl
+}
+
+func (r *ClusterSummaryReconciler) startWatcherForTemplateResourceRefs(ctx context.Context,
+	clusterSummary *configv1beta1.ClusterSummary) error {
+
+	manager := getManager()
+	for i := range clusterSummary.Spec.ClusterProfileSpec.TemplateResourceRefs {
+		ref := &clusterSummary.Spec.ClusterProfileSpec.TemplateResourceRefs[i]
+
+		gvk := schema.FromAPIVersionAndKind(ref.Resource.APIVersion, ref.Resource.Kind)
+
+		if err := manager.startWatcherForTemplateResourceRef(ctx, gvk, ref, clusterSummary); err != nil {
+			return err
+		}
+	}
+
+	manager.stopStaleWatchForTemplateResourceRef(ctx, clusterSummary, false)
+	return nil
+}
+
+// Removes any cleanup job
+func (r *ClusterSummaryReconciler) cleanupQueuedCleanOperations(clusterSummary *configv1beta1.ClusterSummary) {
+	r.Deployer.CleanupEntries(clusterSummary.Spec.ClusterNamespace, clusterSummary.Spec.ClusterName, clusterSummary.Name,
+		string(libsveltosv1beta1.FeatureHelm), clusterSummary.Spec.ClusterType, true)
+
+	r.Deployer.CleanupEntries(clusterSummary.Spec.ClusterNamespace, clusterSummary.Spec.ClusterName, clusterSummary.Name,
+		string(libsveltosv1beta1.FeatureKustomize), clusterSummary.Spec.ClusterType, true)
+
+	r.Deployer.CleanupEntries(clusterSummary.Spec.ClusterNamespace, clusterSummary.Spec.ClusterName, clusterSummary.Name,
+		string(libsveltosv1beta1.FeatureResources), clusterSummary.Spec.ClusterType, true)
+}
+
+// resetFeatureStatusToProvisioning reset status from Provisioned to Provisioning
+func (r *ClusterSummaryReconciler) resetFeatureStatusToProvisioning(clusterSummaryScope *scope.ClusterSummaryScope) {
+	status := libsveltosv1beta1.FeatureStatusProvisioning
+	for i := range clusterSummaryScope.ClusterSummary.Status.FeatureSummaries {
+		fs := &clusterSummaryScope.ClusterSummary.Status.FeatureSummaries[i]
+		if fs.Status == libsveltosv1beta1.FeatureStatusProvisioned {
+			fs.Status = status
+		}
+	}
+}
+
+func (r *ClusterSummaryReconciler) skipReconciliation(clusterSummaryScope *scope.ClusterSummaryScope,
+	req ctrl.Request) bool {
+
+	r.PolicyMux.Lock()
+	defer r.PolicyMux.Unlock()
+
+	cs := clusterSummaryScope.ClusterSummary
+	if !cs.DeletionTimestamp.IsZero() {
+		// Skip and requeue deleted ClusterSummary if too soon.
+		v := r.DeletedInstances[req.NamespacedName]
+		thresholdTime := v.Add(deleteRequeueAfter)
+		if !time.Now().After(thresholdTime) {
+			return true
+		}
+	}
+
+	if cd, ok := r.NextReconcileTimes[req.NamespacedName]; ok {
+		// A spec change (generation bump) always wins over a running cooldown so that
+		// changes to Interval or other URL fields take effect immediately.
+		if cd.Generation < cs.Generation {
+			delete(r.NextReconcileTimes, req.NamespacedName)
+			cs.Status.NextReconcileTime = nil
+			return false
+		}
+		if time.Now().Before(cd.Until) {
+			return true
+		}
+		// Cooldown expired — remove from map
+		delete(r.NextReconcileTimes, req.NamespacedName)
+	} else if cs.Status.NextReconcileTime != nil && time.Now().Before(cs.Status.NextReconcileTime.Time) {
+		// No in-memory entry but status says we should wait — this is the post-restart case.
+		// Rebuild the in-memory entry so subsequent events use the faster map path.
+		r.NextReconcileTimes[req.NamespacedName] = reconcileCooldown{
+			Until:      cs.Status.NextReconcileTime.Time,
+			Generation: cs.Generation,
+		}
+		return true
+	}
+
+	cs.Status.NextReconcileTime = nil
+
+	return false
+}
+
+func (r *ClusterSummaryReconciler) handleDeletedCluster(ctx context.Context,
+	clusterSummaryScope *scope.ClusterSummaryScope, logger logr.Logger) error {
+
+	// in case cleanup operations were already queued, before removing ClusterSummary
+	// remove those
+	r.cleanupQueuedCleanOperations(clusterSummaryScope.ClusterSummary)
+
+	logger.V(logs.LogDebug).Info("remove drift-detection-manager resources from management cluster")
+	cs := clusterSummaryScope.ClusterSummary
+
+	err := removeStaleResourceSummary(ctx, cs.Spec.ClusterNamespace, cs.Spec.ClusterName, cs.Spec.ClusterType, logger)
+	if err != nil {
+		logger.V(logs.LogInfo).Info(
+			fmt.Sprintf("failed to remove resourceSummary instances from management cluster: %v", err))
+		return err
+	}
+
+	err = removeDriftDetectionManagerFromManagementCluster(ctx,
+		cs.Spec.ClusterNamespace, cs.Spec.ClusterName, cs.Spec.ClusterType, logger)
+	if err != nil {
+		logger.V(logs.LogInfo).Info(
+			fmt.Sprintf("failed to remove drift-detection-manager resources from management cluster: %v", err))
+		return err
+	}
+
+	return nil
+}
+
+func (r *ClusterSummaryReconciler) getClusterSummaryScope(ctx context.Context,
+	clusterSummary *configv1beta1.ClusterSummary, logger logr.Logger,
+) (*scope.ClusterSummaryScope, error) {
+
+	// Fetch the (Cluster)Profile.
+	profile, _, err := configv1beta1.GetProfileOwnerAndTier(ctx, r.Client, clusterSummary)
+	if err != nil {
+		logger.Error(err, "Failed to get owner clusterProfile")
+		return nil, fmt.Errorf(
+			"failed to get owner clusterProfile for %s/%s: %w",
+			clusterSummary.Namespace, clusterSummary.Name, err,
+		)
+	}
+	if profile == nil {
+		msg := "Failed to get owner (Cluster)Profile"
+		logger.Error(err, msg)
+		clusterSummary.Status.FailureMessage = &msg
+		return nil, fmt.Errorf("failed to get owner (Cluster)Profile for %s/%s",
+			clusterSummary.Namespace, clusterSummary.Name)
+	}
+
+	clusterSummaryScope, err := scope.NewClusterSummaryScope(&scope.ClusterSummaryScopeParams{
+		Client:         r.Client,
+		Logger:         logger,
+		ClusterSummary: clusterSummary,
+		Profile:        profile,
+		ControllerName: controllerNameClusterSummary,
+	})
+
+	return clusterSummaryScope, err
+}
+
+func (r *ClusterSummaryReconciler) verifyPullModeEligibility(ctx context.Context,
+	clusterSummaryScope *scope.ClusterSummaryScope, logger logr.Logger) (bool, error) {
+
+	cs := clusterSummaryScope.ClusterSummary
+
+	isPullMode, err := clusterproxy.IsClusterInPullMode(ctx, r.Client, cs.Spec.ClusterNamespace,
+		cs.Spec.ClusterName, cs.Spec.ClusterType, logger)
+	if err != nil {
+		msg := fmt.Sprintf("failed to verify if Cluster is in pull mode: %v", err)
+		logger.V(logs.LogDebug).Info(msg)
+		return false, err
+	}
+
+	if !isPullMode {
+		return true, nil
+	}
+
+	// Pull mode requires a valid license
+	publicKey, err := license.GetPublicKey()
+	if err != nil {
+		logger.V(logs.LogInfo).Info(fmt.Sprintf("failed to get public key: %v", err))
+		return false, err
+	}
+
+	result := license.VerifyLicenseSecret(ctx, r.Client, getSveltosNamespace(), publicKey, logger)
+	if result.Message != "" {
+		logger.V(logs.LogDebug).Info(result.Message)
+	}
+
+	return grantsPullModeEligibility(&result, cs.Spec.ClusterNamespace, cs.Spec.ClusterName, logger), nil
+}
+
+// grantsPullModeEligibility decides, from an already-verified license result, whether this
+// specific cluster is eligible for pull mode. Split out of verifyPullModeEligibility so the
+// decision can be unit tested against synthetic results without needing a real signed license.
+func grantsPullModeEligibility(result *license.LicenseVerificationResult,
+	clusterNamespace, clusterName string, logger logr.Logger) bool {
+
+	licenseManagerInstance := GetLicenseManager()
+
+	if result.IsValid || result.IsInGracePeriod {
+		if result.Payload == nil {
+			logger.V(logs.LogInfo).Info("An Enterprise or EnterprisePlus License is required")
+			return false
+		}
+
+		if !result.Payload.HasFeature(license.FeaturePullMode) {
+			// Features, when explicitly set, is an allowlist.
+			logger.V(logs.LogInfo).Info("License does not include the PullMode feature")
+			return false
+		}
+
+		if result.Payload.Plan != license.PlanEnterprisePlus && result.Payload.Plan != license.PlanEnterprise {
+			logger.V(logs.LogInfo).Info("An Enterprise or EnterprisePlus License is required")
+			return false
+		}
+
+		if result.Payload.MaxClusters == 0 {
+			// Customer can have unlimited number of clusters in pull mode
+			return true
+		}
+		// License is valid only for MaxClusters in pull mode
+		return licenseManagerInstance.IsClusterInTopX(clusterNamespace, clusterName, result.Payload.MaxClusters)
+	}
+
+	// Without license, 2 clusters in pull mode are still managed for free
+	const maxFreeClusters = 2
+	return licenseManagerInstance.IsClusterInTopX(clusterNamespace, clusterName, maxFreeClusters)
+}
+
+func (r *ClusterSummaryReconciler) updateStatusWithMissingLicenseError(
+	clusterSummaryScope *scope.ClusterSummaryScope, logger logr.Logger) {
+
+	// All features fail for the same reason: one event, recorded the first time
+	_, previousMessage := getFeatureFailure(clusterSummaryScope.ClusterSummary, libsveltosv1beta1.FeatureHelm)
+
+	failed := libsveltosv1beta1.FeatureStatusFailed
+	r.updateFeatureStatus(clusterSummaryScope, libsveltosv1beta1.FeatureHelm, &failed, nil,
+		errPullModeLicenseRequired, logger)
+	r.updateFeatureStatus(clusterSummaryScope, libsveltosv1beta1.FeatureKustomize, &failed, nil,
+		errPullModeLicenseRequired, logger)
+	r.updateFeatureStatus(clusterSummaryScope, libsveltosv1beta1.FeatureResources, &failed, nil,
+		errPullModeLicenseRequired, logger)
+
+	if previousMessage == nil || *previousMessage != errPullModeLicenseRequired.Error() {
+		clusterSummary := clusterSummaryScope.ClusterSummary
+		recordEventf(r.eventRecorder, clusterSummary, nil, corev1.EventTypeWarning, eventreasons.LicenseInvalid,
+			eventreasons.ActionDeploying, "Cluster %s %s/%s: %s", clusterSummary.Spec.ClusterType,
+			clusterSummary.Spec.ClusterNamespace, clusterSummary.Spec.ClusterName, errPullModeLicenseRequired.Error())
+	}
+}
+
+// removeFinalizer removes the finalizer
+func (r *ClusterSummaryReconciler) removeFinalizer(clusterSummaryScope *scope.ClusterSummaryScope,
+	logger logr.Logger) error {
+
+	// Remove Finalizer
+	logger.V(logs.LogInfo).Info("Removing finalizer")
+	if controllerutil.ContainsFinalizer(clusterSummaryScope.ClusterSummary, configv1beta1.ClusterSummaryFinalizer) {
+		if finalizersUpdated := controllerutil.RemoveFinalizer(clusterSummaryScope.ClusterSummary,
+			configv1beta1.ClusterSummaryFinalizer); !finalizersUpdated {
+			return fmt.Errorf("failed to remove finalizer")
+		}
+	}
+
+	return nil
+}
+
+func (r *ClusterSummaryReconciler) processUndeployError(clusterSummaryScope *scope.ClusterSummaryScope,
+	undeployError error, logger logr.Logger) (reconcile.Result, error) {
+
+	var waitError *configv1beta1.WaitForProfileProcessingError
+	if errors.As(undeployError, &waitError) {
+		logger.V(logs.LogDebug).Info("waiting for other profiles to process charts", "message", waitError.Message)
+		return reconcile.Result{RequeueAfter: deleteRequeueAfter}, nil
+	}
+
+	// In DryRun mode it is expected to always get an error back
+	if !clusterSummaryScope.IsDryRunSync() {
+		logger.V(logs.LogInfo).Error(undeployError, "failed to undeploy")
+		return reconcile.Result{RequeueAfter: deleteRequeueAfter}, nil
+	}
+
+	var nonRetriableError *configv1beta1.NonRetriableError
+	if errors.As(undeployError, &nonRetriableError) {
+		return reconcile.Result{RequeueAfter: deleteHandOverRequeueAfter}, nil
+	}
+
+	var templateError *configv1beta1.TemplateInstantiationError
+	if errors.As(undeployError, &templateError) {
+		return reconcile.Result{RequeueAfter: deleteHandOverRequeueAfter}, nil
+	}
+
+	var healthCheckError *clusterops.HealthCheckError
+	if errors.As(undeployError, &healthCheckError) {
+		return reconcile.Result{RequeueAfter: r.HealthErrorRetryTime}, nil
+	}
+
+	return reconcile.Result{RequeueAfter: deleteRequeueAfter}, nil
+}
+
+// getPatchesFrom gets referenced ConfigMap/Secret in a PatchesFrom.
+func getPatchesFrom(ctx context.Context, clusterSummary *configv1beta1.ClusterSummary) (*libsveltosset.Set, error) {
+	currentValuesFromReferences := &libsveltosset.Set{}
+
+	patchesFrom := clusterSummary.Spec.ClusterProfileSpec.PatchesFrom
+	for i := range patchesFrom {
+		referencedNamespace := patchesFrom[i].Namespace
+		namespace, err := libsveltostemplate.GetReferenceResourceNamespace(ctx, getManagementClusterClient(),
+			clusterSummary.Spec.ClusterNamespace, clusterSummary.Spec.ClusterName, referencedNamespace,
+			clusterSummary.Spec.ClusterType)
+		if err != nil {
+			return nil, err
+		}
+
+		referencedName, err := libsveltostemplate.GetReferenceResourceName(ctx, getManagementClusterClient(),
+			clusterSummary.Spec.ClusterNamespace, clusterSummary.Spec.ClusterName, patchesFrom[i].Name,
+			clusterSummary.Spec.ClusterType)
+		if err != nil {
+			return nil, err
+		}
+
+		currentValuesFromReferences.Insert(&corev1.ObjectReference{
+			APIVersion: corev1.SchemeGroupVersion.String(),
+			Kind:       patchesFrom[i].Kind,
+			Namespace:  namespace,
+			Name:       referencedName,
+		})
+	}
+
+	return currentValuesFromReferences, nil
+}
+
+func getClusterSummaryWithInstantiatedCharts(ctx context.Context, cs *configv1beta1.ClusterSummary,
+	mgmtResources map[string]*unstructured.Unstructured, logger logr.Logger,
+) (*configv1beta1.ClusterSummary, error) {
+
+	csCopy := configv1beta1.ClusterSummary{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: cs.Namespace,
+			Name:      cs.Name,
+		},
+	}
+	csCopy.Spec = cs.Spec
+	csCopy.Spec.ClusterProfileSpec.HelmCharts = nil
+	csCopy.Spec.ClusterProfileSpec.HelmCharts = make([]configv1beta1.HelmChart,
+		len(cs.Spec.ClusterProfileSpec.HelmCharts))
+
+	clusterObjects, err := fetchClusterObjects(ctx, getManagementClusterConfig(), getManagementClusterClient(),
+		cs.Spec.ClusterNamespace, cs.Spec.ClusterName, cs.Spec.ClusterType, logger)
+	if err != nil {
+		logger.V(logs.LogInfo).Error(err, "failed to fetch resources")
+		return nil, err
+	}
+	innerDCtx := &deploymentContext{
+		clusterSummary: cs,
+		clusterObjects: clusterObjects,
+		mgmtResources:  mgmtResources,
+	}
+
+	for i := range cs.Spec.ClusterProfileSpec.HelmCharts {
+		helmChart := &cs.Spec.ClusterProfileSpec.HelmCharts[i]
+		instantiateHelmChart, err := getInstantiatedChartIdentity(ctx, innerDCtx, helmChart, logger)
+		if err != nil {
+			return nil, err
+		}
+		csCopy.Spec.ClusterProfileSpec.HelmCharts[i] = *instantiateHelmChart
+	}
+
+	return &csCopy, nil
+}

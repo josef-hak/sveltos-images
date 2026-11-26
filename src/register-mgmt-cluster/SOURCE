@@ -1,0 +1,5 @@
+upstream: https://github.com/projectsveltos/register-mgmt-cluster
+tag: v1.17.0
+commit: 7d66f58d45ed657199060856c9d0482c97272f4a
+vendored: 2026-11-26T11:50:39Z
+pruned: .git doc/

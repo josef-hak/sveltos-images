@@ -1,0 +1,14 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: controller
+  namespace: projectsveltos
+spec:
+  template:
+    spec:
+      initContainers:
+      - image: docker.io/projectsveltos/addon-controller:v1.17.0
+        name: initialization
+      containers:
+      - image: docker.io/projectsveltos/addon-controller:v1.17.0
+        name: controller

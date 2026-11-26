@@ -1,0 +1,51 @@
+/*
+Copyright 2024. projectsveltos.io. All rights reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package controllers
+
+var (
+	ShouldRenewTokenRequest                            = (*SveltosClusterReconciler).shouldRenewTokenRequest
+	GetTokenExpiration                                 = (*SveltosClusterReconciler).getTokenExpiration
+	AdjustTokenRequestRenewalOption                    = (*SveltosClusterReconciler).adjustTokenRequestRenewalOption
+	GetServiceAccountTokenRequest                      = (*SveltosClusterReconciler).getServiceAccountTokenRequest
+	ReconcilePullModeCluster                           = (*SveltosClusterReconciler).reconcilePullModeCluster
+	UpdateLicenseAnnotations                           = (*SveltosClusterReconciler).updateLicenseAnnotations
+	HandlePullModeTokenRequestRenewal                  = (*SveltosClusterReconciler).handlePullModeTokenRequestRenewal
+	GetPullModeManagementClusterEndpoint               = (*SveltosClusterReconciler).getPullModeManagementClusterEndpoint
+	TerminatePullModeTokenRenewalTrackingIfProvisioned = (*SveltosClusterReconciler).terminatePullModeTokenRenewalTrackingIfProvisioned
+)
+
+var (
+	GetPullModeKubeconfigSecret = getPullModeKubeconfigSecret
+)
+
+const (
+	PullModeKubeconfigSecretNamePostfix      = pullModeKubeconfigSecretNamePostfix
+	PullModeKubeconfigSecretKey              = pullModeKubeconfigSecretKey
+	PullModeManagementClusterURLConfigMapKey = pullModeManagementClusterURLConfigMapKey
+	PullModeManagementClusterCAConfigMapKey  = pullModeManagementClusterCAConfigMapKey
+	DeleteRequeueAfter                       = deleteRequeueAfter
+
+	PullModeManagementClusterTLSServerNameConfigMapKey = pullModeManagementClusterTLSServerNameConfigMapKey
+)
+
+var (
+	HandleAutomaticPauseUnPause = handleAutomaticPauseUnPause
+)
+
+var (
+	GetResourcesMatchinResourceSelector = getResourcesMatchinResourceSelector
+)

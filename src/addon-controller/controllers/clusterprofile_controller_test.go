@@ -1,0 +1,532 @@
+/*
+Copyright 2022. projectsveltos.io. All rights reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package controllers_test
+
+import (
+	"context"
+	"sync"
+
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+
+	"github.com/go-logr/logr"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/klog/v2/textlogger"
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+
+	configv1beta1 "github.com/projectsveltos/addon-controller/api/v1beta1"
+	"github.com/projectsveltos/addon-controller/controllers"
+	"github.com/projectsveltos/addon-controller/lib/clusterops"
+	"github.com/projectsveltos/addon-controller/pkg/scope"
+	libsveltosv1beta1 "github.com/projectsveltos/libsveltos/api/v1beta1"
+	libsveltosset "github.com/projectsveltos/libsveltos/lib/set"
+)
+
+var _ = Describe("Profile: Reconciler", func() {
+	var clusterProfile *configv1beta1.ClusterProfile
+	var logger logr.Logger
+
+	BeforeEach(func() {
+		logger = textlogger.NewLogger(textlogger.NewConfig())
+
+		clusterProfile = &configv1beta1.ClusterProfile{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: clusterProfileNamePrefix + randomString(),
+			},
+			Spec: configv1beta1.Spec{
+				ClusterSelector: libsveltosv1beta1.Selector{
+					LabelSelector: metav1.LabelSelector{
+						MatchLabels: map[string]string{randomString(): randomString()},
+					},
+				},
+			},
+		}
+		Expect(addTypeInformationToObject(scheme, clusterProfile)).To(Succeed())
+	})
+
+	It("Adds finalizer", func() {
+		Expect(testEnv.Create(context.TODO(), clusterProfile)).To(Succeed())
+		Expect(waitForObject(context.TODO(), testEnv.Client, clusterProfile)).To(Succeed())
+
+		reconciler := &controllers.ClusterProfileReconciler{
+			Client:          testEnv,
+			Scheme:          scheme,
+			ClusterMap:      make(map[corev1.ObjectReference]*libsveltosset.Set),
+			ClusterProfiles: make(map[corev1.ObjectReference]libsveltosv1beta1.Selector),
+			ClusterLabels:   make(map[corev1.ObjectReference]map[string]string),
+			Mux:             sync.Mutex{},
+		}
+
+		clusterProfileName := client.ObjectKey{
+			Name: clusterProfile.Name,
+		}
+
+		_, err := reconciler.Reconcile(context.TODO(), ctrl.Request{
+			NamespacedName: clusterProfileName,
+		})
+		Expect(err).ToNot(HaveOccurred())
+
+		currentClusterProfile := &configv1beta1.ClusterProfile{}
+		err = testEnv.Get(context.TODO(), clusterProfileName, currentClusterProfile)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(
+			controllerutil.ContainsFinalizer(
+				currentClusterProfile,
+				configv1beta1.ClusterProfileFinalizer,
+			),
+		).Should(BeTrue())
+	})
+
+	It("getClustersFromClusterSets gets cluster selected by referenced clusterSet", func() {
+		clusterSet1 := &libsveltosv1beta1.ClusterSet{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: randomString(),
+			},
+			Status: libsveltosv1beta1.Status{
+				SelectedClusterRefs: []corev1.ObjectReference{
+					{
+						Namespace: randomString(), Name: randomString(),
+						Kind: libsveltosv1beta1.SveltosClusterKind, APIVersion: libsveltosv1beta1.GroupVersion.String(),
+					},
+					{
+						Namespace: randomString(), Name: randomString(),
+						Kind: libsveltosv1beta1.SveltosClusterKind, APIVersion: libsveltosv1beta1.GroupVersion.String(),
+					},
+				},
+			},
+		}
+
+		clusterSet2 := &libsveltosv1beta1.ClusterSet{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: randomString(),
+			},
+			Status: libsveltosv1beta1.Status{
+				SelectedClusterRefs: []corev1.ObjectReference{
+					{
+						Namespace: randomString(), Name: randomString(),
+						Kind: libsveltosv1beta1.SveltosClusterKind, APIVersion: libsveltosv1beta1.GroupVersion.String(),
+					},
+				},
+			},
+		}
+
+		clusterProfile.Spec.SetRefs = []string{
+			clusterSet1.Name,
+			clusterSet2.Name,
+		}
+
+		initObjects := []client.Object{
+			clusterSet1,
+			clusterSet2,
+			clusterProfile,
+		}
+
+		c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(initObjects...).
+			WithObjects(initObjects...).Build()
+
+		reconciler := &controllers.ClusterProfileReconciler{
+			Client:          c,
+			Scheme:          scheme,
+			ClusterMap:      make(map[corev1.ObjectReference]*libsveltosset.Set),
+			ClusterProfiles: make(map[corev1.ObjectReference]libsveltosv1beta1.Selector),
+			ClusterLabels:   make(map[corev1.ObjectReference]map[string]string),
+			Mux:             sync.Mutex{},
+		}
+
+		clusters, err := controllers.GetClustersFromClusterSets(reconciler, context.TODO(),
+			clusterProfile.Spec.SetRefs, logger)
+		Expect(err).To(BeNil())
+		Expect(clusters).ToNot(BeNil())
+		for i := range clusterSet1.Status.SelectedClusterRefs {
+			Expect(clusters).To(ContainElement(corev1.ObjectReference{
+				Namespace:  clusterSet1.Status.SelectedClusterRefs[i].Namespace,
+				Name:       clusterSet1.Status.SelectedClusterRefs[i].Name,
+				Kind:       clusterSet1.Status.SelectedClusterRefs[i].Kind,
+				APIVersion: clusterSet1.Status.SelectedClusterRefs[i].APIVersion,
+			}))
+		}
+		for i := range clusterSet2.Status.SelectedClusterRefs {
+			Expect(clusters).To(ContainElement(corev1.ObjectReference{
+				Namespace:  clusterSet2.Status.SelectedClusterRefs[i].Namespace,
+				Name:       clusterSet2.Status.SelectedClusterRefs[i].Name,
+				Kind:       clusterSet2.Status.SelectedClusterRefs[i].Kind,
+				APIVersion: clusterSet2.Status.SelectedClusterRefs[i].APIVersion,
+			}))
+		}
+	})
+
+	It("Reconciliation of deleted ClusterProfile removes finalizer only when all ClusterSummaries are gone", func() {
+		ns := &corev1.Namespace{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: randomString(),
+			},
+		}
+		Expect(testEnv.Create(context.TODO(), ns)).To(Succeed())
+		Expect(waitForObject(context.TODO(), testEnv.Client, ns)).To(Succeed())
+
+		clusterSummary := &configv1beta1.ClusterSummary{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      clusterProfileNamePrefix + randomString(),
+				Namespace: ns.Name,
+				Labels:    map[string]string{clusterops.ClusterProfileLabelName: clusterProfile.Name},
+			},
+			Spec: configv1beta1.ClusterSummarySpec{
+				ClusterType: libsveltosv1beta1.ClusterTypeCapi,
+			},
+		}
+		controllerutil.AddFinalizer(clusterSummary, configv1beta1.ClusterSummaryFinalizer)
+		Expect(testEnv.Create(context.TODO(), clusterSummary)).To(Succeed())
+		Expect(waitForObject(context.TODO(), testEnv.Client, clusterSummary)).To(Succeed())
+
+		controllerutil.AddFinalizer(clusterProfile, configv1beta1.ClusterProfileFinalizer)
+		Expect(testEnv.Create(context.TODO(), clusterProfile)).To(Succeed())
+		Expect(waitForObject(context.TODO(), testEnv.Client, clusterProfile)).To(Succeed())
+
+		addOwnerReference(ctx, testEnv.Client, clusterSummary, clusterProfile)
+
+		currentClusterProfile := &configv1beta1.ClusterProfile{}
+		Expect(testEnv.Get(context.TODO(), types.NamespacedName{Name: clusterProfile.Name},
+			currentClusterProfile)).To(Succeed())
+		Expect(testEnv.Delete(context.TODO(), currentClusterProfile)).To(Succeed())
+
+		Eventually(func() bool {
+			err := testEnv.Get(context.TODO(), types.NamespacedName{Name: clusterProfile.Name},
+				currentClusterProfile)
+			if err != nil {
+				return false
+			}
+			return !currentClusterProfile.DeletionTimestamp.IsZero()
+		}, timeout, pollingInterval).Should(BeTrue())
+
+		reconciler := &controllers.ClusterProfileReconciler{
+			Client:          testEnv,
+			Scheme:          scheme,
+			ClusterMap:      make(map[corev1.ObjectReference]*libsveltosset.Set),
+			ClusterProfiles: make(map[corev1.ObjectReference]libsveltosv1beta1.Selector),
+			ClusterLabels:   make(map[corev1.ObjectReference]map[string]string),
+			Mux:             sync.Mutex{},
+		}
+
+		clusterProfileName := client.ObjectKey{
+			Name: clusterProfile.Name,
+		}
+
+		// Reconcile ClusterProfile. ClusterSummary will be marked for deletion.
+		// ClusterSummary has tough a finalizer (and there is no controller for it in this
+		// test) so ClusterSummary won't be removed.
+		// Since ClusterSummary won't be removed, ClusterProfile's finalizer will not be
+		// removed.
+
+		result, err := reconciler.Reconcile(context.TODO(), ctrl.Request{
+			NamespacedName: clusterProfileName,
+		})
+		// Because there was one ClusterSummary and reconciliation deleted it and requested a new reconciliation
+		Expect(err).To(BeNil())
+		Expect(result.RequeueAfter).ToNot(BeZero())
+
+		err = testEnv.Get(context.TODO(), clusterProfileName, currentClusterProfile)
+		Expect(err).ToNot(HaveOccurred())
+
+		Eventually(func() bool {
+			currentClusterSummary := &configv1beta1.ClusterSummary{}
+			err = testEnv.Get(context.TODO(),
+				types.NamespacedName{Namespace: clusterSummary.Namespace, Name: clusterSummary.Name},
+				currentClusterSummary)
+			if err != nil {
+				return false
+			}
+			return !currentClusterSummary.DeletionTimestamp.IsZero()
+		}, timeout, pollingInterval).Should(BeTrue())
+
+		// Remove ClusterSummary finalizer
+		currentClusterSummary := &configv1beta1.ClusterSummary{}
+		Expect(testEnv.Get(context.TODO(),
+			types.NamespacedName{Namespace: clusterSummary.Namespace, Name: clusterSummary.Name},
+			currentClusterSummary)).To(Succeed())
+		controllerutil.RemoveFinalizer(currentClusterSummary, configv1beta1.ClusterSummaryFinalizer)
+		Expect(testEnv.Update(context.TODO(), currentClusterSummary)).To(Succeed())
+
+		Eventually(func() bool {
+			err = testEnv.Get(context.TODO(),
+				types.NamespacedName{Namespace: clusterSummary.Namespace, Name: clusterSummary.Name},
+				currentClusterSummary)
+			return apierrors.IsNotFound(err)
+		}, timeout, pollingInterval).Should(BeTrue())
+
+		// Reconcile ClusterProfile again. Since all associated ClusterSummaries are
+		// gone, this reconciliation will remove finalizer and remove ClusterProfile
+
+		_, err = reconciler.Reconcile(context.TODO(), ctrl.Request{
+			NamespacedName: clusterProfileName,
+		})
+		Expect(err).ToNot(HaveOccurred())
+
+		Eventually(func() bool {
+			err = testEnv.Get(context.TODO(), clusterProfileName, currentClusterProfile)
+			return apierrors.IsNotFound(err)
+		}, timeout, pollingInterval).Should(BeTrue())
+	})
+
+	It("reconcileDelete waits for clusters to be unpaused when ClusterSummaries still present are for paused clusters",
+		func() {
+			paused := true
+			cluster := &clusterv1.Cluster{
+				ObjectMeta: metav1.ObjectMeta{Namespace: randomString(), Name: randomString()},
+				Spec:       clusterv1.ClusterSpec{Paused: &paused},
+			}
+			Expect(addTypeInformationToObject(scheme, cluster)).To(Succeed())
+
+			clusterSummary := getClusterSummaryWithFinalizer(configv1beta1.ClusterProfileKind, clusterProfile, cluster)
+
+			initObjects := []client.Object{clusterProfile, cluster, clusterSummary}
+			c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(initObjects...).
+				WithObjects(initObjects...).Build()
+
+			reconciler := &controllers.ClusterProfileReconciler{
+				Client:          c,
+				Scheme:          scheme,
+				ClusterMap:      make(map[corev1.ObjectReference]*libsveltosset.Set),
+				ClusterProfiles: make(map[corev1.ObjectReference]libsveltosv1beta1.Selector),
+				ClusterLabels:   make(map[corev1.ObjectReference]map[string]string),
+				Mux:             sync.Mutex{},
+			}
+
+			profileScope, err := scope.NewProfileScope(scope.ProfileScopeParams{
+				Client:         c,
+				Logger:         logger,
+				Profile:        clusterProfile,
+				ControllerName: testControllerNameProfile,
+			})
+			Expect(err).To(BeNil())
+
+			result := controllers.ClusterProfileReconcileDelete(reconciler, context.TODO(), profileScope)
+			Expect(result.RequeueAfter).To(Equal(controllers.PausedClustersRequeueAfter))
+
+			// ClusterProfile is reconciled again when the cluster changes (unpaused)
+			clusterRef := corev1.ObjectReference{
+				Namespace:  cluster.Namespace,
+				Name:       cluster.Name,
+				Kind:       clusterv1.ClusterKind,
+				APIVersion: clusterv1.GroupVersion.String(),
+			}
+			Expect(reconciler.ClusterMap).To(HaveKey(clusterRef))
+			consumers := reconciler.ClusterMap[clusterRef].Items()
+			Expect(consumers).To(HaveLen(1))
+			Expect(consumers[0].Name).To(Equal(clusterProfile.Name))
+			Expect(consumers[0].Kind).To(Equal(configv1beta1.ClusterProfileKind))
+		})
+
+	It("reconcileDelete keeps reconciling when ClusterSummaries still present are for clusters not paused", func() {
+		cluster := &clusterv1.Cluster{
+			ObjectMeta: metav1.ObjectMeta{Namespace: randomString(), Name: randomString()},
+		}
+		Expect(addTypeInformationToObject(scheme, cluster)).To(Succeed())
+
+		clusterSummary := getClusterSummaryWithFinalizer(configv1beta1.ClusterProfileKind, clusterProfile, cluster)
+
+		initObjects := []client.Object{clusterProfile, cluster, clusterSummary}
+		c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(initObjects...).
+			WithObjects(initObjects...).Build()
+
+		reconciler := &controllers.ClusterProfileReconciler{
+			Client:          c,
+			Scheme:          scheme,
+			ClusterMap:      make(map[corev1.ObjectReference]*libsveltosset.Set),
+			ClusterProfiles: make(map[corev1.ObjectReference]libsveltosv1beta1.Selector),
+			ClusterLabels:   make(map[corev1.ObjectReference]map[string]string),
+			Mux:             sync.Mutex{},
+		}
+
+		profileScope, err := scope.NewProfileScope(scope.ProfileScopeParams{
+			Client:         c,
+			Logger:         logger,
+			Profile:        clusterProfile,
+			ControllerName: testControllerNameProfile,
+		})
+		Expect(err).To(BeNil())
+
+		result := controllers.ClusterProfileReconcileDelete(reconciler, context.TODO(), profileScope)
+		Expect(result.RequeueAfter).To(Equal(controllers.DeleteRequeueAfter))
+		Expect(reconciler.ClusterMap).To(BeEmpty())
+	})
+
+	It("reconcileDelete removes the matching clusters metric of the ClusterProfile once the finalizer is removed", func() {
+		controllerutil.AddFinalizer(clusterProfile, configv1beta1.ClusterProfileFinalizer)
+
+		initObjects := []client.Object{clusterProfile}
+		c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(initObjects...).
+			WithObjects(initObjects...).Build()
+
+		reconciler := &controllers.ClusterProfileReconciler{
+			Client:          c,
+			Scheme:          scheme,
+			ClusterMap:      make(map[corev1.ObjectReference]*libsveltosset.Set),
+			ClusterProfiles: make(map[corev1.ObjectReference]libsveltosv1beta1.Selector),
+			ClusterLabels:   make(map[corev1.ObjectReference]map[string]string),
+			Mux:             sync.Mutex{},
+		}
+
+		profileScope, err := scope.NewProfileScope(scope.ProfileScopeParams{
+			Client:         c,
+			Logger:         logger,
+			Profile:        clusterProfile,
+			ControllerName: testControllerNameProfile,
+		})
+		Expect(err).To(BeNil())
+
+		// A Profile with the same name: its metric must stay.
+		profileNamespace := randomString()
+		controllers.TrackMatchingClusters(configv1beta1.ClusterProfileKind, "", clusterProfile.Name, 2, logger)
+		controllers.TrackMatchingClusters(configv1beta1.ProfileKind, profileNamespace, clusterProfile.Name, 1, logger)
+
+		clusterProfileLabels := profileMetricLabels(configv1beta1.ClusterProfileKind, "", clusterProfile.Name)
+		profileLabels := profileMetricLabels(configv1beta1.ProfileKind, profileNamespace, clusterProfile.Name)
+		Expect(hasMetricSeries("projectsveltos_matching_clusters", clusterProfileLabels)).To(BeTrue())
+
+		result := controllers.ClusterProfileReconcileDelete(reconciler, context.TODO(), profileScope)
+		Expect(result.RequeueAfter).To(BeZero())
+		Expect(controllerutil.ContainsFinalizer(clusterProfile, configv1beta1.ClusterProfileFinalizer)).To(BeFalse())
+
+		Expect(hasMetricSeries("projectsveltos_matching_clusters", clusterProfileLabels)).To(BeFalse())
+		Expect(hasMetricSeries("projectsveltos_matching_clusters", profileLabels)).To(BeTrue())
+	})
+})
+
+var _ = Describe("ClusterProfileReconciler: requeue methods", func() {
+	var matchingClusterProfile *configv1beta1.ClusterProfile
+	var nonMatchingClusterProfile *configv1beta1.ClusterProfile
+	var cluster *clusterv1.Cluster
+	var namespace string
+
+	BeforeEach(func() {
+		var err error
+		scheme, err = setupScheme()
+		Expect(err).ToNot(HaveOccurred())
+
+		namespace = randomString()
+
+		key1 := randomString()
+		value1 := randomString()
+		key2 := randomString()
+		value2 := randomString()
+
+		cluster = &clusterv1.Cluster{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      upstreamClusterNamePrefix + randomString(),
+				Namespace: namespace,
+				Labels: map[string]string{
+					key1: value1,
+					key2: value2,
+				},
+			},
+		}
+
+		matchingClusterProfile = &configv1beta1.ClusterProfile{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: clusterProfileNamePrefix + randomString(),
+			},
+			Spec: configv1beta1.Spec{
+				ClusterSelector: libsveltosv1beta1.Selector{
+					LabelSelector: metav1.LabelSelector{
+						MatchLabels: map[string]string{
+							key1: value1,
+							key2: value2,
+						},
+					},
+				},
+			},
+		}
+
+		nonMatchingClusterProfile = &configv1beta1.ClusterProfile{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: clusterProfileNamePrefix + randomString(),
+			},
+			Spec: configv1beta1.Spec{
+				ClusterSelector: libsveltosv1beta1.Selector{
+					LabelSelector: metav1.LabelSelector{
+						MatchLabels: map[string]string{
+							testEnvLabelKey: testProductionValue,
+						},
+					},
+				},
+			},
+		}
+	})
+
+	AfterEach(func() {
+		ns := &corev1.Namespace{}
+		Expect(testEnv.Get(context.TODO(), types.NamespacedName{Name: namespace}, ns)).To(Succeed())
+		Expect(testEnv.Delete(context.TODO(), matchingClusterProfile)).To(Succeed())
+		Expect(testEnv.Delete(context.TODO(), nonMatchingClusterProfile)).To(Succeed())
+		Expect(testEnv.Delete(context.TODO(), cluster)).To(Succeed())
+		Expect(testEnv.Delete(context.TODO(), ns)).To(Succeed())
+	})
+
+	It("RequeueClusterProfileForCluster returns correct ClusterProfiles for a CAPI cluster", func() {
+		ns := &corev1.Namespace{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: namespace,
+			},
+		}
+
+		clusterConfiguration := &configv1beta1.ClusterConfiguration{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: cluster.Namespace,
+				Name:      controllers.GetClusterConfigurationName(cluster.Name, libsveltosv1beta1.ClusterTypeCapi),
+			},
+		}
+
+		Expect(testEnv.Create(context.TODO(), ns)).To(Succeed())
+		Expect(testEnv.Create(context.TODO(), cluster)).To(Succeed())
+		Expect(testEnv.Create(context.TODO(), clusterConfiguration)).To(Succeed())
+		Expect(testEnv.Create(context.TODO(), matchingClusterProfile)).To(Succeed())
+		Expect(testEnv.Create(context.TODO(), nonMatchingClusterProfile)).To(Succeed())
+
+		Expect(waitForObject(context.TODO(), testEnv.Client, nonMatchingClusterProfile)).To(Succeed())
+
+		clusterProfileName := client.ObjectKey{
+			Name: matchingClusterProfile.Name,
+		}
+
+		clusterProfileReconciler := getClusterProfileReconciler(testEnv.Client)
+		_, err := clusterProfileReconciler.Reconcile(context.TODO(), ctrl.Request{
+			NamespacedName: clusterProfileName,
+		})
+		Expect(err).ToNot(HaveOccurred())
+
+		// Eventual loop so testEnv Cache is synced
+		Eventually(func() bool {
+			clusterProfileList := controllers.RequeueClusterProfileForCluster(clusterProfileReconciler,
+				context.TODO(), cluster)
+			result := reconcile.Request{NamespacedName: types.NamespacedName{Name: matchingClusterProfile.Name}}
+			for i := range clusterProfileList {
+				if clusterProfileList[i] == result {
+					return true
+				}
+			}
+			return false
+		}, timeout, pollingInterval).Should(BeTrue())
+	})
+})

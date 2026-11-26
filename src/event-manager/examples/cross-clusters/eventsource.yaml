@@ -1,0 +1,20 @@
+apiVersion: lib.projectsveltos.io/v1beta1
+kind: EventSource
+metadata:
+ name: load-balancer-service
+spec:
+ collectResources: true
+ resourceSelectors:
+ - group: ""
+   version: "v1"
+   kind: "Service"
+   evaluate: |
+    function evaluate()
+      hs = {}
+      hs.matching = false
+      hs.message = ""
+      if obj.status.loadBalancer.ingress ~= nil then
+        hs.matching = true
+      end
+      return hs
+    end

@@ -1,0 +1,157 @@
+/*
+Copyright 2025. projectsveltos.io. All rights reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package fv_test
+
+import (
+	"context"
+
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+	appsv1 "k8s.io/api/apps/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/types"
+
+	configv1beta1 "github.com/projectsveltos/addon-controller/api/v1beta1"
+	"github.com/projectsveltos/addon-controller/lib/clusterops"
+	libsveltosv1beta1 "github.com/projectsveltos/libsveltos/api/v1beta1"
+)
+
+const (
+	values = `      grafana:
+          enabled: true
+      alertmanager:
+          enabled: false
+      kubeEtcd:
+          service: {}
+          serviceMonitor: {}
+      prometheus:
+          prometheusSpec:
+              serviceMonitorSelectorNilUsesHelmValues: false
+              serviceMonitorNamespaceSelector:
+                  matchExpressions:
+                      - key: kubernetes.io/metadata.name
+                        operator: Exists
+          additionalServiceMonitors:
+              - name: k0s
+                selector:
+                  matchLabels:
+                      app: k0s-observability
+                      component: pushgateway
+                      k0s.k0sproject.io/stack: metrics
+                namespaceSelector:
+                  matchNames:
+                      - k0s-system
+                endpoints:
+                  - port: http
+                    metricRelabelings:
+                      - sourceLabels:
+                          - exported_job
+                        targetLabel: job
+      kubelet:
+          serviceMonitor:
+              cAdvisor: true`
+)
+
+var _ = Describe("Feature", func() {
+	const (
+		namePrefix      = "auto-deploy-dependencies-"
+		deplNamespace   = "kube-prometheus-stack"
+		deplName        = "kube-prometheus-stack-operator"
+		tokenSecretName = "kube-prometheus-stack-prometheus-token"
+	)
+
+	// This Helm release contains corev1.List. Verify those are expanded so drift-detection can watch for configuration drift
+	It("Expand corev1List in helm charts", Label("NEW-FV", "NEW-FV-PULLMODE"), func() {
+		Byf("Get a ClusterProfile matching Cluster %s/%s", kindWorkloadCluster.GetNamespace(), kindWorkloadCluster.GetName())
+		clusterProfile := getClusterProfile(namePrefix, map[string]string{key: value})
+		Byf("Create ClusterProfile %s to deploy kube-prometheus-stack helm chart", clusterProfile.Name)
+		clusterProfile.Spec.HelmCharts = []configv1beta1.HelmChart{
+			{
+				RepositoryURL:    prometheusCommunityURL,
+				RepositoryName:   prometheusCommunityName,
+				ChartName:        "prometheus-community/kube-prometheus-stack",
+				ChartVersion:     kubePrometheusVersion,
+				ReleaseName:      deplNamespace,
+				ReleaseNamespace: deplNamespace,
+				HelmChartAction:  configv1beta1.HelmChartActionInstall,
+				Values:           values,
+			},
+		}
+		clusterProfile.Spec.SyncMode = configv1beta1.SyncModeContinuousWithDriftDetection
+
+		// The chart creates a kubernetes.io/service-account-token Secret. Shortly after it is created, kube-apiserver
+		// adds the kubernetes.io/legacy-token-last-used label to it. Labels are part of what drift detection
+		// evaluates, so this would be reported as configuration drift and trigger a redeploy of the chart.
+		// That has nothing to do with what this test verifies, so ignore the Secret for configuration drift.
+		clusterProfile.Spec.Patches = []libsveltosv1beta1.Patch{
+			{
+				Patch: ignoreConfigurationDriftPatch,
+				Target: &libsveltosv1beta1.PatchSelector{
+					Version:   apiVersionV1,
+					Kind:      kindSecret,
+					Namespace: deplNamespace,
+					Name:      tokenSecretName,
+				},
+			},
+		}
+
+		Expect(k8sClient.Create(context.TODO(), clusterProfile)).To(Succeed())
+
+		verifyClusterProfileMatches(clusterProfile)
+
+		clusterSummary := verifyClusterSummary(clusterops.ClusterProfileLabelName,
+			clusterProfile.Name, &clusterProfile.Spec,
+			kindWorkloadCluster.GetNamespace(), kindWorkloadCluster.GetName(), getClusterType())
+
+		Byf("Getting client to access the workload cluster")
+		workloadClient, err := getKindWorkloadClusterKubeconfig()
+		Expect(err).To(BeNil())
+		Expect(workloadClient).ToNot(BeNil())
+
+		Byf("Verifying kube-prometheus-stack-operator deployment is created in the workload cluster")
+		Eventually(func() bool {
+			depl := &appsv1.Deployment{}
+			err = workloadClient.Get(context.TODO(),
+				types.NamespacedName{Namespace: deplNamespace, Name: deplName}, depl)
+			if err != nil {
+				return false
+			}
+			return *depl.Spec.Replicas == depl.Status.ReadyReplicas
+		}, timeout, pollingInterval).Should(BeTrue())
+
+		Byf("Verifying ClusterSummary %s status is set to Deployed for Helm feature", clusterSummary.Name)
+		verifyFeatureStatusIsProvisioned(kindWorkloadCluster.GetNamespace(), clusterSummary.Name, libsveltosv1beta1.FeatureHelm)
+
+		charts := []configv1beta1.Chart{
+			{ReleaseName: deplNamespace, ChartVersion: kubePrometheusVersion, Namespace: deplNamespace},
+		}
+
+		verifyClusterConfiguration(configv1beta1.ClusterProfileKind, clusterProfile.Name,
+			clusterSummary.Spec.ClusterNamespace, clusterSummary.Spec.ClusterName, libsveltosv1beta1.FeatureHelm,
+			nil, charts)
+
+		deleteClusterProfile(clusterProfile)
+
+		Byf("Verifying kube-prometheus-stack deployment is removed from workload cluster")
+		Eventually(func() bool {
+			depl := &appsv1.Deployment{}
+			err = workloadClient.Get(context.TODO(),
+				types.NamespacedName{Namespace: deplNamespace, Name: deplName}, depl)
+			return apierrors.IsNotFound(err)
+		}, timeout, pollingInterval).Should(BeTrue())
+	})
+})

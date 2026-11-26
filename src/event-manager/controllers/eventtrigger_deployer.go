@@ -1,0 +1,3800 @@
+/*
+Copyright 2023. projectsveltos.io. All rights reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package controllers
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"reflect"
+	"sort"
+	"strings"
+	"sync"
+	"text/template"
+	"time"
+
+	sourcev1 "github.com/fluxcd/source-controller/api/v1"
+	"github.com/gdexlab/go-render/render"
+	"github.com/go-logr/logr"
+	"github.com/pkg/errors"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset/scheme"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/rest"
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
+	"sigs.k8s.io/cluster-api/util"
+	"sigs.k8s.io/cluster-api/util/annotations"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	configv1beta1 "github.com/projectsveltos/addon-controller/api/v1beta1"
+	"github.com/projectsveltos/event-manager/api/v1beta1"
+	"github.com/projectsveltos/event-manager/pkg/scope"
+	libsveltosv1beta1 "github.com/projectsveltos/libsveltos/api/v1beta1"
+	"github.com/projectsveltos/libsveltos/lib/clustercache"
+	"github.com/projectsveltos/libsveltos/lib/clusterproxy"
+	"github.com/projectsveltos/libsveltos/lib/deployer"
+	"github.com/projectsveltos/libsveltos/lib/funcmap"
+	"github.com/projectsveltos/libsveltos/lib/k8s_utils"
+	logs "github.com/projectsveltos/libsveltos/lib/logsettings"
+	"github.com/projectsveltos/libsveltos/lib/pullmode"
+	"github.com/projectsveltos/libsveltos/lib/randutils"
+	"github.com/projectsveltos/libsveltos/lib/sharding"
+)
+
+const (
+	deployedBySveltosTrueValue = "true"
+	coreAPIVersion             = "v1"
+
+	// TODO: remove this (it is replaced by eventSourceNameLabel)
+	eventReportNameLabel = "eventtrigger.lib.projectsveltos.io/eventreportname"
+
+	eventSourceNameLabel             = "eventtrigger.lib.projectsveltos.io/eventsourcename"
+	eventTriggerNameLabel            = "eventtrigger.lib.projectsveltos.io/eventtriggername"
+	clusterNamespaceLabel            = "eventtrigger.lib.projectsveltos.io/clusterNamespace"
+	clusterNameLabel                 = "eventtrigger.lib.projectsveltos.io/clustername"
+	clusterTypeLabel                 = "eventtrigger.lib.projectsveltos.io/clustertype"
+	cloudEventSourceLabel            = "eventtrigger.lib.projectsveltos.io/cesource"
+	cloudEventSubjectLabel           = "eventtrigger.lib.projectsveltos.io/cesubject"
+	generatorLabel                   = "eventtrigger.lib.projectsveltos.io/fromgenerator"
+	referencedResourceNamespaceLabel = "eventtrigger.lib.projectsveltos.io/refnamespace"
+	referencedResourceNameLabel      = "eventtrigger.lib.projectsveltos.io/refname"
+)
+
+type getCurrentHash func(tx context.Context, c client.Client,
+	chc *v1beta1.EventTrigger, cluster *corev1.ObjectReference, logger logr.Logger) ([]byte, error)
+
+type feature struct {
+	id          string
+	currentHash getCurrentHash
+	deploy      deployer.RequestHandler
+	undeploy    deployer.RequestHandler
+}
+
+const (
+	// The failure messages of a cluster which is not a failure to deploy the EventTrigger: the cluster is paused,
+	// not ready or down, its agent is not healthy, or a previous cleanup is still in progress. They are not
+	// recorded as events.
+	msgClusterPausedOrNotReady = "cannot proceed deploying. Either cluster is paused or not ready."
+	msgAgentNotHealthy         = "agent in managed cluster is not healthy."
+	msgCleanupInProgress       = "cleanup is in progress"
+)
+
+func (r *EventTriggerReconciler) isClusterAShardMatch(ctx context.Context,
+	clusterInfo *libsveltosv1beta1.ClusterInfo) (bool, error) {
+
+	clusterType := clusterproxy.GetClusterType(&clusterInfo.Cluster)
+	cluster, err := clusterproxy.GetCluster(ctx, r.Client, clusterInfo.Cluster.Namespace,
+		clusterInfo.Cluster.Name, clusterType)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return true, nil
+		}
+		return false, err
+	}
+
+	return sharding.IsShardAMatch(r.ShardKey, cluster), nil
+}
+
+// deployEventBasedAddon update necessary resources (eventSource) in the managed clusters
+func (r *EventTriggerReconciler) deployEventTrigger(ctx context.Context, eScope *scope.EventTriggerScope,
+	f feature, logger logr.Logger) error {
+
+	resource := eScope.EventTrigger
+
+	logger = logger.WithValues("eventTrigger", resource.Name)
+	logger.V(logs.LogDebug).Info("request to evaluate/deploy")
+
+	var errorSeen error
+	allProcessed := true
+
+	for i := range resource.Status.ClusterInfo {
+		c := &resource.Status.ClusterInfo[i]
+
+		l := logger.WithValues("cluster", fmt.Sprintf("%s:%s/%s",
+			c.Cluster.Kind, c.Cluster.Namespace, c.Cluster.Name))
+
+		shardMatch, err := r.isClusterAShardMatch(ctx, c)
+		if err != nil {
+			return err
+		}
+
+		var clusterInfo *libsveltosv1beta1.ClusterInfo
+		if !shardMatch {
+			l.V(logs.LogDebug).Info("cluster is not a shard match")
+			// Since cluster is not a shard match, another deployment will deploy and update
+			// this specific clusterInfo status. Here we simply return current status.
+			clusterInfo = c
+			if clusterInfo.Status != libsveltosv1beta1.SveltosStatusProvisioned {
+				allProcessed = false
+			}
+			// This is a required parameter. It is set by the deployment matching the
+			// cluster shard. if not set yet, set it to empty
+			if clusterInfo.Hash == nil {
+				str := base64.StdEncoding.EncodeToString([]byte("empty"))
+				clusterInfo.Hash = []byte(str)
+			}
+		} else {
+			clusterInfo, err = r.processEventTrigger(ctx, eScope, &c.Cluster, f, l)
+			if err != nil {
+				errorSeen = err
+			}
+			if clusterInfo != nil {
+				if clusterInfo.Hash == nil {
+					l.V(logs.LogDebug).Info("hash is not set. Skip this.")
+				} else {
+					// c is what the EventTrigger recorded for this cluster before this attempt
+					recordClusterInfoFailure(ctx, r.Client, resource, c.FailureMessage, clusterInfo)
+					resource.Status.ClusterInfo[i] = *clusterInfo
+					if clusterInfo.Status != libsveltosv1beta1.SveltosStatusProvisioned &&
+						clusterInfo.Status != libsveltosv1beta1.SveltosStatusFailedNonRetriable {
+
+						allProcessed = false
+					}
+					r.trackClusterInfoOutcome(clusterInfo, resource.Name, l)
+				}
+			}
+		}
+	}
+
+	// Filter out entries with Statuslibsveltosv1beta1.SveltosStatusRemoved
+	n := 0
+	for i := range resource.Status.ClusterInfo {
+		if resource.Status.ClusterInfo[i].Status != libsveltosv1beta1.SveltosStatusRemoved {
+			resource.Status.ClusterInfo[n] = resource.Status.ClusterInfo[i]
+			n++
+		}
+	}
+	// Truncate the slice to the new length
+	resource.Status.ClusterInfo = resource.Status.ClusterInfo[:n]
+
+	logger.V(logs.LogDebug).Info("set clusterInfo")
+	eScope.SetClusterInfo(resource.Status.ClusterInfo)
+
+	if errorSeen != nil {
+		return errorSeen
+	}
+
+	if !allProcessed {
+		return fmt.Errorf("request to process EventTrigger is still queued in one ore more clusters")
+	}
+
+	return nil
+}
+
+// trackClusterInfoOutcome records reconcile-outcome metrics for a terminal clusterInfo.Status. Non-terminal
+// statuses (Provisioning, Removing) are intentionally not tracked.
+func (r *EventTriggerReconciler) trackClusterInfoOutcome(clusterInfo *libsveltosv1beta1.ClusterInfo,
+	eventTriggerName string, logger logr.Logger) {
+
+	clusterType := clusterproxy.GetClusterType(&clusterInfo.Cluster)
+
+	switch clusterInfo.Status {
+	case libsveltosv1beta1.SveltosStatusProvisioned, libsveltosv1beta1.SveltosStatusRemoved:
+		trackReconcileOutcome(clusterInfo.Cluster.Namespace, clusterInfo.Cluster.Name, clusterType,
+			true, eventTriggerName, logger)
+		trackLastSuccess(clusterInfo.Cluster.Namespace, clusterInfo.Cluster.Name, clusterType,
+			time.Now(), eventTriggerName, logger)
+	case libsveltosv1beta1.SveltosStatusFailed, libsveltosv1beta1.SveltosStatusFailedNonRetriable:
+		trackReconcileOutcome(clusterInfo.Cluster.Namespace, clusterInfo.Cluster.Name, clusterType,
+			false, eventTriggerName, logger)
+	case libsveltosv1beta1.SveltosStatusProvisioning, libsveltosv1beta1.SveltosStatusRemoving:
+		// Non-terminal; nothing to track yet.
+	}
+}
+
+// undeployEventBasedAddon clean resources in managed clusters
+func (r *EventTriggerReconciler) undeployEventTrigger(ctx context.Context, eScope *scope.EventTriggerScope,
+	clusterInfo []libsveltosv1beta1.ClusterInfo, logger logr.Logger) error {
+
+	f := getHandlersForFeature(v1beta1.FeatureEventTrigger)
+
+	resource := eScope.EventTrigger
+
+	logger = logger.WithValues("eventTrigger", resource.Name)
+	logger.V(logs.LogDebug).Info("request to undeploy")
+
+	var err error
+	for i := range clusterInfo {
+		l := logger.WithValues("cluster", fmt.Sprintf("%s:%s/%s",
+			clusterInfo[i].Cluster.Kind, clusterInfo[i].Cluster.Namespace, clusterInfo[i].Cluster.Name))
+
+		shardMatch, tmpErr := r.isClusterAShardMatch(ctx, &clusterInfo[i])
+		if tmpErr != nil {
+			err = tmpErr
+			continue
+		}
+
+		if !shardMatch && clusterInfo[i].Status != libsveltosv1beta1.SveltosStatusRemoved {
+			// If shard is not a match, wait for other controller to remove
+			err = fmt.Errorf("remove pending")
+			continue
+		}
+
+		l.V(logs.LogDebug).Info("undeploy EventTrigger")
+		newInfo, tmpErr := r.removeEventTrigger(ctx, eScope, &clusterInfo[i].Cluster, clusterInfo[i].Hash,
+			f, l)
+
+		// Always update the slice with the returned state if it exists
+		if newInfo != nil {
+			// clusterInfo[i] is what the EventTrigger recorded for this cluster before this attempt
+			recordClusterInfoFailure(ctx, r.Client, resource, clusterInfo[i].FailureMessage, newInfo)
+			clusterInfo[i] = *newInfo
+		}
+
+		if tmpErr != nil {
+			err = tmpErr
+			continue
+		}
+	}
+
+	// Filter out entries with Statuslibsveltosv1beta1.SveltosStatusRemoved
+	n := 0
+	for i := range resource.Status.ClusterInfo {
+		if resource.Status.ClusterInfo[i].Status != libsveltosv1beta1.SveltosStatusRemoved {
+			resource.Status.ClusterInfo[n] = resource.Status.ClusterInfo[i]
+			n++
+		}
+	}
+	// Truncate the slice to the new length
+	resource.Status.ClusterInfo = resource.Status.ClusterInfo[:n]
+
+	return err
+}
+
+// processEventTriggerForCluster deploys necessary resources in managed cluster.
+func processEventTriggerForCluster(ctx context.Context, c client.Client,
+	clusterNamespace, clusterName, applicant, featureID string,
+	clusterType libsveltosv1beta1.ClusterType, options deployer.Options, logger logr.Logger) error {
+
+	logger = logger.WithValues("eventTrigger", applicant)
+	logger = logger.WithValues("cluster", fmt.Sprintf("%s:%s/%s", clusterType, clusterNamespace, clusterName))
+
+	resource := &v1beta1.EventTrigger{}
+	err := c.Get(ctx, types.NamespacedName{Name: applicant}, resource)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			logger.V(logs.LogDebug).Info("eventTrigger not found")
+			return nil
+		}
+		return err
+	}
+
+	if !resource.DeletionTimestamp.IsZero() {
+		logger.V(logs.LogDebug).Info("eventTrigger marked for deletion")
+		return nil
+	}
+	logger.V(logs.LogDebug).Info("Deploy eventTrigger")
+
+	err = deployEventSource(ctx, c, clusterNamespace, clusterName, clusterType, resource, options, logger)
+	if err != nil {
+		logger.V(logs.LogDebug).Info("failed to deploy referenced EventSource")
+		return err
+	}
+
+	err = removeStaleEventSources(ctx, c, clusterNamespace, clusterName, clusterType, resource, false, logger)
+	if err != nil {
+		logger.V(logs.LogDebug).Info("failed to remove stale EventSources")
+		return err
+	}
+
+	logger.V(logs.LogDebug).Info("Deployed eventTrigger")
+	return nil
+}
+
+// undeployEventTriggerResourcesFromCluster cleans resources associtated with EventTrigger instance:
+// - resources (EventSource) from managed cluster
+// - resources (EventReports) from the management cluster (those were pulled from the managed cluster)
+// - resources instantiated in the management cluster (ConfigMap/Secrets expressed as templated referenced
+// in PolicyRefs/ValuesFrom sections)
+func undeployEventTriggerResourcesFromCluster(ctx context.Context, c client.Client,
+	clusterNamespace, clusterName, applicant, featureID string,
+	clusterType libsveltosv1beta1.ClusterType, options deployer.Options, logger logr.Logger) error {
+
+	logger = logger.WithValues("eventTrigger", applicant)
+	logger = logger.WithValues("cluster", fmt.Sprintf("%s:%s/%s", clusterType, clusterNamespace, clusterName))
+
+	eventTrigger := &v1beta1.EventTrigger{}
+	err := c.Get(ctx, types.NamespacedName{Name: applicant}, eventTrigger)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			logger.V(logs.LogDebug).Info("eventTrigger not found")
+			return nil
+		}
+		return err
+	}
+
+	// This was queued while the cluster was still present; time may have passed since then,
+	// so check again. If the cluster is gone by now, there is no agent left to undeploy from
+	// or to ack a pull mode removal request.
+	var clusterStillExists bool
+	cluster, err := clusterproxy.GetCluster(ctx, c, clusterNamespace, clusterName, clusterType)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			clusterStillExists = false
+		} else {
+			return err
+		}
+	} else {
+		clusterStillExists = cluster.GetDeletionTimestamp().IsZero()
+	}
+
+	if clusterStillExists {
+		isPullMode, err := clusterproxy.IsClusterInPullMode(ctx, c, clusterNamespace, clusterName,
+			clusterType, logger)
+		if err != nil {
+			logger.V(logs.LogInfo).Error(err, "failed to verify if Cluster is in pull mode")
+			return err
+		}
+
+		if isPullMode {
+			logger.V(logs.LogDebug).Info("Undeploy eventTrigger in pull mode")
+			err := undeployEventTriggerInPullMode(ctx, c, clusterNamespace, clusterName, eventTrigger, logger)
+			if err != nil {
+				logger.V(logs.LogInfo).Error(err, "failed to undeploy eventTrigger in pull mode")
+				return err
+			}
+		}
+	} else {
+		logger.V(logs.LogDebug).Info("cluster is gone, skipping pull mode undeploy")
+	}
+
+	logger.V(logs.LogDebug).Info("Undeploy eventTrigger. Removing EventSource")
+
+	// in pull mode, stale eventSources are removed from
+	err = removeStaleEventSources(ctx, c, clusterNamespace, clusterName, clusterType, eventTrigger, true, logger)
+	if err != nil {
+		logger.V(logs.LogInfo).Error(err, "failed to remove eventSources")
+		return err
+	}
+
+	logger.V(logs.LogDebug).Info("Undeploy eventTrigger. Removing EventReports")
+	// Remove all EventReports pulled from this managed cluster because of this EventSource
+	err = removeStaleEventReports(ctx, c, clusterNamespace, clusterName,
+		eventTrigger.Spec.EventSourceName, clusterType, logger)
+	if err != nil {
+		logger.V(logs.LogInfo).Error(err, "failed to remove stale EventReports")
+		return err
+	}
+
+	logger.V(logs.LogDebug).Info("Undeployed eventTrigger.")
+
+	logger.V(logs.LogDebug).Info("Clearing instantiated ClusterProfile/ConfigMap/Secret instances")
+	return removeInstantiatedResources(ctx, c, clusterNamespace, clusterName, clusterType, eventTrigger,
+		nil, nil, nil, logger)
+}
+
+func sortResources(resources []client.Object) {
+	sort.Slice(resources, func(i, j int) bool {
+		a, b := resources[i], resources[j]
+
+		// 1. Sort by APIVersion
+		if a.GetObjectKind().GroupVersionKind().GroupVersion().String() !=
+			b.GetObjectKind().GroupVersionKind().GroupVersion().String() {
+
+			return a.GetObjectKind().GroupVersionKind().GroupVersion().String() <
+				b.GetObjectKind().GroupVersionKind().GroupVersion().String()
+		}
+
+		// 2. Sort by Kind
+		if a.GetObjectKind().GroupVersionKind().Kind != b.GetObjectKind().GroupVersionKind().Kind {
+			return a.GetObjectKind().GroupVersionKind().Kind < b.GetObjectKind().GroupVersionKind().Kind
+		}
+
+		// 3. Sort by Namespace
+		if a.GetNamespace() != b.GetNamespace() {
+			return a.GetNamespace() < b.GetNamespace()
+		}
+
+		// 4. Sort by Name
+		return a.GetName() < b.GetName()
+	})
+}
+
+func getSortedSpec(spec *v1beta1.EventTriggerSpec) *v1beta1.EventTriggerSpec {
+	specCopy := spec.DeepCopy()
+
+	specCopy.PolicyRefs = getSortedPolicyRefs(spec.PolicyRefs)
+
+	specCopy.TemplateResourceRefs = getSortedTemplateResourceRefs(spec.TemplateResourceRefs)
+
+	specCopy.DriftExclusions = getSortedDriftExclusions(spec.DriftExclusions)
+
+	specCopy.KustomizationRefs = getSortedKustomizationRefs(spec.KustomizationRefs)
+
+	specCopy.HelmCharts = getSortedHelmCharts(spec.HelmCharts)
+
+	specCopy.Patches = getSortedPatches(spec.Patches)
+
+	specCopy.PreDeployChecks = getSortedValidateHealths(spec.PreDeployChecks)
+
+	specCopy.ValidateHealths = getSortedValidateHealths(spec.ValidateHealths)
+
+	specCopy.PreDeleteChecks = getSortedValidateHealths(spec.PreDeleteChecks)
+
+	specCopy.PostDeleteChecks = getSortedValidateHealths(spec.PostDeleteChecks)
+
+	sort.Strings(specCopy.ClusterSetRefs)
+	sort.Strings(specCopy.DependsOn)
+	return specCopy
+}
+
+func eventTriggerHash(ctx context.Context, c client.Client,
+	e *v1beta1.EventTrigger, cluster *corev1.ObjectReference, logger logr.Logger) ([]byte, error) {
+
+	var config strings.Builder
+	config.WriteString(getVersion())
+
+	specCopy := getSortedSpec(&e.Spec)
+	config.WriteString(render.AsCode(specCopy))
+
+	keys := make([]string, 0, len(e.Labels))
+	for k := range e.Labels {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		fmt.Fprintf(&config, "%s:%s", k, e.Labels[k])
+	}
+
+	resources, err := fetchReferencedResources(ctx, c, e, cluster, logger)
+	if err != nil {
+		return nil, err
+	}
+	sortResources(resources)
+
+	for i := range resources {
+		switch r := resources[i].(type) {
+		case *corev1.ConfigMap:
+			config.WriteString(render.AsCode(getSortedMap(r.Data)))
+		case *corev1.Secret:
+			config.WriteString(render.AsCode(getSortedMapBinary(r.Data)))
+			config.WriteString(render.AsCode(getSortedMap(r.StringData)))
+		case *sourcev1.Bucket:
+			config.WriteString(render.AsCode(r.Status.Artifact))
+		case *sourcev1.OCIRepository:
+			config.WriteString(render.AsCode(r.Status.Artifact))
+		case *sourcev1.GitRepository:
+			config.WriteString(render.AsCode(r.Status.Artifact))
+		case *libsveltosv1beta1.EventSource:
+			config.WriteString(render.AsCode(r.Spec))
+		case *libsveltosv1beta1.EventReport:
+			reportCopy := r.DeepCopy()
+			sort.Slice(reportCopy.Spec.MatchingResources, func(i, j int) bool {
+				mi := reportCopy.Spec.MatchingResources[i]
+				mj := reportCopy.Spec.MatchingResources[j]
+				if mi.Kind != mj.Kind {
+					return mi.Kind < mj.Kind
+				}
+				if mi.Namespace != mj.Namespace {
+					return mi.Namespace < mj.Namespace
+				}
+				return mi.Name < mj.Name
+			})
+			sort.Slice(reportCopy.Spec.CloudEvents, func(i, j int) bool {
+				return string(reportCopy.Spec.CloudEvents[i]) < string(reportCopy.Spec.CloudEvents[j])
+			})
+			config.WriteString(render.AsCode(reportCopy.Spec))
+		default:
+			logger.Info("unsupported resource type in hash calculation", "type", fmt.Sprintf("%T", r))
+			panic(1)
+		}
+	}
+
+	if getAgentInMgmtCluster() {
+		config.WriteString("agentless")
+	}
+
+	h := sha256.New()
+	h.Write([]byte(config.String()))
+	return h.Sum(nil), nil
+}
+
+// processEventTrigger detects whether it is needed to deploy EventBasedAddon resources in current passed cluster.
+func (r *EventTriggerReconciler) processEventTrigger(ctx context.Context, eScope *scope.EventTriggerScope,
+	cluster *corev1.ObjectReference, f feature, logger logr.Logger,
+) (*libsveltosv1beta1.ClusterInfo, error) {
+
+	eventTrigger := eScope.EventTrigger
+
+	// Get EventTrigger Spec hash (at this very precise moment)
+	currentHash, err := eventTriggerHash(ctx, r.Client, eventTrigger, cluster, logger)
+	if err != nil {
+		logger.V(logs.LogInfo).Error(err, "failed to evaluate current hash")
+		return nil, err
+	}
+
+	if !isClusterStillMatching(eScope, cluster) {
+		return r.removeEventTrigger(ctx, eScope, cluster, currentHash, f, logger)
+	}
+
+	clusterInfo := &libsveltosv1beta1.ClusterInfo{
+		Cluster:        *cluster,
+		Hash:           currentHash,
+		FailureMessage: stringPtr(""),
+		Status:         libsveltosv1beta1.SveltosStatusProvisioning,
+	}
+
+	proceed, err := r.canProceed(ctx, eScope, cluster, logger)
+	if err != nil {
+		failureMessage := err.Error()
+		clusterInfo.FailureMessage = &failureMessage
+		return clusterInfo, err
+	} else if !proceed {
+		failureMessage := msgClusterPausedOrNotReady
+		clusterInfo.FailureMessage = &failureMessage
+		return clusterInfo, nil
+	}
+	isHealthy, err := r.isAgentHealthy(ctx, cluster, logger)
+	if err != nil {
+		failureMessage := err.Error()
+		clusterInfo.FailureMessage = &failureMessage
+		return clusterInfo, err
+	}
+	if !isHealthy {
+		failureMessage := msgAgentNotHealthy
+		logger.V(logs.LogInfo).Info(failureMessage)
+		clusterInfo.FailureMessage = &failureMessage
+		clusterInfo.Status = libsveltosv1beta1.SveltosStatusFailedNonRetriable
+		return clusterInfo, nil
+	}
+
+	// Remove any queued entry to cleanup
+	r.Deployer.CleanupEntries(cluster.Namespace, cluster.Name, eventTrigger.Name, f.id,
+		clusterproxy.GetClusterType(cluster), true)
+
+	// If undeploying feature is in progress, wait for it to complete.
+	// Otherwise, if we redeploy feature while same feature is still being cleaned up, if two workers process those request in
+	// parallel some resources might end up missing.
+	if r.Deployer.IsInProgress(cluster.Namespace, cluster.Name, eventTrigger.Name, f.id,
+		clusterproxy.GetClusterType(cluster), true) {
+
+		msg := msgCleanupInProgress
+		clusterInfo.FailureMessage = &msg
+		logger.V(logs.LogDebug).Info(msg)
+		return clusterInfo, fmt.Errorf("cleanup of %s in cluster still in progress. Wait before redeploying", f.id)
+	}
+
+	isPullMode, err := clusterproxy.IsClusterInPullMode(ctx, r.Client, cluster.Namespace,
+		cluster.Name, clusterproxy.GetClusterType(cluster), logger)
+	if err != nil {
+		msg := fmt.Sprintf("failed to verify if Cluster is in pull mode: %v", err)
+		logger.V(logs.LogDebug).Info(msg)
+		clusterInfo.FailureMessage = &msg
+		return clusterInfo, err
+	}
+
+	// Get the EventTrigger hash when EventTrigger was last deployed/evaluated in this cluster (if ever)
+	hash, _ := r.getClusterHashAndStatus(eventTrigger, cluster)
+	isConfigSame := reflect.DeepEqual(hash, currentHash)
+	if !isConfigSame {
+		logger.V(logs.LogDebug).Info(fmt.Sprintf("EventTrigger has changed. Current hash %x. Previous hash %x",
+			currentHash, hash))
+		// Reset EventReport Status in the management cluster or managed cluster. This will cause ClusterProfiles to be updated.
+		// Deployment of ClusterProfiles happen when EventReport instances are collected. And only EventReport instances marked
+		// as non processed, are redeployed.
+		// Since something has changed in the EventTrigger configuration, this make sures ClusterProfiles are properly updated.
+		// Without this, only EventReport update (in the eventReport collection code) will trigger a ClusterProfile update.
+		err := r.resetEventReportStatus(ctx, eventTrigger, cluster, isPullMode, logger)
+		if err != nil {
+			msg := err.Error()
+			clusterInfo.FailureMessage = &msg
+			logger.V(logs.LogDebug).Error(err, "failed resetting EventReport status")
+			return clusterInfo, err
+		}
+	} else {
+		logger.V(logs.LogDebug).Info("EventTrigger has not changed")
+	}
+
+	return r.proceedProcessingEventTrigger(ctx, eScope, cluster, isPullMode, isConfigSame, currentHash, f, logger)
+}
+
+func (r *EventTriggerReconciler) proceedProcessingEventTrigger(ctx context.Context, eScope *scope.EventTriggerScope,
+	cluster *corev1.ObjectReference, isPullMode, isConfigSame bool, currentHash []byte, f feature, logger logr.Logger,
+) (*libsveltosv1beta1.ClusterInfo, error) {
+
+	clusterInfo := &libsveltosv1beta1.ClusterInfo{
+		Cluster:        *cluster,
+		Hash:           currentHash,
+		FailureMessage: stringPtr(""),
+		Status:         libsveltosv1beta1.SveltosStatusProvisioning,
+	}
+
+	resource := eScope.EventTrigger
+	_, currentStatus := r.getClusterHashAndStatus(resource, cluster)
+
+	var deployerStatus *libsveltosv1beta1.SveltosFeatureStatus
+	var result deployer.Result
+
+	if isConfigSame {
+		logger.V(logs.LogDebug).Info("EventTrigger has not changed")
+		result = r.Deployer.GetResult(ctx, cluster.Namespace, cluster.Name, resource.Name, f.id,
+			clusterproxy.GetClusterType(cluster), false)
+		deployerStatus = r.convertResultStatus(result)
+	}
+
+	previousError := eScope.GetFailureMessage(cluster)
+	clusterInfo.FailureMessage = previousError
+	if deployerStatus != nil {
+		logger.V(logs.LogDebug).Info(fmt.Sprintf("result is available %q. updating status.", *deployerStatus))
+
+		clusterInfo.Status = *deployerStatus
+
+		if result.Err != nil {
+			errorMessage := result.Err.Error()
+			clusterInfo.FailureMessage = &errorMessage
+
+			clustercache.GetManager().InvalidateOnAuthError(cluster.Namespace, cluster.Name,
+				clusterproxy.GetClusterType(cluster), result.Err)
+		}
+
+		if *deployerStatus == libsveltosv1beta1.SveltosStatusProvisioned {
+			if isPullMode {
+				// provisioned here means configuration for sveltos-applier has been successufully prepared.
+				// In pull mode, verify now agent has deployed the configuration.
+				return r.proceedDeployingEventTriggerInPullMode(ctx, eScope, cluster, f, isConfigSame,
+					currentHash, logger)
+			}
+
+			return clusterInfo, nil
+		}
+
+		if *deployerStatus == libsveltosv1beta1.SveltosStatusProvisioning {
+			return clusterInfo, fmt.Errorf("EventTrigger is still being provisioned")
+		}
+	} else if isConfigSame && currentStatus != nil && *currentStatus == libsveltosv1beta1.SveltosStatusProvisioned {
+		logger.V(logs.LogDebug).Info("already deployed")
+		clusterInfo.Status = libsveltosv1beta1.SveltosStatusProvisioned
+		clusterInfo.FailureMessage = stringPtr("")
+	} else {
+		logger.V(logs.LogDebug).Info("no result is available. queue job and mark status as provisioning")
+		clusterInfo.Status = libsveltosv1beta1.SveltosStatusProvisioning
+		options := deployer.Options{HandlerOptions: make(map[string]any)}
+		options.HandlerOptions[configurationHash] = currentHash
+		if err := r.Deployer.Deploy(ctx, cluster.Namespace, cluster.Name, resource.Name, f.id,
+			clusterproxy.GetClusterType(cluster), false, f.deploy, programDuration, options); err != nil {
+			failureMessage := err.Error()
+			clusterInfo.FailureMessage = &failureMessage
+			return clusterInfo, err
+		}
+	}
+
+	if clusterInfo.Hash == nil {
+		panic(1)
+	}
+
+	return clusterInfo, nil
+}
+
+func (r *EventTriggerReconciler) proceedDeployingEventTriggerInPullMode(ctx context.Context,
+	eScope *scope.EventTriggerScope, cluster *corev1.ObjectReference, f feature,
+	isConfigSame bool, currentHash []byte, logger logr.Logger) (*libsveltosv1beta1.ClusterInfo, error) {
+
+	var pullmodeStatus *libsveltosv1beta1.FeatureStatus
+
+	clusterInfo := &libsveltosv1beta1.ClusterInfo{
+		Cluster:        *cluster,
+		Hash:           currentHash,
+		FailureMessage: stringPtr(""),
+		Status:         libsveltosv1beta1.SveltosStatusProvisioning,
+	}
+
+	eventTrigger := eScope.EventTrigger
+	if isConfigSame {
+		pullmodeHash, err := pullmode.GetRequestorHash(ctx, getManagementClusterClient(),
+			cluster.Namespace, cluster.Name, v1beta1.EventTriggerKind, eventTrigger.Name, f.id, logger)
+		if err != nil {
+			if !apierrors.IsNotFound(err) {
+				msg := fmt.Sprintf("failed to get pull mode hash: %v", err)
+				logger.V(logs.LogDebug).Info(msg)
+				clusterInfo.FailureMessage = &msg
+				return clusterInfo, err
+			} else {
+				isConfigSame = false
+			}
+		} else {
+			isConfigSame = reflect.DeepEqual(pullmodeHash, currentHash)
+		}
+	}
+
+	if isConfigSame {
+		// only if configuration hash matches, check if feature is deployed
+		logger.V(logs.LogDebug).Info("hash has not changed")
+		var err error
+		pullmodeStatus, err = r.proceesAgentDeploymentStatus(ctx, eventTrigger, cluster, f, logger)
+		if err != nil {
+			failureMessage := err.Error()
+			clusterInfo.FailureMessage = &failureMessage
+			return clusterInfo, err
+		}
+	}
+
+	if pullmodeStatus != nil {
+		logger.V(logs.LogDebug).Info(fmt.Sprintf("agent result is available. updating status: %v", *pullmodeStatus))
+		switch *pullmodeStatus {
+		case libsveltosv1beta1.FeatureStatusProvisioned:
+			if err := pullmode.TerminateDeploymentTracking(ctx, r.Client, cluster.Namespace,
+				cluster.Name, v1beta1.EventTriggerKind, eventTrigger.Name, f.id, logger); err != nil {
+				failureMessage := fmt.Sprintf("failed to terminate tracking: %v", err)
+				logger.V(logs.LogDebug).Info(failureMessage)
+				clusterInfo.FailureMessage = &failureMessage
+				return clusterInfo, err
+			}
+			clusterInfo.Status = libsveltosv1beta1.SveltosStatusProvisioned
+			return clusterInfo, nil
+		case libsveltosv1beta1.FeatureStatusProvisioning:
+			msg := "agent is provisioning the content"
+			logger.V(logs.LogDebug).Info(msg)
+			clusterInfo.Status = libsveltosv1beta1.SveltosStatusProvisioning
+			return clusterInfo, nil
+		case libsveltosv1beta1.FeatureStatusFailed:
+			logger.V(logs.LogDebug).Info("agent failed provisioning the content")
+			clusterInfo.Status = libsveltosv1beta1.SveltosStatusFailed
+		case libsveltosv1beta1.FeatureStatusFailedNonRetriable, libsveltosv1beta1.FeatureStatusRemoving,
+			libsveltosv1beta1.FeatureStatusAgentRemoving, libsveltosv1beta1.FeatureStatusRemoved:
+			logger.V(logs.LogDebug).Info("proceed deploying")
+		case libsveltosv1beta1.FeatureStatusBlocked:
+			// Blocked is set by addon-controller on a ClusterSummary while a predecessor waits
+			// on a DependsOn dependent or a TransitionFrom successor. EventTrigger's own
+			// DependsOn only orders the ClusterProfile it generates, deployed and tracked
+			// separately via addon-controller's own ClusterSummary; the pull-mode agent never
+			// reports Blocked in a ConfigurationGroup for EventTrigger itself, so this case is
+			// unreachable in practice. Listed only to satisfy exhaustive.
+			logger.V(logs.LogDebug).Info("proceed deploying")
+		}
+	} else {
+		clusterInfo.Status = libsveltosv1beta1.SveltosStatusProvisioning
+	}
+
+	// Getting here means either agent failed to deploy feature or configuration has changed.
+	// Either way, feature must be (re)deployed. Queue so new configuration for agent is prepared.
+	options := deployer.Options{HandlerOptions: make(map[string]any)}
+	options.HandlerOptions[configurationHash] = currentHash
+
+	logger.V(logs.LogDebug).Info("queueing request to deploy")
+	if err := r.Deployer.Deploy(ctx, cluster.Namespace, cluster.Name,
+		eventTrigger.Name, f.id, clusterproxy.GetClusterType(cluster), false,
+		f.deploy, programDuration, options); err != nil {
+		failureMessage := err.Error()
+		clusterInfo.FailureMessage = &failureMessage
+		return clusterInfo, err
+	}
+
+	return clusterInfo, fmt.Errorf("request to deploy queued")
+}
+
+// If SveltosCluster is in pull mode, verify whether agent has pulled and successuffly deployed it.
+func (r *EventTriggerReconciler) proceesAgentDeploymentStatus(ctx context.Context,
+	eventTrigger *v1beta1.EventTrigger, cluster *corev1.ObjectReference, f feature, logger logr.Logger,
+) (*libsveltosv1beta1.FeatureStatus, error) {
+
+	logger.V(logs.LogDebug).Info("Verify if agent has deployed content and process it")
+
+	status, err := pullmode.GetDeploymentStatus(ctx, r.Client, cluster.Namespace, cluster.Name,
+		v1beta1.EventTriggerKind, eventTrigger.Name, f.id, logger)
+
+	if err != nil {
+		if pullmode.IsProcessingMismatch(err) {
+			provisioning := libsveltosv1beta1.FeatureStatusProvisioning
+			return &provisioning, nil
+		} else if pullmode.IsActionNotSetToDeploy(err) {
+			_ = pullmode.TerminateDeploymentTracking(ctx, r.Client, cluster.Namespace,
+				cluster.Name, v1beta1.EventTriggerKind, eventTrigger.Name, f.id, logger)
+		}
+		return nil, err
+	}
+
+	return status.DeploymentStatus, err
+}
+
+func (r *EventTriggerReconciler) removeEventTrigger(ctx context.Context, eScope *scope.EventTriggerScope,
+	cluster *corev1.ObjectReference, currentHash []byte, f feature, logger logr.Logger,
+) (*libsveltosv1beta1.ClusterInfo, error) {
+
+	resource := eScope.EventTrigger
+
+	logger = logger.WithValues("eventTrigger", resource.Name)
+	logger.V(logs.LogDebug).Info("request to undeploy")
+
+	clusterInfo := &libsveltosv1beta1.ClusterInfo{
+		Cluster: *cluster,
+		Status:  libsveltosv1beta1.SveltosStatusRemoving,
+		Hash:    currentHash,
+	}
+
+	isPresent, isDeleted, err := r.isClusterPresent(ctx, cluster)
+	if err != nil {
+		failureMessage := err.Error()
+		clusterInfo.FailureMessage = &failureMessage
+		return clusterInfo, err
+	}
+
+	if !isPresent || isDeleted {
+		clusterInfo.Status = libsveltosv1beta1.SveltosStatusRemoved
+		return clusterInfo, nil
+	}
+
+	// Remove any queued entry to deploy/evaluate
+	r.Deployer.CleanupEntries(cluster.Namespace, cluster.Name, resource.Name, f.id,
+		clusterproxy.GetClusterType(cluster), false)
+
+	// If deploying feature is in progress, wait for it to complete.
+	// Otherwise, if we cleanup feature while same feature is still being provisioned, if two workers process those request in
+	// parallel some resources might be left over.
+	if r.Deployer.IsInProgress(cluster.Namespace, cluster.Name, resource.Name, f.id,
+		clusterproxy.GetClusterType(cluster), false) {
+
+		msg := "provisioning is in progress"
+		logger.V(logs.LogDebug).Info(msg)
+		clusterInfo.FailureMessage = &msg
+		return clusterInfo, fmt.Errorf("deploying %s still in progress. Wait before cleanup", f.id)
+	}
+
+	result := r.Deployer.GetResult(ctx, cluster.Namespace, cluster.Name, resource.Name, f.id,
+		clusterproxy.GetClusterType(cluster), true)
+	status := r.convertResultStatus(result)
+
+	if status != nil {
+		if *status == libsveltosv1beta1.SveltosStatusRemoving {
+			return clusterInfo, fmt.Errorf("feature is still being removed")
+		}
+
+		if *status == libsveltosv1beta1.SveltosStatusRemoved {
+			logger.V(logs.LogDebug).Info("status is removed")
+			clusterInfo.Status = libsveltosv1beta1.SveltosStatusRemoved
+			return clusterInfo, nil
+		}
+
+		if result.Err != nil {
+			failureMessage := result.Err.Error()
+			clusterInfo.FailureMessage = &failureMessage
+
+			clustercache.GetManager().InvalidateOnAuthError(cluster.Namespace, cluster.Name,
+				clusterproxy.GetClusterType(cluster), result.Err)
+		}
+	} else {
+		logger.V(logs.LogDebug).Info("no result is available. mark status as removing")
+	}
+
+	logger.V(logs.LogDebug).Info("queueing request to un-deploy")
+	if err := r.Deployer.Deploy(ctx, cluster.Namespace, cluster.Name, resource.Name, f.id,
+		clusterproxy.GetClusterType(cluster), true,
+		f.undeploy, programDuration, deployer.Options{}); err != nil {
+		failureMessage := err.Error()
+		clusterInfo.FailureMessage = &failureMessage
+		return clusterInfo, err
+	}
+
+	return clusterInfo, fmt.Errorf("cleanup request is queued")
+}
+
+func undeployEventTriggerInPullMode(ctx context.Context, c client.Client,
+	clusterNamespace, clusterName string, eventTrigger *v1beta1.EventTrigger, logger logr.Logger) error {
+
+	// EvenTrigger follows a strict state machine for resource removal:
+	//
+	// 1. Create ConfigurationGroup with action=Remove
+	// 2. Monitor ConfigurationGroup status:
+	//    - Missing ConfigurationGroup = resources successfully removed
+	//    - ConfigurationGroup.Status = Removed = resources successfully removed
+	var retError error
+	agentStatus, err := pullmode.GetRemoveStatus(ctx, c, clusterNamespace, clusterName,
+		v1beta1.EventTriggerKind, eventTrigger.Name, v1beta1.FeatureEventTrigger, logger)
+	if err != nil {
+		retError = err
+	} else if agentStatus != nil {
+		if agentStatus.DeploymentStatus != nil && *agentStatus.DeploymentStatus == libsveltosv1beta1.FeatureStatusRemoved {
+			logger.V(logs.LogDebug).Info("agent removed content")
+			err = pullmode.TerminateDeploymentTracking(ctx, c, clusterNamespace, clusterName,
+				v1beta1.EventTriggerKind, eventTrigger.Name, v1beta1.FeatureEventTrigger, logger)
+			if err != nil {
+				return err
+			}
+			return nil
+		} else if agentStatus.FailureMessage != nil {
+			retError = errors.New(*agentStatus.FailureMessage)
+		} else {
+			return errors.New("agent is removing eventTrigger instance")
+		}
+	}
+
+	logger.V(logs.LogDebug).Info("queueing request to un-deploy")
+	setters := prepareSetters(eventTrigger, nil)
+	err = pullmode.RemoveDeployedResources(ctx, c, clusterNamespace, clusterName, v1beta1.EventTriggerKind, eventTrigger.Name,
+		v1beta1.FeatureEventTrigger, logger, setters...)
+	if err != nil {
+		logger.V(logs.LogDebug).Error(err, "removeDeployedResources failed")
+		return err
+	}
+
+	if retError != nil {
+		return retError
+	}
+
+	return fmt.Errorf("agent cleanup request is queued")
+}
+
+func (r *EventTriggerReconciler) convertResultStatus(result deployer.Result) *libsveltosv1beta1.SveltosFeatureStatus {
+	switch result.ResultStatus {
+	case deployer.Deployed:
+		s := libsveltosv1beta1.SveltosStatusProvisioned
+		return &s
+	case deployer.Failed:
+		s := libsveltosv1beta1.SveltosStatusFailed
+		return &s
+	case deployer.InProgress:
+		s := libsveltosv1beta1.SveltosStatusProvisioning
+		return &s
+	case deployer.Removed:
+		s := libsveltosv1beta1.SveltosStatusRemoved
+		return &s
+	case deployer.Unavailable:
+		return nil
+	}
+
+	return nil
+}
+
+// getClusterHashAndStatus returns the hash of the EventTrigger that was deployed/evaluated in a given
+// Cluster (if ever deployed/evaluated)
+func (r *EventTriggerReconciler) getClusterHashAndStatus(resource *v1beta1.EventTrigger,
+	cluster *corev1.ObjectReference) ([]byte, *libsveltosv1beta1.SveltosFeatureStatus) {
+
+	for i := range resource.Status.ClusterInfo {
+		clusterInfo := &resource.Status.ClusterInfo[i]
+		if isClusterInfoForCluster(clusterInfo, cluster.Namespace, cluster.Name, clusterproxy.GetClusterType(cluster)) {
+			return clusterInfo.Hash, &clusterInfo.Status
+		}
+	}
+
+	return nil, nil
+}
+
+// isPaused returns true if Sveltos/CAPI Cluster is paused or EventTrigger has paused annotation.
+func (r *EventTriggerReconciler) isPaused(ctx context.Context, cluster *corev1.ObjectReference,
+	resource *v1beta1.EventTrigger) (bool, error) {
+
+	isClusterPaused, err := clusterproxy.IsClusterPaused(ctx, r.Client, cluster.Namespace, cluster.Name,
+		clusterproxy.GetClusterType(cluster))
+
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+
+	if isClusterPaused {
+		return true, nil
+	}
+
+	return annotations.HasPaused(resource), nil
+}
+
+// canProceed returns true if cluster is ready to be programmed and it is not paused.
+func (r *EventTriggerReconciler) canProceed(ctx context.Context, eScope *scope.EventTriggerScope,
+	cluster *corev1.ObjectReference, logger logr.Logger) (bool, error) {
+
+	logger = logger.WithValues("cluster", fmt.Sprintf("%s:%s/%s", cluster.Kind, cluster.Namespace, cluster.Name))
+
+	paused, err := r.isPaused(ctx, cluster, eScope.EventTrigger)
+	if err != nil {
+		return false, err
+	}
+
+	if paused {
+		logger.V(logs.LogDebug).Info("Cluster/EventTrigger is paused")
+		return false, nil
+	}
+
+	ready, err := clusterproxy.IsClusterReadyToBeConfigured(ctx, r.Client, cluster, eScope.Logger)
+	if err != nil {
+		return false, err
+	}
+
+	if !ready {
+		logger.V(logs.LogDebug).Info("Cluster is not ready yet")
+		return false, nil
+	}
+
+	return true, nil
+}
+
+// isAgentHealthy returns true if the cluster is NOT in pull mode,
+// OR if it is in pull mode and the heartbeat is current.
+func (r *EventTriggerReconciler) isAgentHealthy(ctx context.Context,
+	clusterRef *corev1.ObjectReference, logger logr.Logger) (bool, error) {
+
+	clusterType := clusterproxy.GetClusterType(clusterRef)
+	if clusterType != libsveltosv1beta1.ClusterTypeSveltos {
+		return true, nil
+	}
+
+	isPullMode, err := clusterproxy.IsClusterInPullMode(ctx, r.Client, clusterRef.Namespace,
+		clusterRef.Name, clusterType, logger)
+	if err != nil {
+		msg := fmt.Sprintf("failed to verify if Cluster is in pull mode: %v", err)
+		logger.V(logs.LogDebug).Info(msg)
+		return false, err
+	}
+
+	if !isPullMode {
+		return true, nil
+	}
+
+	sveltosCluster := &libsveltosv1beta1.SveltosCluster{}
+	err = r.Get(ctx,
+		types.NamespacedName{
+			Namespace: clusterRef.Namespace,
+			Name:      clusterRef.Name,
+		}, sveltosCluster)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+
+	// Check if the failure message indicates a heartbeat timeout
+	if pullmode.IsAgentTimeoutError(sveltosCluster) {
+		return false, nil
+	}
+
+	return true, nil
+}
+
+// isClusterStillMatching returns true if cluster is still matching by looking at EventBasedAddon
+// Status MatchingClusterRefs
+func isClusterStillMatching(eScope *scope.EventTriggerScope, cluster *corev1.ObjectReference) bool {
+	for i := range eScope.EventTrigger.Status.MatchingClusterRefs {
+		matchingCluster := &eScope.EventTrigger.Status.MatchingClusterRefs[i]
+		if reflect.DeepEqual(*matchingCluster, *cluster) {
+			return true
+		}
+	}
+	return false
+}
+
+// isClusterConditionForCluster returns true if the ClusterCondition is for the cluster clusterType, clusterNamespace,
+// clusterName
+func isClusterInfoForCluster(clusterInfo *libsveltosv1beta1.ClusterInfo, clusterNamespace, clusterName string,
+	clusterType libsveltosv1beta1.ClusterType) bool {
+
+	return clusterInfo.Cluster.Namespace == clusterNamespace &&
+		clusterInfo.Cluster.Name == clusterName &&
+		clusterproxy.GetClusterType(&clusterInfo.Cluster) == clusterType
+}
+
+// deployEventSource deploys (creates or updates) referenced EventSource.
+func deployEventSource(ctx context.Context, c client.Client,
+	clusterNamespace, clusterName string, clusterType libsveltosv1beta1.ClusterType,
+	eventTrigger *v1beta1.EventTrigger, options deployer.Options, logger logr.Logger) error {
+
+	currentEventSource, err := fetchEventSource(ctx, c, clusterNamespace, clusterName,
+		eventTrigger.Spec.EventSourceName, clusterType, logger)
+	if err != nil {
+		return err
+	}
+	if currentEventSource == nil {
+		logger.V(logs.LogInfo).Info(fmt.Sprintf("referenced EventSource %s does not exist",
+			eventTrigger.Spec.EventSourceName))
+		return nil
+	}
+
+	isPullMode, err := clusterproxy.IsClusterInPullMode(ctx, c, clusterNamespace, clusterName,
+		clusterType, logger)
+	if err != nil {
+		msg := fmt.Sprintf("failed to verify if Cluster is in pull mode: %v", err)
+		logger.V(logs.LogDebug).Info(msg)
+		return err
+	}
+
+	if isPullMode {
+		// If SveltosCluster is in pull mode, discard all previous staged resources. Those will be regenerated now.
+		err = pullmode.DiscardStagedResourcesForDeployment(ctx, c, clusterNamespace,
+			clusterName, v1beta1.EventTriggerKind, eventTrigger.Name, v1beta1.FeatureEventTrigger, logger)
+		if err != nil {
+			return err
+		}
+	}
+
+	if getAgentInMgmtCluster() && !isPullMode {
+		return addEventSourceToConfigMap(ctx, c, clusterNamespace, clusterName, clusterType,
+			eventTrigger, currentEventSource, logger)
+	}
+
+	// If sveltos-agent is deployed to the managed cluster, deploy EventSource there.
+	var remoteClient client.Client
+	if !isPullMode {
+		remoteClient, err = clustercache.GetManager().GetKubernetesClient(ctx, c, clusterNamespace, clusterName,
+			"", "", clusterType, logger)
+		if err != nil {
+			logger.V(logs.LogInfo).Error(err, "failed to get managed cluster client")
+			return err
+		}
+	}
+
+	// classifier installs sveltos-agent and CRDs it needs, including
+	// EventSource and EventReport CRDs.
+
+	err = createOrUpdateEventSource(ctx, remoteClient, eventTrigger, currentEventSource,
+		clusterNamespace, clusterName, isPullMode, logger)
+	if err != nil {
+		logger.V(logs.LogInfo).Error(err, "failed to create/update EventSource")
+		return err
+	}
+
+	if isPullMode {
+		configurationHash, _ := options.HandlerOptions[configurationHash].([]byte)
+		setters := prepareSetters(eventTrigger, configurationHash)
+		err = pullmode.CommitStagedResourcesForDeployment(ctx, c, clusterNamespace, clusterName,
+			v1beta1.EventTriggerKind, eventTrigger.Name, v1beta1.FeatureEventTrigger, logger, setters...)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func createOrUpdateEventSource(ctx context.Context, remoteClient client.Client, resource *v1beta1.EventTrigger,
+	eventSource *libsveltosv1beta1.EventSource, clusterNamespace, clusterName string, isPullMode bool, logger logr.Logger) error {
+
+	logger = logger.WithValues("eventSource", eventSource.Name)
+
+	if !isPullMode {
+		currentEventSource := &libsveltosv1beta1.EventSource{}
+		err := remoteClient.Get(context.TODO(), types.NamespacedName{Name: eventSource.Name}, currentEventSource)
+		if err == nil {
+			logger.V(logs.LogDebug).Info("updating eventSource")
+			currentEventSource.Spec = eventSource.Spec
+			// Copy labels. If admin-label is set, sveltos-agent will impersonate
+			// ServiceAccount representing the tenant admin when fetching resources
+			currentEventSource.Labels = eventSource.Labels
+			currentEventSource.Annotations = map[string]string{
+				libsveltosv1beta1.DeployedBySveltosAnnotation: deployedBySveltosTrueValue,
+			}
+			k8s_utils.AddOwnerReference(currentEventSource, resource)
+			return remoteClient.Update(ctx, currentEventSource)
+		}
+
+		currentEventSource.Name = eventSource.Name
+		currentEventSource.Spec = eventSource.Spec
+		// Copy labels. If admin-label is set, sveltos-agent will impersonate
+		// ServiceAccount representing the tenant admin when fetching resources
+		currentEventSource.Labels = eventSource.Labels
+		currentEventSource.Annotations = map[string]string{
+			libsveltosv1beta1.DeployedBySveltosAnnotation: deployedBySveltosTrueValue,
+		}
+		k8s_utils.AddOwnerReference(currentEventSource, resource)
+
+		logger.V(logs.LogDebug).Info("creating eventSource")
+		return remoteClient.Create(ctx, currentEventSource)
+	}
+
+	toDeployEventSource := getEventSourceToDeploy(eventSource)
+	unstructuredObj, err := runtime.DefaultUnstructuredConverter.ToUnstructured(&toDeployEventSource)
+	if err != nil {
+		logger.V(logs.LogDebug).Error(err, "failed to convert eventSource instance to unstructured")
+	}
+
+	u := &unstructured.Unstructured{}
+	u.SetUnstructuredContent(unstructuredObj)
+
+	resources := map[string][]unstructured.Unstructured{}
+	resources["eventsource-instance"] = []unstructured.Unstructured{*u}
+	return pullmode.StageResourcesForDeployment(ctx, getManagementClusterClient(), clusterNamespace, clusterName,
+		v1beta1.EventTriggerKind, resource.Name, v1beta1.FeatureEventTrigger, resources, false, logger)
+}
+
+func getEventSourceToDeploy(eventSource *libsveltosv1beta1.EventSource) *libsveltosv1beta1.EventSource {
+	toDeploy := &libsveltosv1beta1.EventSource{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: eventSource.Name,
+			Annotations: map[string]string{
+				libsveltosv1beta1.DeployedBySveltosAnnotation: deployedBySveltosTrueValue,
+			},
+		},
+		Spec: eventSource.Spec,
+	}
+
+	addTypeInformationToObject(getManagementClusterScheme(), toDeploy)
+	return toDeploy
+}
+
+// removeStaleEventReports removes stale EventReports from the management cluster.
+func removeStaleEventReports(ctx context.Context, c client.Client,
+	clusterNamespace, clusterName, eventSourceName string,
+	clusterType libsveltosv1beta1.ClusterType, logger logr.Logger) error {
+
+	listOptions := []client.ListOption{
+		client.InNamespace(clusterNamespace),
+		client.MatchingLabels{
+			libsveltosv1beta1.EventReportClusterNameLabel: clusterName,
+			libsveltosv1beta1.EventReportClusterTypeLabel: strings.ToLower(string(clusterType)),
+			libsveltosv1beta1.EventSourceNameLabel:        eventSourceName,
+		},
+	}
+
+	eventReportList := &libsveltosv1beta1.EventReportList{}
+	err := c.List(ctx, eventReportList, listOptions...)
+	if err != nil {
+		logger.V(logs.LogInfo).Error(err, "failed to list EventReports.")
+		return err
+	}
+
+	for i := range eventReportList.Items {
+		err = c.Delete(ctx, &eventReportList.Items[i])
+		if err != nil && !apierrors.IsNotFound(err) {
+			logger.V(logs.LogInfo).Error(err, "failed to delete EventReport")
+			return err
+		}
+	}
+
+	return nil
+}
+
+// removeStaleEventSources removes stale EventSources.
+// - If EventTrigger is deleted, EventTrigger will be removed as OwnerReference from any
+// EventSource instance;
+// - If EventTrigger is still existing, EventTrigger will be removed as OwnerReference from any
+// EventSource instance it used to referenced and it is not referencing anymore.
+// An EventSource with zero OwnerReference will be deleted from managed cluster.
+func removeStaleEventSources(ctx context.Context, c client.Client,
+	clusterNamespace, clusterName string, clusterType libsveltosv1beta1.ClusterType,
+	eventTrigger *v1beta1.EventTrigger, removeAll bool, logger logr.Logger) error {
+
+	isPullMode, err := clusterproxy.IsClusterInPullMode(ctx, c, clusterNamespace, clusterName,
+		clusterType, logger)
+	if err != nil {
+		logger.V(logs.LogInfo).Error(err, "failed to verify if Cluster is in pull mode")
+		return err
+	}
+
+	if isPullMode {
+		// In pull mode stale eventSources in the managed clusters are removed by Sveltos-applier
+		return nil
+	}
+
+	if getAgentInMgmtCluster() {
+		leaveEntry := ""
+		if !removeAll && eventTrigger.DeletionTimestamp.IsZero() {
+			// If removeAll is false and eventTrigger still exists, remove all entries but the one pointing
+			// to current referenced EventSource
+			leaveEntry = eventTrigger.Spec.EventSourceName
+		}
+
+		return removeEventSourceFromConfigMap(ctx, c, clusterNamespace, clusterName, clusterType, eventTrigger,
+			leaveEntry, logger)
+	}
+
+	// If the cluster does not exist anymore, return (cluster has been deleted
+	// there is nothing to clear)
+	_, err = clusterproxy.GetCluster(ctx, c, clusterNamespace, clusterName, clusterType)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+
+	return proceedRemovingStaleEventSources(ctx, c, clusterNamespace, clusterName, clusterType,
+		eventTrigger, removeAll, logger)
+}
+
+func proceedRemovingStaleEventSources(ctx context.Context, c client.Client,
+	clusterNamespace, clusterName string, clusterType libsveltosv1beta1.ClusterType,
+	eventTrigger *v1beta1.EventTrigger, removeAll bool, logger logr.Logger) error {
+
+	remoteClient, err := clustercache.GetManager().GetKubernetesClient(ctx, c, clusterNamespace, clusterName,
+		"", "", clusterType, logger)
+	if err != nil {
+		logger.V(logs.LogInfo).Error(err, "failed to get managed cluster client")
+		return err
+	}
+
+	eventSources := &libsveltosv1beta1.EventSourceList{}
+	err = remoteClient.List(ctx, eventSources)
+	if err != nil {
+		logger.V(logs.LogInfo).Error(err, "failed to get list eventSources")
+		return err
+	}
+
+	for i := range eventSources.Items {
+		es := &eventSources.Items[i]
+		l := logger.WithValues("eventsource", es.Name)
+
+		// removeAll indicates all EventSources deployed by this EventTrigger on this cluster
+		// need to be removed (cluster is no longer a match)
+		if !removeAll && eventTrigger.DeletionTimestamp.IsZero() &&
+			es.Name == eventTrigger.Spec.EventSourceName {
+			// eventTrigger still exists and eventSource is still referenced
+			continue
+		}
+
+		targetGK := schema.GroupKind{
+			Group: v1beta1.GroupVersion.Group,
+			Kind:  v1beta1.EventTriggerKind,
+		}
+
+		if !util.IsOwnedByObject(es, eventTrigger, targetGK) {
+			continue
+		}
+
+		l.V(logs.LogDebug).Info("removing OwnerReference")
+		k8s_utils.RemoveOwnerReference(es, eventTrigger)
+
+		if len(es.GetOwnerReferences()) != 0 {
+			l.V(logs.LogDebug).Info("updating")
+			// Other EventTrigger are still deploying this very same policy
+			err = remoteClient.Update(ctx, es)
+			if err != nil {
+				logger.V(logs.LogInfo).Error(err, "failed to get update EventSource")
+				return err
+			}
+			continue
+		}
+
+		// Since EventSource is about to be removed from the managed cluster, removes all
+		// EventReports pulled from this managed cluster because of this EventSource
+		err = removeStaleEventReports(ctx, c, clusterNamespace, clusterName, es.Name, clusterType, logger)
+		if err != nil {
+			return err
+		}
+
+		l.V(logs.LogDebug).Info("deleting EventSource from managed cluster")
+		err = remoteClient.Delete(ctx, es)
+		if err != nil {
+			logger.V(logs.LogInfo).Error(err, "failed to get delete EventSource")
+			return err
+		}
+	}
+
+	return nil
+}
+
+// When instantiating one ClusterProfile for all resources those values are available.
+// Resources contains matching Kubernetes resources (this one only
+// if EventSource.Spec.CollectResource is set to true).
+// MatchingResources is always available if Kubernetes resources were a match.
+// CloudEvents represent matching CloudEvents.
+type currentObjects struct {
+	MatchingResources []corev1.ObjectReference
+	Resources         []map[string]interface{}
+	CloudEvents       []map[string]interface{}
+	Cluster           map[string]interface{}
+}
+
+// When instantiating one ClusterProfile per resource those values are available.
+// Resource contains matching Kubernetes resource (this one only
+// if EventSource.Spec.CollectResource is set to true).
+// MatchingResource is always available if Kubernetes resources were a match.
+// CloudEvent represent a match CloudEvent.
+// For every object, either MatchingResource/Resource is available or CloudEvent
+type currentObject struct {
+	MatchingResource corev1.ObjectReference
+	Resource         map[string]interface{}
+	CloudEvent       map[string]interface{}
+	Cluster          map[string]interface{}
+}
+
+// updateClusterProfiles creates/updates ClusterProfile(s).
+// One or more clusterProfiles will be created/updated depending on eventTrigger.Spec.OneForEvent flag.
+// ClusterProfile(s) content will have:
+// - ClusterRef set to reference passed in cluster;
+// - HelmCharts instantiated from EventTrigger.Spec.HelmCharts using values from resources, collected
+// from the managed cluster, matching the EventSource referenced by EventTrigger
+func updateClusterProfiles(ctx context.Context, c client.Client, clusterNamespace, clusterName string,
+	clusterType libsveltosv1beta1.ClusterType, eventTrigger *v1beta1.EventTrigger, er *libsveltosv1beta1.EventReport,
+	logger logr.Logger) error {
+
+	var err error
+
+	// EventReport explicitly deleted: remove immediately, no safeguard needed.
+	if !er.DeletionTimestamp.IsZero() {
+		logger.V(logs.LogDebug).Info("EventReport is being deleted")
+		resetZeroMatchCount(er, eventTrigger.Name)
+		clusterProfiles := []*configv1beta1.ClusterProfile{}
+		clusterProfiles, err = appendCloudEventClusterProfiles(ctx, c, clusterNamespace, clusterName, eventTrigger.Name,
+			clusterType, er, clusterProfiles)
+		if err != nil {
+			return err
+		}
+		return removeInstantiatedResources(ctx, c, clusterNamespace, clusterName, clusterType,
+			eventTrigger, er, clusterProfiles, nil, logger)
+	}
+
+	// No matching resources: require zeroMatchThreshold consecutive observations before removing
+	// ClusterProfiles, to guard against transient empty EventReports (e.g. from a sveltos-agent
+	// internal restart before its informers have re-synced).
+	if !hasMatchingResources(er) {
+		count := incrementZeroMatchCount(er, eventTrigger.Name)
+		if count < zeroMatchThreshold {
+			logger.V(logs.LogInfo).Info("EventReport has no matching resources, waiting for confirmation",
+				"count", count, "threshold", zeroMatchThreshold)
+			return fmt.Errorf("EventReport %s/%s has no matching resources: waiting for confirmation before removing "+
+				"ClusterProfiles (%d/%d consecutive empty reports observed)",
+				er.Namespace, er.Name, count, zeroMatchThreshold)
+		}
+		logger.V(logs.LogDebug).Info("EventReport has no matching resources confirmed, removing ClusterProfiles",
+			"count", count)
+		resetZeroMatchCount(er, eventTrigger.Name)
+		clusterProfiles := []*configv1beta1.ClusterProfile{}
+		clusterProfiles, err = appendCloudEventClusterProfiles(ctx, c, clusterNamespace, clusterName, eventTrigger.Name,
+			clusterType, er, clusterProfiles)
+		if err != nil {
+			return err
+		}
+		return removeInstantiatedResources(ctx, c, clusterNamespace, clusterName, clusterType,
+			eventTrigger, er, clusterProfiles, nil, logger)
+	}
+
+	// Has matching resources: reset the zero-match counter.
+	resetZeroMatchCount(er, eventTrigger.Name)
+
+	var clusterProfiles []*configv1beta1.ClusterProfile
+	var fromGenerators []libsveltosv1beta1.PolicyRef
+
+	// Resources (ClusterProfiles, ConfigMaps and Secrets) created because of CloudEvent contains the
+	// cloudEventSubjectLabel and cloudEventSourceLabel. This means a CloudEvent is uniquely identified
+	// by Sveltos by looking at just Subject and Source.
+
+	if eventTrigger.Spec.OneForEvent {
+		logger.V(logs.LogDebug).Info("updating one clusterProfile per resource")
+		// Instantiate ConfigMap/Secrets from ConfigMapGenerator/SecretGenerator first: the
+		// ClusterProfile is created/updated only once the resources it may depend on are ready,
+		// so a generator failure does not leave behind a ClusterProfile for this reconcile pass.
+		fromGenerators, err = instantiateFromGeneratorsPerResource(ctx, c, eventTrigger, er, clusterNamespace,
+			clusterName, clusterType, logger)
+		if err != nil {
+			logger.V(logs.LogInfo).Error(err, "failed to instantiate from generators")
+			return err
+		}
+		clusterProfiles, err = instantiateOneClusterProfilePerResource(ctx, c, clusterNamespace, clusterName,
+			clusterType, eventTrigger, er, logger)
+		if err != nil {
+			logger.V(logs.LogInfo).Error(err,
+				"failed to create one clusterProfile instance per matching resource")
+			return err
+		}
+	} else {
+		logger.V(logs.LogDebug).Info("updating one clusterProfile for all resources")
+		fromGenerators, err = instantiateFromGeneratorsPerAllResource(ctx, c, eventTrigger, er, clusterNamespace,
+			clusterName, clusterType, logger)
+		if err != nil {
+			logger.V(logs.LogInfo).Error(err, "failed to instantiate from generators")
+			return err
+		}
+		clusterProfiles, err = instantiateOneClusterProfilePerAllResource(ctx, c, clusterNamespace, clusterName,
+			clusterType, eventTrigger, er, logger)
+		if err != nil {
+			logger.V(logs.LogInfo).Error(err,
+				"failed to create one clusterProfile instance per matching resource")
+			return err
+		}
+	}
+
+	// ClusterProfiles created because of CloudEvents are removed when CloudEventAction is set to Delete.
+	// Fetch all ClusterProfiles created because of CloudEvents by this eventTrigger and append to list
+	// of ClusterProfiles that are not stale
+	clusterProfiles, err = appendCloudEventClusterProfiles(ctx, c, clusterNamespace, clusterName, eventTrigger.Name,
+		clusterType, er, clusterProfiles)
+	if err != nil {
+		return err
+	}
+
+	// Remove stale ClusterProfiles/ConfigMaps/Secrets, i.e, resources previously created by this EventTrigger
+	// instance for this cluster but currently not needed anymore
+	return removeInstantiatedResources(ctx, c, clusterNamespace, clusterName, clusterType, eventTrigger, er,
+		clusterProfiles, fromGenerators, logger)
+}
+
+// instantiateOneClusterProfilePerResource instantiate a ClusterProfile for each resource/cloudEvent currently matching
+// the referenced EventSource (result is taken from EventReport).
+// When instantiating:
+// - "MatchingResource" references a corev1.ObjectReference representing the resource (always available)
+// - "Resource" references an unstructured.Unstructured referencing the resource (available only if EventSource.Spec.CollectResources
+// is set to true)
+// - "CloudEvent" references a cloudEvent
+func instantiateOneClusterProfilePerResource(ctx context.Context, c client.Client, clusterNamespace, clusterName string,
+	clusterType libsveltosv1beta1.ClusterType, eventTrigger *v1beta1.EventTrigger,
+	eventReport *libsveltosv1beta1.EventReport, logger logr.Logger) ([]*configv1beta1.ClusterProfile, error) {
+
+	clusterProfiles := make([]*configv1beta1.ClusterProfile, 0)
+	objects, err := prepareCurrentObjectList(ctx, c, clusterNamespace, clusterName, clusterType, eventReport, logger)
+	if err != nil {
+		logger.V(logs.LogInfo).Error(err, "failed to prepare currentObject list")
+		return nil, err
+	}
+
+	for i := range objects {
+		var clusterProfile *configv1beta1.ClusterProfile
+
+		clusterProfile, err = instantiateClusterProfileForResource(ctx, c, clusterNamespace, clusterName,
+			clusterType, eventTrigger, eventReport, &objects[i], logger)
+		if err != nil {
+			return nil, err
+		}
+		if clusterProfile != nil {
+			clusterProfiles = append(clusterProfiles, clusterProfile)
+		}
+	}
+
+	return clusterProfiles, nil
+}
+
+// instantiateClusterProfileForResource creates one ClusterProfile by:
+// - setting Spec.ClusterRef reference passed in cluster clusterNamespace/clusterName/ClusterType
+// - instantiating eventTrigger.Spec.HelmCharts with passed in resource (one of the resource matching referenced EventSource)
+// and copying this value to ClusterProfile.Spec.HelmCharts
+// - instantiating eventTrigger.Spec.PolicyRefs with passed in resource (one of the resource matching referenced EventSource)
+// in new ConfigMaps/Secrets and have ClusterProfile.Spec.PolicyRefs reference those;
+// - labels are added to ClusterProfile to easily fetch all ClusterProfiles created by a given EventTrigger
+func instantiateClusterProfileForResource(ctx context.Context, c client.Client, clusterNamespace, clusterName string,
+	clusterType libsveltosv1beta1.ClusterType, eventTrigger *v1beta1.EventTrigger, er *libsveltosv1beta1.EventReport,
+	object *currentObject, logger logr.Logger) (*configv1beta1.ClusterProfile, error) {
+
+	labels := getInstantiatedObjectLabels(clusterNamespace, clusterName, eventTrigger.Name,
+		er, clusterType)
+	if object.CloudEvent != nil {
+		logger.V(logs.LogDebug).Info("instantiateClusterProfileForResource with cloudEvent")
+		labels = appendInstantiatedObjectLabelsForCloudEvent(labels, getCESource(object.CloudEvent),
+			getCESubject(object.CloudEvent))
+	} else {
+		labels = appendInstantiatedObjectLabelsForResource(labels,
+			object.MatchingResource.Namespace, object.MatchingResource.Name)
+	}
+	labels = appendServiceAccountLabels(eventTrigger, labels)
+
+	clusterProfileName, err := getClusterProfileName(ctx, c, clusterNamespace, clusterName,
+		eventTrigger, object, labels, logger)
+	if err != nil {
+		logger.V(logs.LogInfo).Error(err, "failed to get ClusterProfile name")
+		return nil, err
+	}
+
+	logger.V(logs.LogDebug).Info(fmt.Sprintf(
+		"instantiateClusterProfileForResource ClusterProfile name: %s", clusterProfileName))
+
+	// It is important to add this label here (after we searched if a ClusterProfile already exists)
+	if er != nil && er.Labels != nil {
+		// Given eventReportNameLabel is now misleading (it contains the EventSource name not the
+		// EventReport one) introducing eventSourceNameLabel. In few releases after v0.52.2 we can
+		// remove eventReportNameLabel
+		labels[eventSourceNameLabel] = er.Labels[libsveltosv1beta1.EventSourceNameLabel]
+	}
+
+	clusterProfile := getNonInstantiatedClusterProfile(eventTrigger, clusterProfileName, labels)
+	var instantiatedCloudEventAction *v1beta1.CloudEventAction
+	if object.CloudEvent != nil {
+		instantiatedCloudEventAction, err = instantiateCloudEventAction(clusterNamespace, clusterName, eventTrigger,
+			object, logger)
+		if err != nil {
+			return nil, err
+		}
+
+		logger.V(logs.LogDebug).Info(fmt.Sprintf("instantiateClusterProfileForResource cloudEventAction: %s", *instantiatedCloudEventAction))
+
+		if *instantiatedCloudEventAction == v1beta1.CloudEventActionDelete {
+			// Resources created because of a cloudEvent are ONLY removed when same (same subject/source) cloudEvent
+			// is received and EventTrigger.Spec.CloudEventAction is set to delete.
+			return nil, deleteClusterProfile(ctx, c, clusterProfile, logger)
+		}
+	}
+
+	clusterProfileSpec, err := instantiateClusterProfileSpecForResource(ctx, c, clusterNamespace, clusterName,
+		clusterType, eventTrigger, labels, object, logger)
+	if err != nil {
+		return nil, err
+	}
+	clusterProfile.Spec = *clusterProfileSpec
+
+	addTypeInformationToObject(mgmtClusterSchema, clusterProfile)
+
+	dr, err := k8s_utils.GetDynamicResourceInterface(mgmtClusterConfig,
+		clusterProfile.GetObjectKind().GroupVersionKind(), clusterProfile.GetNamespace())
+	if err != nil {
+		logger.V(logs.LogInfo).Error(err, "failed to get dynamic client")
+		return nil, err
+	}
+
+	err = updateResource(ctx, dr, clusterProfile, logger)
+	if err != nil {
+		return nil, err
+	}
+
+	if object.CloudEvent != nil && *instantiatedCloudEventAction == v1beta1.CloudEventActionCreate {
+		// To prevent stale ClusterProfiles, ensure the cache is synced before processing next CloudEvents.
+		// This is especially crucial when an EventReport contains both add and delete CloudEvents for the same profile.
+		waitForClusterProfile(ctx, c, clusterProfileName)
+	}
+
+	return clusterProfile, nil
+}
+
+// instantiateClusterProfileSpecForResource creates one ClusterProfile.Spec per event
+func instantiateClusterProfileSpecForResource(ctx context.Context, c client.Client, clusterNamespace, clusterName string,
+	clusterType libsveltosv1beta1.ClusterType, eventTrigger *v1beta1.EventTrigger, labels map[string]string,
+	object *currentObject, logger logr.Logger) (*configv1beta1.Spec, error) {
+
+	clusterProfileSpec := *getClusterProfileSpec(eventTrigger)
+
+	templateName := getTemplateName(clusterNamespace, clusterName, eventTrigger.Name)
+	err := setTemplateResourceRefs(&clusterProfileSpec, templateName, object.Cluster, object,
+		eventTrigger, logger)
+	if err != nil {
+		return nil, err
+	}
+
+	err = setClusterSelector(&clusterProfileSpec, clusterNamespace, clusterName, clusterType, eventTrigger,
+		object, logger)
+	if err != nil {
+		return nil, err
+	}
+
+	instantiateHelmChartsWithResource, err := instantiateHelmChartsWithResource(ctx, c, eventTrigger,
+		clusterNamespace, templateName, eventTrigger.Spec.HelmCharts, object, labels, logger)
+	if err != nil {
+		return nil, err
+	}
+	clusterProfileSpec.HelmCharts = instantiateHelmChartsWithResource
+
+	instantiateKustomizeRefsWithResource, err := instantiateKustomizationRefsWithResource(ctx, c, eventTrigger,
+		clusterNamespace, templateName, eventTrigger.Spec.KustomizationRefs, object, labels, logger)
+	if err != nil {
+		return nil, err
+	}
+	clusterProfileSpec.KustomizationRefs = instantiateKustomizeRefsWithResource
+
+	instantiatedPatchesFrom, err := instantiatePatchesFromWithResource(ctx, c, eventTrigger,
+		clusterNamespace, templateName, object, labels, logger)
+	if err != nil {
+		return nil, err
+	}
+	clusterProfileSpec.PatchesFrom = instantiatedPatchesFrom
+
+	err = setPolicyRefs(ctx, c, &clusterProfileSpec, templateName, clusterNamespace, clusterName, clusterType,
+		object, eventTrigger, labels, logger)
+	if err != nil {
+		return nil, err
+	}
+
+	return &clusterProfileSpec, nil
+}
+
+// instantiateOneClusterProfilePerAllResource creates one ClusterProfile by:
+// - setting Spec.ClusterRef reference passed in cluster clusterNamespace/clusterName/ClusterType
+// - instantiating eventTrigger.Spec.HelmCharts with passed in resource (one of the resource matching referenced EventSource)
+// and copying this value to ClusterProfile.Spec.HelmCharts
+// - instantiating eventTrigger.Spec.PolicyRefs with passed in resource (one of the resource matching referenced EventSource)
+// in new ConfigMaps/Secrets and have ClusterProfile.Spec.PolicyRefs reference those;
+// - labels are added to ClusterProfile to easily fetch all ClusterProfiles created by a given EvnteTrigger
+func instantiateOneClusterProfilePerAllResource(ctx context.Context, c client.Client, clusterNamespace, clusterName string,
+	clusterType libsveltosv1beta1.ClusterType, eventTrigger *v1beta1.EventTrigger,
+	eventReport *libsveltosv1beta1.EventReport, logger logr.Logger) ([]*configv1beta1.ClusterProfile, error) {
+
+	objects, err := prepareCurrentObjects(ctx, c, clusterNamespace, clusterName, clusterType,
+		eventReport, logger)
+	if err != nil {
+		logger.V(logs.LogInfo).Error(err, "failed to prepare currentObjects")
+		return nil, err
+	}
+
+	labels := getInstantiatedObjectLabels(clusterNamespace, clusterName, eventTrigger.Name,
+		eventReport, clusterType)
+	labels = appendServiceAccountLabels(eventTrigger, labels)
+
+	clusterProfileName, err := getClusterProfileName(ctx, c, clusterNamespace, clusterName,
+		eventTrigger, objects, labels, logger)
+	if err != nil {
+		logger.V(logs.LogInfo).Error(err, "failed to get ClusterProfile name")
+		return nil, err
+	}
+
+	// It is important to add this label here (after we searched if a ClusterProfile already exists)
+	if eventReport != nil && eventReport.Labels != nil {
+		// Given eventReportNameLabel is now misleading (it contains the EventSource name not the
+		// EventReport one) introducing eventSourceNameLabel. In few releases after v0.52.2 we can
+		// remove eventReportNameLabel
+		labels[eventSourceNameLabel] = eventReport.Labels[libsveltosv1beta1.EventSourceNameLabel]
+	}
+
+	clusterProfile := getNonInstantiatedClusterProfile(eventTrigger, clusterProfileName, labels)
+
+	clusterProfileSpec, err := instantiateClusterProfileSpecPerAllResource(ctx, c, clusterNamespace,
+		clusterName, clusterType, eventTrigger, labels, objects, logger)
+	if err != nil {
+		return nil, err
+	}
+	clusterProfile.Spec = *clusterProfileSpec
+
+	addTypeInformationToObject(mgmtClusterSchema, clusterProfile)
+
+	dr, err := k8s_utils.GetDynamicResourceInterface(mgmtClusterConfig,
+		clusterProfile.GetObjectKind().GroupVersionKind(), clusterProfile.GetNamespace())
+	if err != nil {
+		logger.V(logs.LogInfo).Error(err, "failed to get dynamic client")
+		return nil, err
+	}
+
+	return []*configv1beta1.ClusterProfile{clusterProfile}, updateResource(ctx, dr, clusterProfile, logger)
+}
+
+func instantiateClusterProfileSpecPerAllResource(ctx context.Context, c client.Client, clusterNamespace, clusterName string,
+	clusterType libsveltosv1beta1.ClusterType, eventTrigger *v1beta1.EventTrigger, labels map[string]string,
+	objects *currentObjects, logger logr.Logger) (*configv1beta1.Spec, error) {
+
+	clusterProfileSpec := getClusterProfileSpec(eventTrigger)
+
+	templateName := getTemplateName(clusterNamespace, clusterName, eventTrigger.Name)
+	err := setTemplateResourceRefs(clusterProfileSpec, templateName, objects.Cluster, objects,
+		eventTrigger, logger)
+	if err != nil {
+		return nil, err
+	}
+
+	err = setClusterSelector(clusterProfileSpec, clusterNamespace, clusterName, clusterType, eventTrigger,
+		objects, logger)
+	if err != nil {
+		return nil, err
+	}
+
+	instantiateHelmChartsWithResources, err := instantiateHelmChartsWithAllResources(ctx, c, eventTrigger,
+		clusterNamespace, templateName, eventTrigger.Spec.HelmCharts, objects, labels, logger)
+	if err != nil {
+		return nil, err
+	}
+	clusterProfileSpec.HelmCharts = instantiateHelmChartsWithResources
+
+	instantiateKustomizeRefsWithResource, err := instantiateKustomizationRefsWithAllResources(ctx, c, eventTrigger,
+		clusterNamespace, templateName, eventTrigger.Spec.KustomizationRefs, objects, labels, logger)
+	if err != nil {
+		return nil, err
+	}
+	clusterProfileSpec.KustomizationRefs = instantiateKustomizeRefsWithResource
+
+	instantiatePatchesFromWithResource, err := instantiatePatchesFromWithAllResources(ctx, c, eventTrigger,
+		clusterNamespace, templateName, objects, labels, logger)
+	if err != nil {
+		return nil, err
+	}
+	clusterProfileSpec.PatchesFrom = instantiatePatchesFromWithResource
+
+	clusterProfileSpec.DriftExclusions = eventTrigger.Spec.DriftExclusions
+
+	err = setPolicyRefs(ctx, c, clusterProfileSpec, templateName, clusterNamespace, clusterName, clusterType,
+		objects, eventTrigger, labels, logger)
+	if err != nil {
+		return nil, err
+	}
+
+	return clusterProfileSpec, nil
+}
+
+func setTemplateResourceRefs(clusterProfileSpec *configv1beta1.Spec,
+	templateName string, clusterContent map[string]interface{}, data any, eventTrigger *v1beta1.EventTrigger,
+	logger logr.Logger) error {
+
+	templateResourceRefs, err := instantiateTemplateResourceRefs(templateName, clusterContent, data,
+		eventTrigger.Spec.TemplateResourceRefs, funcmap.HasTextTemplateAnnotation(eventTrigger.Annotations),
+		logger)
+	if err != nil {
+		logger.V(logs.LogInfo).Error(err, "failed to instantiate TemplateResourceRefs")
+		return err
+	}
+	clusterProfileSpec.TemplateResourceRefs = templateResourceRefs
+	return nil
+}
+
+func setPolicyRefs(ctx context.Context, c client.Client, clusterProfileSpec *configv1beta1.Spec,
+	templateName, clusterNamespace, clusterName string, clusterType libsveltosv1beta1.ClusterType,
+	data any, eventTrigger *v1beta1.EventTrigger, labels map[string]string, logger logr.Logger) error {
+
+	clusterRef := getClusterRef(clusterNamespace, clusterName, clusterType)
+	localPolicyRef, remotePolicyRef, err := instantiateReferencedPolicyRefs(ctx, c, eventTrigger,
+		templateName, eventTrigger, clusterRef, data, labels, logger)
+	if err != nil {
+		return err
+	}
+	clusterProfileSpec.PolicyRefs = getClusterProfilePolicyRefs(localPolicyRef, remotePolicyRef)
+	return nil
+}
+
+func setClusterSelector(clusterProfileSpec *configv1beta1.Spec, clusterNamespace, clusterName string,
+	clusterType libsveltosv1beta1.ClusterType, eventTrigger *v1beta1.EventTrigger, data any,
+	logger logr.Logger) error {
+
+	useSameCluster := true
+	if !reflect.DeepEqual(eventTrigger.Spec.DestinationClusterSelector, libsveltosv1beta1.Selector{}) {
+		useSameCluster = false
+		clusterProfileSpec.ClusterRefs = nil
+		clusterProfileSpec.ClusterSelector = eventTrigger.Spec.DestinationClusterSelector
+	}
+
+	if eventTrigger.Spec.DestinationCluster != nil {
+		useSameCluster = false
+		templateName := getTemplateName(clusterNamespace, clusterName, eventTrigger.Name)
+
+		// Instantiated field-by-field (not by JSON-marshaling the whole ObjectReference and
+		// templating that as one blob): a quoted string literal used as a function argument
+		// inside a template action would otherwise be corrupted by JSON's quote escaping
+		// before the template engine ever sees it.
+		destinationCluster := *eventTrigger.Spec.DestinationCluster.DeepCopy()
+
+		var err error
+		destinationCluster.Namespace, err = instantiateStringField(templateName, "destinationCluster.namespace",
+			destinationCluster.Namespace, data, false, logger)
+		if err != nil {
+			return err
+		}
+
+		destinationCluster.Name, err = instantiateStringField(templateName, "destinationCluster.name",
+			destinationCluster.Name, data, false, logger)
+		if err != nil {
+			return err
+		}
+
+		destinationCluster.Kind, err = instantiateStringField(templateName, "destinationCluster.kind",
+			destinationCluster.Kind, data, false, logger)
+		if err != nil {
+			return err
+		}
+
+		destinationCluster.APIVersion, err = instantiateStringField(templateName, "destinationCluster.apiVersion",
+			destinationCluster.APIVersion, data, false, logger)
+		if err != nil {
+			return err
+		}
+
+		clusterProfileSpec.ClusterRefs = []corev1.ObjectReference{destinationCluster}
+	}
+
+	if useSameCluster {
+		clusterProfileSpec.ClusterRefs = []corev1.ObjectReference{*getClusterRef(clusterNamespace, clusterName, clusterType)}
+		clusterProfileSpec.ClusterSelector = libsveltosv1beta1.Selector{}
+	}
+
+	return nil
+}
+
+func getClusterProfilePolicyRefs(localPolicyRef, remotePolicyRef []configv1beta1.PolicyRef) []configv1beta1.PolicyRef {
+	result := make([]configv1beta1.PolicyRef, len(localPolicyRef)+len(remotePolicyRef))
+
+	// Add local policyRef
+	for i := range localPolicyRef {
+		result[i] = configv1beta1.PolicyRef{
+			DeploymentType: configv1beta1.DeploymentTypeLocal,
+			Namespace:      localPolicyRef[i].Namespace,
+			Name:           localPolicyRef[i].Name,
+			Kind:           localPolicyRef[i].Kind,
+			Path:           localPolicyRef[i].Path,
+		}
+	}
+
+	numOfPolicyItems := len(localPolicyRef)
+	// Add remote policyRef
+	for i := range remotePolicyRef {
+		result[numOfPolicyItems+i] = configv1beta1.PolicyRef{
+			DeploymentType: configv1beta1.DeploymentTypeRemote,
+			Namespace:      remotePolicyRef[i].Namespace,
+			Name:           remotePolicyRef[i].Name,
+			Kind:           remotePolicyRef[i].Kind,
+			Path:           remotePolicyRef[i].Path,
+		}
+	}
+
+	return result
+}
+
+// getResources returns a slice of unstructured.Unstructured by processing eventReport.Spec.Resources field
+func getResources(eventReport *libsveltosv1beta1.EventReport, logger logr.Logger) ([]unstructured.Unstructured, error) {
+	elements, err := deployer.CustomSplit(string(eventReport.Spec.Resources))
+	if err != nil {
+		return nil, err
+	}
+
+	result := make([]unstructured.Unstructured, 0)
+	for i := range elements {
+		if elements[i] == "" {
+			continue
+		}
+
+		var err error
+		var policy *unstructured.Unstructured
+		policy, err = k8s_utils.GetUnstructured([]byte(elements[i]))
+		if err != nil {
+			logger.V(logs.LogInfo).Info(fmt.Sprintf("failed to get policy from Data %.100s", elements[i]))
+			return nil, err
+		}
+
+		result = append(result, *policy)
+	}
+
+	return result, nil
+}
+
+// getCloudEvents returns a slice of map[string]interface{}
+func getCloudEvents(eventReport *libsveltosv1beta1.EventReport, logger logr.Logger) ([]map[string]interface{}, error) {
+	result := make([]map[string]interface{}, 0)
+	for i := range eventReport.Spec.CloudEvents {
+		var data map[string]interface{}
+		err := json.Unmarshal(eventReport.Spec.CloudEvents[i], &data)
+		if err != nil {
+			logger.V(logs.LogInfo).Error(err, "failed to parse cloudEvent")
+			return nil, err
+		}
+
+		result = append(result, data)
+	}
+
+	return result, nil
+}
+
+func instantiateSection(templateName string, toBeInstantiated []byte, data any,
+	useTxtFuncMap bool, logger logr.Logger) ([]byte, error) {
+
+	tmpl, err := template.New(templateName).Option("missingkey=error").Funcs(
+		getTemplateFuncMap(useTxtFuncMap, logger)).Parse(string(toBeInstantiated))
+	if err != nil {
+		logger.V(logs.LogInfo).Error(err, "failed to parse template")
+		return nil, err
+	}
+
+	var buffer bytes.Buffer
+	if err = tmpl.Execute(&buffer, data); err != nil {
+		logger.V(logs.LogInfo).Error(err, "failed to execute template")
+		return nil, err
+	}
+
+	return buffer.Bytes(), nil
+}
+
+// instantiateStringField instantiates a single string field as its own Go template and
+// returns the result. Fields are instantiated one at a time (rather than JSON-marshaling a
+// whole struct/slice and templating that as one blob) so a quoted string literal used as a
+// function argument inside a template action (e.g. {{ replace "-control-plane" "" .Name }})
+// is never corrupted by JSON's quote/newline escaping before the template engine sees it.
+func instantiateStringField(templateName, fieldName, value string, data any, useTxtFuncMap bool,
+	logger logr.Logger) (string, error) {
+
+	instantiated, err := instantiateSection(templateName, []byte(value), data, useTxtFuncMap, logger)
+	if err != nil {
+		logger.V(logs.LogInfo).Error(err, fmt.Sprintf("failed to instantiate %s", fieldName))
+		return "", err
+	}
+	return string(instantiated), nil
+}
+
+func instantiateHelmCharts(ctx context.Context, c client.Client, e *v1beta1.EventTrigger,
+	clusterNamespace, templateName string, helmCharts []configv1beta1.HelmChart, data any,
+	labels map[string]string, logger logr.Logger) ([]configv1beta1.HelmChart, error) {
+
+	useTxtFuncMap := funcmap.HasTextTemplateAnnotation(e.Annotations)
+
+	instantiatedHelmCharts := make([]configv1beta1.HelmChart, len(helmCharts))
+	for i := range helmCharts {
+		// DeepCopy, not a plain struct copy: ValuesFrom (mutated in place by instantiateValuesFrom
+		// below) and other slice/map fields would otherwise still share their backing array/map
+		// with the original helmCharts[i], corrupting it for any other caller reusing the same
+		// EventTrigger spec (e.g. one instantiation per matching resource in oneForEvent mode).
+		instantiatedHelmChart := *helmCharts[i].DeepCopy()
+
+		var err error
+		instantiatedHelmChart.RepositoryURL, err = instantiateStringField(templateName, "repositoryURL",
+			instantiatedHelmChart.RepositoryURL, data, useTxtFuncMap, logger)
+		if err != nil {
+			return nil, err
+		}
+
+		instantiatedHelmChart.RepositoryName, err = instantiateStringField(templateName, "repositoryName",
+			instantiatedHelmChart.RepositoryName, data, useTxtFuncMap, logger)
+		if err != nil {
+			return nil, err
+		}
+
+		instantiatedHelmChart.ChartName, err = instantiateStringField(templateName, "chartName",
+			instantiatedHelmChart.ChartName, data, useTxtFuncMap, logger)
+		if err != nil {
+			return nil, err
+		}
+
+		instantiatedHelmChart.ChartVersion, err = instantiateStringField(templateName, "chartVersion",
+			instantiatedHelmChart.ChartVersion, data, useTxtFuncMap, logger)
+		if err != nil {
+			return nil, err
+		}
+
+		instantiatedHelmChart.ReleaseName, err = instantiateStringField(templateName, "releaseName",
+			instantiatedHelmChart.ReleaseName, data, useTxtFuncMap, logger)
+		if err != nil {
+			return nil, err
+		}
+
+		instantiatedHelmChart.ReleaseNamespace, err = instantiateStringField(templateName, "releaseNamespace",
+			instantiatedHelmChart.ReleaseNamespace, data, useTxtFuncMap, logger)
+		if err != nil {
+			return nil, err
+		}
+
+		instantiatedHelmChart.Values, err = instantiateStringField(templateName, "values",
+			instantiatedHelmChart.Values, data, useTxtFuncMap, logger)
+		if err != nil {
+			return nil, err
+		}
+
+		err = instantiateValuesFrom(ctx, c, e, instantiatedHelmChart.ValuesFrom,
+			clusterNamespace, templateName, data, labels, logger)
+		if err != nil {
+			return nil, err
+		}
+
+		instantiatedHelmCharts[i] = instantiatedHelmChart
+	}
+
+	return instantiatedHelmCharts, nil
+}
+
+func instantiateKustomizationRefs(ctx context.Context, c client.Client, e *v1beta1.EventTrigger,
+	clusterNamespace, templateName string, kustomizationRefs []configv1beta1.KustomizationRef,
+	data any, labels map[string]string, logger logr.Logger) ([]configv1beta1.KustomizationRef, error) {
+
+	useTxtFuncMap := funcmap.HasTextTemplateAnnotation(e.Annotations)
+
+	instantiatedKustomizationRefs := make([]configv1beta1.KustomizationRef, len(kustomizationRefs))
+	for i := range kustomizationRefs {
+		// DeepCopy, not a plain struct copy: ValuesFrom (mutated in place by instantiateValuesFrom
+		// below), Components, and Values would otherwise still share their backing array/map with
+		// the original kustomizationRefs[i], corrupting it for any other caller reusing the same
+		// EventTrigger spec (e.g. one instantiation per matching resource in oneForEvent mode).
+		instantiatedRef := *kustomizationRefs[i].DeepCopy()
+
+		var err error
+		instantiatedRef.Namespace, err = instantiateStringField(templateName, "namespace",
+			instantiatedRef.Namespace, data, useTxtFuncMap, logger)
+		if err != nil {
+			return nil, err
+		}
+
+		instantiatedRef.Name, err = instantiateStringField(templateName, "name",
+			instantiatedRef.Name, data, useTxtFuncMap, logger)
+		if err != nil {
+			return nil, err
+		}
+
+		instantiatedRef.Path, err = instantiateStringField(templateName, "path",
+			instantiatedRef.Path, data, useTxtFuncMap, logger)
+		if err != nil {
+			return nil, err
+		}
+
+		instantiatedRef.TargetNamespace, err = instantiateStringField(templateName, "targetNamespace",
+			instantiatedRef.TargetNamespace, data, useTxtFuncMap, logger)
+		if err != nil {
+			return nil, err
+		}
+
+		for j := range instantiatedRef.Components {
+			instantiatedRef.Components[j], err = instantiateStringField(templateName, "components",
+				instantiatedRef.Components[j], data, useTxtFuncMap, logger)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		for k, v := range instantiatedRef.Values {
+			instantiatedRef.Values[k], err = instantiateStringField(templateName, "values",
+				v, data, useTxtFuncMap, logger)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		err = instantiateValuesFrom(ctx, c, e, instantiatedRef.ValuesFrom,
+			clusterNamespace, templateName, data, labels, logger)
+		if err != nil {
+			return nil, err
+		}
+
+		instantiatedKustomizationRefs[i] = instantiatedRef
+	}
+
+	return instantiatedKustomizationRefs, nil
+}
+
+func instantiateValuesFrom(ctx context.Context, c client.Client, e *v1beta1.EventTrigger,
+	valuesFrom []configv1beta1.ValueFrom, clusterNamespace, templateName string, data any, labels map[string]string,
+	logger logr.Logger) error {
+
+	for i := range valuesFrom {
+		ref := &valuesFrom[i]
+
+		var namespace string
+		if ref.Namespace == "" {
+			namespace = clusterNamespace
+		} else {
+			instantiantedNamespace, err := instantiateSection(templateName, []byte(ref.Namespace), data,
+				funcmap.HasTextTemplateAnnotation(e.Annotations), logger)
+			if err != nil {
+				logger.V(logs.LogInfo).Error(err, "failed to instantiate name")
+				return err
+			}
+			namespace = string(instantiantedNamespace)
+		}
+
+		name, err := instantiateSection(templateName, []byte(ref.Name), data,
+			funcmap.HasTextTemplateAnnotation(e.Annotations), logger)
+		if err != nil {
+			logger.V(logs.LogInfo).Error(err, "failed to instantiate name")
+			return err
+		}
+
+		var resource client.Object
+		if ref.Kind == string(libsveltosv1beta1.ConfigMapReferencedResourceKind) {
+			resource, err = getConfigMap(ctx, c,
+				types.NamespacedName{Namespace: namespace, Name: string(name)})
+		} else {
+			resource, err = getSecret(ctx, c,
+				types.NamespacedName{Namespace: namespace, Name: string(name)})
+		}
+
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				// referenced ConfigMap/Secret does not exist. Assume is not intended to be a template.
+				// So there is no need to instantiate a new one. Generated ClusterProfile can directly
+				// reference this one
+				continue
+			}
+			return err
+		}
+
+		var info *types.NamespacedName
+		if _, ok := resource.GetAnnotations()[v1beta1.InstantiateAnnotation]; !ok {
+			// referenced ConfigMap/Secret is not a template. So there is no
+			// need to instantiate a new one. Generated ClusterProfile can directly
+			// reference this one
+			info = &types.NamespacedName{Namespace: resource.GetNamespace(), Name: resource.GetName()}
+		} else {
+			name, err := getResourceName(ctx, c, resource, labels)
+			if err != nil {
+				logger.V(logs.LogInfo).Error(err, fmt.Sprintf("failed to get %s name", resource.GetObjectKind()))
+				return err
+			}
+			// If referenced resource is a template, assume it needs to be instantiated using
+			// information from the resources in the managed cluster that generated the event.
+			// Generate then a new ConfigMap/Secret. The autocreated ClusterProfile will reference
+			// this new resource.
+			info, err = instantiateReferencedPolicy(ctx, e, resource, templateName, name, data, labels, logger)
+			if err != nil {
+				msg := fmt.Sprintf("failed to instantiate content for ValuesFrom: %s/%s",
+					resource.GetNamespace(), resource.GetName())
+				logger.V(logs.LogInfo).Error(err, msg)
+				return errors.Wrapf(err, "%s", msg)
+			}
+		}
+
+		ref.Name = info.Name
+		ref.Namespace = info.Namespace
+	}
+
+	return nil
+}
+
+func instantiateDataSection(templateName string, content map[string]string, data any,
+	useTxtFuncMap bool, logger logr.Logger) (map[string]string, error) {
+
+	instantiatedContent := make(map[string]string)
+
+	for key := range content {
+		tmpl, err := template.New(templateName).Option("missingkey=error").Funcs(
+			getTemplateFuncMap(useTxtFuncMap, logger)).Parse(content[key])
+		if err != nil {
+			logger.V(logs.LogInfo).Error(err, "failed to parse content")
+			return nil, err
+		}
+
+		var buffer bytes.Buffer
+		if err = tmpl.Execute(&buffer, data); err != nil {
+			logger.V(logs.LogInfo).Error(err, "failed to execute content")
+			return nil, err
+		}
+
+		// Store the instantiated content
+		instantiatedContent[key] = buffer.String()
+	}
+
+	return instantiatedContent, nil
+}
+
+func instantiateTemplateResourceRefs(templateName string,
+	clusterContent map[string]interface{}, data any, templateResourceRefs []configv1beta1.TemplateResourceRef,
+	useTxtFuncMap bool, logger logr.Logger) ([]configv1beta1.TemplateResourceRef, error) {
+
+	var uCluster unstructured.Unstructured
+	uCluster.SetUnstructuredContent(clusterContent)
+
+	instantiated := make([]configv1beta1.TemplateResourceRef, len(templateResourceRefs))
+	for i := range templateResourceRefs {
+		tmpl, err := template.New(templateName).Option("missingkey=error").Funcs(
+			getTemplateFuncMap(useTxtFuncMap, logger)).Parse(templateResourceRefs[i].Resource.Name)
+		if err != nil {
+			return nil, err
+		}
+
+		var nameBuffer bytes.Buffer
+		err = tmpl.Execute(&nameBuffer, data)
+		if err != nil {
+			return nil, err
+		}
+
+		tmpl, err = template.New(templateName).Option("missingkey=error").Funcs(
+			getTemplateFuncMap(useTxtFuncMap, logger)).Parse(templateResourceRefs[i].Resource.Namespace)
+		if err != nil {
+			return nil, err
+		}
+
+		var namespaceBuffer bytes.Buffer
+		err = tmpl.Execute(&namespaceBuffer, data)
+		if err != nil {
+			return nil, err
+		}
+
+		instantiated[i] = templateResourceRefs[i]
+		instantiated[i].Resource.Namespace = namespaceBuffer.String()
+		instantiated[i].Resource.Name = nameBuffer.String()
+	}
+
+	return instantiated, nil
+}
+
+// instantiatePatchesFromWithResource instantiate eventTrigger.Spec.PatchesFrom using information from passed
+// in object which represents one of the resource matching referenced EventSource in the managed cluster.
+func instantiatePatchesFromWithResource(ctx context.Context, c client.Client, e *v1beta1.EventTrigger,
+	clusterNamespace, templateName string, data any, labels map[string]string, logger logr.Logger,
+) ([]configv1beta1.ValueFrom, error) {
+
+	valuesFrom := make([]configv1beta1.ValueFrom, len(e.Spec.PatchesFrom))
+	copy(valuesFrom, e.Spec.PatchesFrom)
+	err := instantiateValuesFrom(ctx, c, e, valuesFrom, clusterNamespace, templateName, data, labels, logger)
+	if err != nil {
+		return nil, err
+	}
+
+	return valuesFrom, nil
+}
+
+// instantiatePatchesFromWithAllResources instantiate eventTrigger.Spec.PatchesFrom using information from passed
+// in objects which represent all of the resources matching referenced EventSource in the managed cluster.
+func instantiatePatchesFromWithAllResources(ctx context.Context, c client.Client, e *v1beta1.EventTrigger,
+	clusterNamespace, templateName string, data any, labels map[string]string, logger logr.Logger,
+) ([]configv1beta1.ValueFrom, error) {
+
+	valuesFrom := make([]configv1beta1.ValueFrom, len(e.Spec.PatchesFrom))
+	copy(valuesFrom, e.Spec.PatchesFrom)
+	err := instantiateValuesFrom(ctx, c, e, valuesFrom, clusterNamespace, templateName, data, labels, logger)
+	if err != nil {
+		return nil, err
+	}
+
+	return valuesFrom, nil
+}
+
+// instantiateHelmChartsWithResource instantiate eventTrigger.Spec.HelmCharts using information from passed in object
+// which represents one of the resource matching referenced EventSource in the managed cluster.
+func instantiateHelmChartsWithResource(ctx context.Context, c client.Client, e *v1beta1.EventTrigger,
+	clusterNamespace, templateName string, helmCharts []configv1beta1.HelmChart, data any,
+	labels map[string]string, logger logr.Logger) ([]configv1beta1.HelmChart, error) {
+
+	return instantiateHelmCharts(ctx, c, e, clusterNamespace, templateName, helmCharts, data, labels, logger)
+}
+
+// instantiateHelmChartsWithAllResources instantiate eventTrigger.Spec.HelmCharts using information from passed in objects
+// which represent all of the resources matching referenced EventSource in the managed cluster.
+func instantiateHelmChartsWithAllResources(ctx context.Context, c client.Client, e *v1beta1.EventTrigger,
+	clusterNamespace, templateName string, helmCharts []configv1beta1.HelmChart, data any,
+	labels map[string]string, logger logr.Logger) ([]configv1beta1.HelmChart, error) {
+
+	return instantiateHelmCharts(ctx, c, e, clusterNamespace, templateName, helmCharts, data, labels, logger)
+}
+
+// instantiateKustomizationRefsWithResource instantiate eventTrigger.Spec.KustomizationRefs using information from passed
+// in object which represents one of the resource matching referenced EventSource in the managed cluster.
+func instantiateKustomizationRefsWithResource(ctx context.Context, c client.Client, e *v1beta1.EventTrigger,
+	clusterNamespace, templateName string, kustomizationRefs []configv1beta1.KustomizationRef, data any,
+	labels map[string]string, logger logr.Logger,
+) ([]configv1beta1.KustomizationRef, error) {
+
+	return instantiateKustomizationRefs(ctx, c, e, clusterNamespace, templateName, kustomizationRefs, data, labels, logger)
+}
+
+// instantiateKustomizationRefsWithAllResources instantiate eventTrigger.Spec.KustomizationRefs using information from passed
+// in objects which represent all of the resources matching referenced EventSource in the managed cluster.
+func instantiateKustomizationRefsWithAllResources(ctx context.Context, c client.Client, e *v1beta1.EventTrigger,
+	clusterNamespace, templateName string, kustomizationRefs []configv1beta1.KustomizationRef, data any,
+	labels map[string]string, logger logr.Logger) ([]configv1beta1.KustomizationRef, error) {
+
+	return instantiateKustomizationRefs(ctx, c, e, clusterNamespace, templateName, kustomizationRefs, data, labels, logger)
+}
+
+// instantiateReferencedPolicies instantiate eventTrigger.Spec.PolicyRefs using information from passed in objects
+// which represent all of the resources matching referenced EventSource in the managed cluster.
+func instantiateReferencedPolicyRefs(ctx context.Context, c client.Client, e *v1beta1.EventTrigger,
+	templateName string, eventTrigger *v1beta1.EventTrigger, cluster *corev1.ObjectReference, objects any,
+	labels map[string]string, logger logr.Logger) (localSet, remoteSet []configv1beta1.PolicyRef, err error) {
+
+	// fetches all referenced ConfigMaps/Secrets
+	var local map[configv1beta1.PolicyRef]client.Object
+	var remote map[configv1beta1.PolicyRef]client.Object
+	local, remote, err = fetchPolicyRefs(ctx, c, eventTrigger, cluster, objects, templateName, logger)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	localSet, err = instantiateResources(ctx, c, e, templateName, local, objects, labels, logger)
+	if err != nil {
+		return nil, nil, err
+	}
+	remoteSet, err = instantiateResources(ctx, c, e, templateName, remote, objects, labels, logger)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return
+}
+
+func instantiateResources(ctx context.Context, c client.Client, e *v1beta1.EventTrigger,
+	templateName string, resources map[configv1beta1.PolicyRef]client.Object, objects any, labels map[string]string,
+	logger logr.Logger) ([]configv1beta1.PolicyRef, error) {
+
+	result := make([]configv1beta1.PolicyRef, 0)
+
+	for k := range resources {
+		ref := resources[k]
+		_, kind := ref.GetObjectKind().GroupVersionKind().ToAPIVersionAndKind()
+
+		l := logger.WithValues("referencedResource", fmt.Sprintf("%s:%s/%s",
+			ref.GetObjectKind().GroupVersionKind().Kind, ref.GetNamespace(), ref.GetName()))
+		l.V(logs.LogDebug).Info("process referenced resource")
+		var info *types.NamespacedName
+
+		if _, ok := ref.GetAnnotations()[v1beta1.InstantiateAnnotation]; !ok {
+			// referenced ConfigMap/Secret is not a template. So there is no
+			// need to instantiate a new one. Generated ClusterProfile can directly
+			// reference this one
+			info = &types.NamespacedName{Namespace: ref.GetNamespace(), Name: ref.GetName()}
+		} else {
+			name, err := getResourceName(ctx, c, ref, labels)
+			if err != nil {
+				logger.V(logs.LogInfo).Error(err, fmt.Sprintf("failed to get %s name", ref.GetObjectKind()))
+				return nil, err
+			}
+			// If referenced resource is a template, assume it needs to be instantiated using
+			// information from the resources in the managed cluster that generated the event.
+			// Generate then a new ConfigMap/Secret. The autocreated ClusterProfile will reference
+			// this new resource.
+			info, err = instantiateReferencedPolicy(ctx, e, ref, templateName, name, objects, labels, logger)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		result = append(result, configv1beta1.PolicyRef{
+			Namespace: info.Namespace, Name: info.Name,
+			Kind: kind, Path: k.Path, Optional: k.Optional, DeploymentType: k.DeploymentType,
+		})
+	}
+
+	return result, nil
+}
+
+func instantiateReferencedPolicy(ctx context.Context, e *v1beta1.EventTrigger, ref client.Object,
+	templateName, name string, objects any, labels map[string]string, logger logr.Logger,
+) (*types.NamespacedName, error) {
+
+	l := logger.WithValues("referencedResource",
+		fmt.Sprintf("%s:%s/%s", ref.GetObjectKind(), ref.GetNamespace(), ref.GetName()))
+
+	content := getDataSection(ref)
+
+	instantiatedContent, err := instantiateDataSection(templateName, content, objects,
+		funcmap.HasTextTemplateAnnotation(e.Annotations), l)
+	if err != nil {
+		l.V(logs.LogInfo).Error(err, "failed to instantiated referenced resource content")
+		return nil, err
+	}
+	content = instantiatedContent
+
+	// Referenced resource labels are to be added. Make a copy
+	tmpLabels := make(map[string]string)
+	for k := range labels {
+		tmpLabels[k] = labels[k]
+	}
+
+	// Resource name must depend on reference resource name as well. So add those labels.
+	// If an EventTrigger is referencing N configMaps/Secrets, N equivalent referenced
+	// resources must be created
+	tmpLabels[referencedResourceNamespaceLabel] = ref.GetNamespace()
+	tmpLabels[referencedResourceNameLabel] = ref.GetName()
+
+	var instantiatedObject client.Object
+	if ref.GetObjectKind().GroupVersionKind().Kind == string(libsveltosv1beta1.ConfigMapReferencedResourceKind) {
+		instantiatedObject = generateConfigMap(ref, name, tmpLabels, content)
+	} else {
+		instantiatedObject = generateSecret(ref, name, tmpLabels, content)
+	}
+	addTypeInformationToObject(mgmtClusterSchema, instantiatedObject)
+
+	dr, err := k8s_utils.GetDynamicResourceInterface(mgmtClusterConfig,
+		instantiatedObject.GetObjectKind().GroupVersionKind(), instantiatedObject.GetNamespace())
+	if err != nil {
+		logger.V(logs.LogInfo).Error(err, "failed to get dynamic client")
+		return nil, err
+	}
+
+	logger.V(logs.LogDebug).Info(fmt.Sprintf("patch resource %s %s:%s",
+		ref.GetObjectKind().GroupVersionKind().Kind, ref.GetNamespace(), ref.GetName()))
+
+	err = updateResource(ctx, dr, instantiatedObject, logger)
+	if err != nil {
+		logger.V(logs.LogInfo).Error(err, fmt.Sprintf("failed to patch resource %s %s:%s",
+			ref.GetObjectKind().GroupVersionKind().Kind, ref.GetNamespace(), ref.GetName()))
+		return nil, err
+	}
+
+	// Keep track of all Secret/ConfigMap instances with "projectsveltos.io/instantiate" annotation
+	// referenced by an EventTrigger. When those changes, EventTrigger will be reconciled.
+	resourceTracker := getTrackerInstance()
+	resourceTracker.trackResourceForConsumer(
+		&corev1.ObjectReference{Kind: ref.GetObjectKind().GroupVersionKind().Kind, Namespace: ref.GetNamespace(),
+			Name: ref.GetName(), APIVersion: coreAPIVersion},
+		&corev1.ObjectReference{Kind: v1beta1.EventTriggerKind, Name: e.GetName(), APIVersion: v1beta1.GroupVersion.String()},
+	)
+
+	return &types.NamespacedName{Namespace: getSveltosNamespace(), Name: name}, nil
+}
+
+func generateConfigMap(ref client.Object, name string, labels, content map[string]string) client.Object {
+	return &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        name,
+			Namespace:   getSveltosNamespace(),
+			Labels:      labels,
+			Annotations: ref.GetAnnotations(), //  libsveltosv1beta1.PolicyTemplateAnnotation might be set
+		},
+		Data: content,
+	}
+}
+
+func generateSecret(ref client.Object, name string, labels, content map[string]string) client.Object {
+	data := make(map[string][]byte)
+	for key, value := range content {
+		data[key] = []byte(value)
+	}
+
+	return &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        name,
+			Namespace:   getSveltosNamespace(),
+			Labels:      labels,
+			Annotations: ref.GetAnnotations(), //  libsveltosv1beta1.PolicyTemplateAnnotation might be set
+		},
+		Data: data,
+		Type: libsveltosv1beta1.ClusterProfileSecretType,
+	}
+}
+
+func getDataSection(ref client.Object) map[string]string {
+	switch v := ref.(type) {
+	case *corev1.ConfigMap:
+		return v.Data
+	case *corev1.Secret:
+		data := make(map[string]string)
+		for key, value := range v.Data {
+			data[key] = string(value)
+		}
+		return data
+	default:
+		panic(1) // only referenced resources are ConfigMap/Secret
+	}
+}
+
+func getTemplateName(clusterNamespace, clusterName, requestorName string) string {
+	return fmt.Sprintf("%s-%s-%s", clusterNamespace, clusterName, requestorName)
+}
+
+func getClusterRef(clusterNamespace, clusterName string,
+	clusterType libsveltosv1beta1.ClusterType) *corev1.ObjectReference {
+
+	ref := &corev1.ObjectReference{
+		Namespace: clusterNamespace,
+		Name:      clusterName,
+	}
+
+	if clusterType == libsveltosv1beta1.ClusterTypeSveltos {
+		ref.APIVersion = libsveltosv1beta1.GroupVersion.String()
+		ref.Kind = libsveltosv1beta1.SveltosClusterKind
+	} else {
+		ref.APIVersion = clusterv1.GroupVersion.String()
+		ref.Kind = "Cluster"
+	}
+
+	return ref
+}
+
+// getClusterProfileName returns the name for a given ClusterProfile given the labels such ClusterProfile
+// should have. It also returns whether the ClusterProfile must be created (if create a false, ClusterProfile
+// should be simply updated). And an error if any occurs.
+func getClusterProfileName(ctx context.Context, c client.Client, clusterNamespace, clusterName string,
+	eventTrigger *v1beta1.EventTrigger, data any, labels map[string]string, logger logr.Logger,
+) (name string, err error) {
+
+	listOptions := []client.ListOption{
+		client.MatchingLabels(labels),
+	}
+
+	if eventTrigger.Spec.InstantiatedProfileNameFormat == "" {
+		clusterProfileList := &configv1beta1.ClusterProfileList{}
+		err = c.List(ctx, clusterProfileList, listOptions...)
+		if err != nil {
+			return "", err
+		}
+
+		objects := make([]client.Object, len(clusterProfileList.Items))
+		for i := range clusterProfileList.Items {
+			objects[i] = &clusterProfileList.Items[i]
+		}
+
+		return getInstantiatedObjectName(ctx, c, objects)
+	}
+
+	templateName := getTemplateName(clusterNamespace, clusterName, eventTrigger.Name)
+	instantiatedName, err := instantiateSection(templateName, []byte(eventTrigger.Spec.InstantiatedProfileNameFormat),
+		data, funcmap.HasTextTemplateAnnotation(eventTrigger.Annotations), logger)
+	if err != nil {
+		return "", err
+	}
+
+	// If the profile exists, make sure this is owned by this EventTrigger instance. Fail it otherwise
+	clusterProfile := &configv1beta1.ClusterProfile{}
+	err = c.Get(ctx, types.NamespacedName{Name: templateName}, clusterProfile)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return string(instantiatedName), nil
+		}
+		return "", err
+	}
+
+	err = validateClusterProfileLabels(clusterProfile, eventTrigger.Name, clusterNamespace,
+		clusterName, string(instantiatedName))
+	if err != nil {
+		return "", err
+	}
+
+	return string(instantiatedName), nil
+}
+
+// validateLabels checks if the ClusterProfile has the exact set of expected labels.
+func validateClusterProfileLabels(clusterProfile *configv1beta1.ClusterProfile,
+	eventTriggerName, clusterNamespace, clusterName, instantiatedName string) error {
+
+	expectedLabels := map[string]string{
+		eventTriggerNameLabel: eventTriggerName,
+		clusterNamespaceLabel: clusterNamespace,
+		clusterNameLabel:      clusterName,
+	}
+
+	currentLabels := clusterProfile.Labels
+	if currentLabels == nil {
+		return fmt.Errorf("ClusterProfile %s does not have the expected labels indicating EventTrigger %s owns it",
+			instantiatedName, eventTriggerName)
+	}
+
+	// First, check if the number of labels matches. This is a quick pre-check.
+	if len(currentLabels) != len(expectedLabels) {
+		return fmt.Errorf("ClusterProfile %s has an incorrect number of labels. Expected %d, got %d",
+			instantiatedName, len(expectedLabels), len(currentLabels))
+	}
+
+	// Then, iterate and validate each expected label.
+	for k, v := range expectedLabels {
+		currentV, ok := currentLabels[k]
+		if !ok || currentV != v {
+			return fmt.Errorf("ClusterProfile %s does not have the labels indicating EventTrigger %s owns it",
+				instantiatedName, eventTriggerName)
+		}
+	}
+
+	return nil
+}
+
+func getResourceName(ctx context.Context, c client.Client, ref client.Object,
+	labels map[string]string) (name string, err error) {
+
+	// Always append the labels identifying the referenced resource
+	labels[referencedResourceNamespaceLabel] = ref.GetNamespace()
+	labels[referencedResourceNameLabel] = ref.GetName()
+
+	switch ref.(type) {
+	case *corev1.ConfigMap:
+		name, err = getConfigMapName(ctx, c, labels)
+	case *corev1.Secret:
+		name, err = getSecretName(ctx, c, labels)
+	default:
+		panic(1)
+	}
+	return
+}
+
+// getConfigMapName returns the name for a given ConfigMap given the labels such ConfigMap
+// should have. And an error if any occurs.
+func getConfigMapName(ctx context.Context, c client.Client, labels map[string]string,
+) (name string, err error) {
+
+	listOptions := []client.ListOption{
+		client.MatchingLabels(labels),
+		client.InNamespace(getSveltosNamespace()), // all instantianted ConfigMaps are in this namespace
+	}
+
+	configMapList := &corev1.ConfigMapList{}
+	err = c.List(ctx, configMapList, listOptions...)
+	if err != nil {
+		return
+	}
+
+	objects := make([]client.Object, 0)
+	for i := range configMapList.Items {
+		objects = append(objects, &configMapList.Items[i])
+	}
+
+	return getInstantiatedObjectName(ctx, c, objects)
+}
+
+// getSecretName returns the name for a given Secret given the labels such Secret
+// should have. And an error if any occurs.
+func getSecretName(ctx context.Context, c client.Client, labels map[string]string,
+) (name string, err error) {
+
+	listOptions := []client.ListOption{
+		client.MatchingLabels(labels),
+		client.InNamespace(getSveltosNamespace()), // all instantianted Secrets are in this namespace
+	}
+
+	secretList := &corev1.SecretList{}
+	err = c.List(ctx, secretList, listOptions...)
+	if err != nil {
+		return
+	}
+
+	objects := make([]client.Object, 0)
+	for i := range secretList.Items {
+		objects = append(objects, &secretList.Items[i])
+	}
+
+	return getInstantiatedObjectName(ctx, c, objects)
+}
+
+func getInstantiatedObjectName(ctx context.Context, c client.Client, objects []client.Object,
+) (name string, err error) {
+
+	prefix := "sveltos-"
+	switch len(objects) {
+	case 0:
+		// no cluster exist yet. Return random name.
+		// If one clusterProfile with this name already exists,
+		// a conflict will happen. On retry different name will
+		// be picked
+		const nameLength = 20
+		name = prefix + randutils.RandomString(nameLength)
+		err = nil
+	case 1:
+		name = objects[0].GetName()
+		err = nil
+	default:
+		err = fmt.Errorf("more than one resource of gvk %s found",
+			objects[0].GetObjectKind().GroupVersionKind().String())
+
+		// Leave first object, remove all others
+		for i := range objects[1:] {
+			// Ignore eventual error, since we are returning an error anyway
+			_ = c.Delete(ctx, objects[i])
+		}
+
+		return name, err
+	}
+	return name, err
+}
+
+// getInstantiatedObjectLabels returns the labels to add to a ClusterProfile created
+// by an EventTrigger for a given cluster
+func getInstantiatedObjectLabels(clusterNamespace, clusterName, eventTriggerName string,
+	er *libsveltosv1beta1.EventReport, clusterType libsveltosv1beta1.ClusterType) map[string]string {
+
+	labels := map[string]string{
+		eventTriggerNameLabel: eventTriggerName,
+		clusterNamespaceLabel: clusterNamespace,
+		clusterNameLabel:      clusterName,
+		clusterTypeLabel:      string(clusterType),
+	}
+
+	// When deleting all resources created by an EventTrigger, er will be nil
+	if er != nil {
+		// In release v0.52.2 when running in agentless mode, the EventReport name.
+		// While previously the EventReport name used to match the EventSource, it is different
+		// name (getEventReportNameInManagementCluster). This caused on upgrade, same ClusterProfile
+		// to be instantiated twice because of that.
+		// EventReport has projectsveltos.io/eventsource-name label. So use that instead to avoid
+		// this problem
+		labels[eventReportNameLabel] = er.Labels[libsveltosv1beta1.EventSourceNameLabel]
+	}
+
+	return labels
+}
+
+// appendInstantiatedObjectLabelsForResource appends labels specific to a specific resource
+func appendInstantiatedObjectLabelsForResource(labels map[string]string, resourceNamespace, resourceName string) map[string]string {
+	labels["eventtrigger.lib.projectsveltos.io/resourcename"] = resourceName
+
+	if resourceNamespace != "" {
+		labels["eventtrigger.lib.projectsveltos.io/resourcenamespace"] = resourceNamespace
+	}
+
+	return labels
+}
+
+// appendInstantiatedObjectLabelsForCloudEvent appends labels specific to a specific cloudEvent
+func appendInstantiatedObjectLabelsForCloudEvent(labels map[string]string, csSource, ceSubject string) map[string]string {
+	labels[cloudEventSourceLabel] = strings.ReplaceAll(csSource, "/", "-")
+	labels[cloudEventSubjectLabel] = strings.ReplaceAll(ceSubject, "/", "-")
+
+	return labels
+}
+
+func isGeneratedFromCloudEvent(resource client.Object) bool {
+	lbls := resource.GetLabels()
+	if lbls == nil {
+		return false
+	}
+	if _, ok := lbls[cloudEventSourceLabel]; ok {
+		return true
+	}
+	return false
+}
+
+func isFromGenerators(resource client.Object) bool {
+	lbls := resource.GetLabels()
+	if lbls == nil {
+		return false
+	}
+	if _, ok := lbls[generatorLabel]; ok {
+		return true
+	}
+	return false
+}
+
+func isResourceExist(resource client.Object) bool {
+	if reflect.ValueOf(resource).IsNil() {
+		return false
+	}
+
+	return resource.GetDeletionTimestamp().IsZero()
+}
+
+func getCESource(cloudEvent map[string]interface{}) string {
+	v, ok := cloudEvent["source"]
+	if !ok {
+		return ""
+	}
+
+	s, ok := v.(string)
+	if !ok {
+		return ""
+	}
+
+	return s
+}
+
+func getCESubject(cloudEvent map[string]interface{}) string {
+	v, ok := cloudEvent["subject"]
+	if !ok {
+		return ""
+	}
+
+	s, ok := v.(string)
+	if !ok {
+		return ""
+	}
+
+	return s
+}
+
+func removeInstantiatedResources(ctx context.Context, c client.Client, clusterNamespace, clusterName string,
+	clusterType libsveltosv1beta1.ClusterType, eventTrigger *v1beta1.EventTrigger, er *libsveltosv1beta1.EventReport,
+	clusterProfiles []*configv1beta1.ClusterProfile, fromGenerators []libsveltosv1beta1.PolicyRef,
+	logger logr.Logger) error {
+
+	staleProfilesFound, err := removeClusterProfiles(ctx, c, clusterNamespace, clusterName, clusterType, eventTrigger, er,
+		clusterProfiles, logger)
+	if err != nil {
+		logger.V(logs.LogInfo).Error(err, "failed to remove stale clusterProfiles")
+		return err
+	}
+
+	// Wait for stale ClusterProfiles to be fully deleted before removing referenced ConfigMaps/Secrets.
+	// Those resources may still be referenced by a ClusterProfile that is terminating.
+	if staleProfilesFound {
+		return fmt.Errorf("stale ClusterProfiles are being deleted, requeuing")
+	}
+
+	policyRefs := make(map[libsveltosv1beta1.PolicyRef]bool) // ignore deploymentType
+	for i := range clusterProfiles {
+		cp := clusterProfiles[i]
+		for j := range cp.Spec.PolicyRefs {
+			policyRefs[libsveltosv1beta1.PolicyRef{
+				Namespace: cp.Spec.PolicyRefs[j].Namespace,
+				Name:      cp.Spec.PolicyRefs[j].Name,
+				Kind:      cp.Spec.PolicyRefs[j].Kind,
+			}] = true
+		}
+		policyRefs = appendHelmChartValuesFrom(policyRefs, cp.Spec.HelmCharts)
+		policyRefs = appendKustomizationRefValuesFrom(policyRefs, cp.Spec.KustomizationRefs)
+	}
+
+	// Add all ConfigMap/Secret instances created started from Generators (ConfigMapGenerator/SecretGenerator)
+	for i := range fromGenerators {
+		policyRefs[fromGenerators[i]] = true
+	}
+
+	if err := removeConfigMaps(ctx, c, clusterNamespace, clusterName, clusterType, eventTrigger,
+		er, policyRefs, logger); err != nil {
+		logger.V(logs.LogInfo).Error(err, "failed to remove stale configMaps")
+		return err
+	}
+
+	if err := removeSecrets(ctx, c, clusterNamespace, clusterName, clusterType, eventTrigger,
+		er, policyRefs, logger); err != nil {
+		logger.V(logs.LogInfo).Error(err, "failed to remove stale secrets")
+		return err
+	}
+
+	return nil
+}
+
+func appendHelmChartValuesFrom(policyRefs map[libsveltosv1beta1.PolicyRef]bool, helmCharts []configv1beta1.HelmChart,
+) map[libsveltosv1beta1.PolicyRef]bool {
+
+	for i := range helmCharts {
+		for j := range helmCharts[i].ValuesFrom {
+			policyRefs[libsveltosv1beta1.PolicyRef{
+				Namespace: helmCharts[i].ValuesFrom[j].Namespace,
+				Name:      helmCharts[i].ValuesFrom[j].Name,
+				Kind:      helmCharts[i].ValuesFrom[j].Kind,
+			}] = true
+		}
+	}
+
+	return policyRefs
+}
+
+func appendKustomizationRefValuesFrom(policyRefs map[libsveltosv1beta1.PolicyRef]bool,
+	kustomizationRefs []configv1beta1.KustomizationRef) map[libsveltosv1beta1.PolicyRef]bool {
+
+	for i := range kustomizationRefs {
+		for j := range kustomizationRefs[i].ValuesFrom {
+			policyRefs[libsveltosv1beta1.PolicyRef{
+				Namespace: kustomizationRefs[i].ValuesFrom[j].Namespace,
+				Name:      kustomizationRefs[i].ValuesFrom[j].Name,
+				Kind:      kustomizationRefs[i].ValuesFrom[j].Kind,
+			}] = true
+		}
+	}
+
+	return policyRefs
+}
+
+// removeConfigMaps fetches all ConfigMaps created by EventTrigger instance for a given cluster.
+// It deletes all stale ConfigMaps (all ConfigMap instances currently present and not in the policyRefs
+// list).
+// policyRefs arg represents all the ConfigMap the EventTrigger instance is currently managing for the
+// given cluster
+func removeConfigMaps(ctx context.Context, c client.Client, clusterNamespace, clusterName string,
+	clusterType libsveltosv1beta1.ClusterType, eventTrigger *v1beta1.EventTrigger, er *libsveltosv1beta1.EventReport,
+	policyRefs map[libsveltosv1beta1.PolicyRef]bool, logger logr.Logger) error {
+
+	// Pass nil for er so eventReportNameLabel (EventSource name) is excluded from the selector,
+	// ensuring stale ConfigMaps from a previously referenced EventSource are also found and deleted.
+	labels := getInstantiatedObjectLabels(clusterNamespace, clusterName, eventTrigger.Name,
+		nil, clusterType)
+
+	listOptions := []client.ListOption{
+		client.MatchingLabels(labels),
+		client.InNamespace(getSveltosNamespace()),
+	}
+
+	configMaps := &corev1.ConfigMapList{}
+	err := c.List(ctx, configMaps, listOptions...)
+	if err != nil {
+		return err
+	}
+
+	for i := range configMaps.Items {
+		cm := &configMaps.Items[i]
+		// For existing EventTrigger and EventReport
+		if isResourceExist(eventTrigger) && isResourceExist(er) &&
+			isGeneratedFromCloudEvent(cm) && isFromGenerators(cm) {
+			// ConfigMaps generated for CloudEvents out of Generators are removed
+			// when CloudEventAction is set to Delete
+			continue
+		}
+
+		if _, ok := policyRefs[*getPolicyRef(cm)]; !ok {
+			logger.V(logs.LogDebug).Info(fmt.Sprintf("deleting configMap %s", cm.Name))
+			err = c.Delete(ctx, cm)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+// removeSecrets fetches all Secrets created by EventTrigger instance for a given cluster.
+// It deletes all stale Secrets (all Secret instances currently present and not in the policyRefs
+// list).
+// policyRefs arg represents all the ConfigMap the EventTrigger instance is currently managing for the
+// given cluster
+func removeSecrets(ctx context.Context, c client.Client, clusterNamespace, clusterName string,
+	clusterType libsveltosv1beta1.ClusterType, eventTrigger *v1beta1.EventTrigger, er *libsveltosv1beta1.EventReport,
+	policyRefs map[libsveltosv1beta1.PolicyRef]bool, logger logr.Logger) error {
+
+	// Pass nil for er so eventReportNameLabel (EventSource name) is excluded from the selector,
+	// ensuring stale Secrets from a previously referenced EventSource are also found and deleted.
+	labels := getInstantiatedObjectLabels(clusterNamespace, clusterName, eventTrigger.Name,
+		nil, clusterType)
+
+	listOptions := []client.ListOption{
+		client.MatchingLabels(labels),
+		client.InNamespace(getSveltosNamespace()),
+	}
+
+	secrets := &corev1.SecretList{}
+	err := c.List(ctx, secrets, listOptions...)
+	if err != nil {
+		return err
+	}
+
+	for i := range secrets.Items {
+		secret := &secrets.Items[i]
+		// For existing EventTrigger and EventReport
+		if isResourceExist(eventTrigger) && isResourceExist(er) &&
+			isGeneratedFromCloudEvent(secret) && isFromGenerators(secret) {
+			// ConfigMaps generated for CloudEvents out of Generators are removed
+			// when CloudEventAction is set to Delete
+			continue
+		}
+		if _, ok := policyRefs[*getPolicyRef(secret)]; !ok {
+			logger.V(logs.LogDebug).Info(fmt.Sprintf("deleting secret %s", secret.Name))
+			err = c.Delete(ctx, secret)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+// removeClusterProfiles fetches all ClusterProfiles created by EventTrigger instance for a given cluster.
+// It deletes all stale ClusterProfiles (all ClusterProfile instances currently present and not in the clusterProfiles
+// list).
+// clusterProfiles arg represents all the ClusterProfiles the EventTrigger instance is currently managing for the
+// given cluster.
+// Returns true if any stale ClusterProfiles were found (newly deleted or still terminating), so the caller
+// can defer removal of referenced ConfigMaps/Secrets until all profiles are fully gone.
+func removeClusterProfiles(ctx context.Context, c client.Client, clusterNamespace, clusterName string,
+	clusterType libsveltosv1beta1.ClusterType, eventTrigger *v1beta1.EventTrigger, er *libsveltosv1beta1.EventReport,
+	clusterProfiles []*configv1beta1.ClusterProfile, logger logr.Logger) (bool, error) {
+
+	// Build a map of current ClusterProfiles for faster indexing
+	// Those are the clusterProfiles current eventTrigger instance is programming
+	// for this cluster and need to not be removed
+	currentClusterProfiles := make(map[string]bool)
+	for i := range clusterProfiles {
+		currentClusterProfiles[clusterProfiles[i].Name] = true
+	}
+
+	// Pass nil for er so eventReportNameLabel (EventSource name) is excluded from the selector,
+	// ensuring stale ClusterProfiles from a previously referenced EventSource are also found and deleted.
+	labels := getInstantiatedObjectLabels(clusterNamespace, clusterName, eventTrigger.Name,
+		nil, clusterType)
+
+	listOptions := []client.ListOption{
+		client.MatchingLabels(labels),
+	}
+
+	clusterProfileList := &configv1beta1.ClusterProfileList{}
+	err := c.List(ctx, clusterProfileList, listOptions...)
+	if err != nil {
+		return false, err
+	}
+
+	staleFound := false
+	for i := range clusterProfileList.Items {
+		cp := &clusterProfileList.Items[i]
+		if _, ok := currentClusterProfiles[cp.Name]; !ok {
+			staleFound = true
+			if cp.DeletionTimestamp.IsZero() {
+				logger.V(logs.LogDebug).Info(fmt.Sprintf("deleting clusterProfile %s", cp.Name))
+				if err := c.Delete(ctx, cp); err != nil {
+					return true, err
+				}
+			} else {
+				logger.V(logs.LogDebug).Info(fmt.Sprintf("clusterProfile %s is being deleted", cp.Name))
+			}
+		}
+	}
+
+	return staleFound, nil
+}
+
+func unstructuredToTyped(config *rest.Config, u *unstructured.Unstructured) (runtime.Object, error) {
+	obj, err := scheme.Scheme.New(u.GroupVersionKind())
+	if err != nil {
+		return nil, err
+	}
+
+	unstructuredContent := u.UnstructuredContent()
+	err = runtime.DefaultUnstructuredConverter.FromUnstructured(unstructuredContent, &obj)
+	if err != nil {
+		return nil, err
+	}
+
+	return obj, nil
+}
+
+// fecthClusterObjects fetches resources representing a cluster.
+// All fetched objects are in the management cluster.
+// Currently limited to Cluster and Infrastructure Provider
+func fecthClusterObjects(ctx context.Context, c client.Client,
+	clusterNamespace, clusterName string, clusterType libsveltosv1beta1.ClusterType,
+	logger logr.Logger) (map[string]interface{}, error) {
+
+	logger.V(logs.LogDebug).Info(fmt.Sprintf("Fetch cluster %s: %s/%s",
+		clusterType, clusterNamespace, clusterName))
+
+	genericCluster, err := clusterproxy.GetCluster(ctx, c, clusterNamespace, clusterName, clusterType)
+	if err != nil {
+		logger.V(logs.LogInfo).Error(err, "failed to fetch cluster")
+		return nil, err
+	}
+	return runtime.DefaultUnstructuredConverter.ToUnstructured(genericCluster)
+}
+
+func getNonInstantiatedClusterProfile(eventTrigger *v1beta1.EventTrigger,
+	clusterProfileName string, labels map[string]string) *configv1beta1.ClusterProfile {
+
+	return &configv1beta1.ClusterProfile{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   clusterProfileName,
+			Labels: labels,
+		},
+		Spec: *getClusterProfileSpec(eventTrigger),
+	}
+}
+
+func prepareCurrentObjects(ctx context.Context, c client.Client, clusterNamespace, clusterName string,
+	clusterType libsveltosv1beta1.ClusterType, eventReport *libsveltosv1beta1.EventReport,
+	logger logr.Logger) (*currentObjects, error) {
+
+	resources, err := getResources(eventReport, logger)
+	if err != nil {
+		logger.V(logs.LogInfo).Error(err, "failed to get matching resources")
+		return nil, err
+	}
+
+	cloudEvents, err := getCloudEvents(eventReport, logger)
+	if err != nil {
+		logger.V(logs.LogInfo).Error(err, "failed to get matching cloudEvents")
+		return nil, err
+	}
+
+	resourceValues := make([]map[string]interface{}, len(resources)+len(cloudEvents))
+	for i := range resources {
+		resourceValues[i] = resources[i].UnstructuredContent()
+	}
+	cluster, err := fecthClusterObjects(ctx, c, clusterNamespace, clusterName, clusterType, logger)
+	if err != nil {
+		logger.V(logs.LogInfo).Error(err, "failed to get cluster")
+		return nil, err
+	}
+
+	return &currentObjects{
+		MatchingResources: eventReport.Spec.MatchingResources,
+		Resources:         resourceValues,
+		CloudEvents:       cloudEvents,
+		Cluster:           cluster,
+	}, nil
+}
+
+func prepareCurrentObjectList(ctx context.Context, c client.Client, clusterNamespace, clusterName string,
+	clusterType libsveltosv1beta1.ClusterType, eventReport *libsveltosv1beta1.EventReport, logger logr.Logger,
+) ([]currentObject, error) {
+
+	cluster, err := fecthClusterObjects(ctx, c, clusterNamespace, clusterName, clusterType, logger)
+	if err != nil {
+		logger.V(logs.LogInfo).Error(err, "failed to get cluster")
+		return nil, err
+	}
+
+	resources, err := getResources(eventReport, logger)
+	if err != nil {
+		logger.V(logs.LogInfo).Error(err, "failed to get matching resources")
+		return nil, err
+	}
+
+	objects := make([]currentObject, 0)
+	if len(resources) != 0 {
+		for i := range resources {
+			matchingResource := corev1.ObjectReference{
+				APIVersion: resources[i].GetAPIVersion(),
+				Kind:       resources[i].GetKind(),
+				Namespace:  resources[i].GetNamespace(),
+				Name:       resources[i].GetName(),
+			}
+			objects = append(objects, currentObject{
+				MatchingResource: matchingResource,
+				Resource:         resources[i].UnstructuredContent(),
+				Cluster:          cluster,
+			})
+		}
+	} else {
+		for i := range eventReport.Spec.MatchingResources {
+			objects = append(objects, currentObject{
+				MatchingResource: eventReport.Spec.MatchingResources[i],
+				Resource:         nil,
+				Cluster:          cluster,
+			})
+		}
+	}
+
+	cloudEvents, err := getCloudEvents(eventReport, logger)
+	if err != nil {
+		logger.V(logs.LogInfo).Error(err, "failed to get matching cloudEvents")
+		return nil, err
+	}
+	for i := range cloudEvents {
+		objects = append(objects, currentObject{
+			CloudEvent: cloudEvents[i],
+			Cluster:    cluster,
+		})
+	}
+
+	return objects, nil
+}
+
+// updateResource creates or updates a resource in a Cluster.
+// No action in DryRun mode.
+func updateResource(ctx context.Context, dr dynamic.ResourceInterface, object client.Object,
+	logger logr.Logger) error {
+
+	l := logger.WithValues("resourceNamespace", object.GetNamespace(), "resourceName", object.GetName(),
+		"resourceGVK", object.GetObjectKind().GroupVersionKind())
+	l.V(logs.LogDebug).Info("updating resource")
+
+	forceConflict := true
+	options := metav1.PatchOptions{
+		FieldManager: "application/apply-patch",
+		Force:        &forceConflict,
+	}
+
+	data, err := runtime.Encode(unstructured.UnstructuredJSONScheme, object)
+	if err != nil {
+		return err
+	}
+
+	_, err = dr.Patch(ctx, object.GetName(), types.ApplyPatchType, data, options)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func appendServiceAccountLabels(eventTrigger *v1beta1.EventTrigger, labels map[string]string) map[string]string {
+	// If EventTrigger was created by tenant admin, copy label over to created ClusterProfile
+	if eventTrigger.Labels != nil {
+		if serviceAccountName, ok := eventTrigger.Labels[libsveltosv1beta1.ServiceAccountNameLabel]; ok {
+			labels[libsveltosv1beta1.ServiceAccountNameLabel] = serviceAccountName
+		}
+		if serviceAccountNamespace, ok := eventTrigger.Labels[libsveltosv1beta1.ServiceAccountNamespaceLabel]; ok {
+			labels[libsveltosv1beta1.ServiceAccountNamespaceLabel] = serviceAccountNamespace
+		}
+	}
+
+	return labels
+}
+
+func appendGeneratorLabel(labels map[string]string) map[string]string {
+	labels[generatorLabel] = "ok"
+	return labels
+}
+
+// instantiateFromGenerators instantiates ConfigMaps from ConfigMapGenerator and Secrets from SecretGenerator
+func instantiateFromGeneratorsPerResource(ctx context.Context, c client.Client, eventTrigger *v1beta1.EventTrigger,
+	er *libsveltosv1beta1.EventReport, clusterNamespace, clusterName string, clusterType libsveltosv1beta1.ClusterType,
+	logger logr.Logger) ([]libsveltosv1beta1.PolicyRef, error) {
+
+	templateName := getTemplateName(clusterNamespace, clusterName, eventTrigger.Name)
+
+	objects, err := prepareCurrentObjectList(ctx, c, clusterNamespace, clusterName, clusterType, er, logger)
+	if err != nil {
+		logger.V(logs.LogInfo).Error(err, "failed to prepare currentObject list")
+		return nil, err
+	}
+
+	var result []libsveltosv1beta1.PolicyRef
+	for i := range objects {
+		labels := getInstantiatedObjectLabels(clusterNamespace, clusterName, eventTrigger.Name,
+			er, clusterType)
+		if objects[i].CloudEvent != nil {
+			labels = appendInstantiatedObjectLabelsForCloudEvent(labels, getCESource(objects[i].CloudEvent),
+				getCESubject(objects[i].CloudEvent))
+		}
+		labels = appendGeneratorLabel(labels)
+		labels = appendServiceAccountLabels(eventTrigger, labels)
+
+		if objects[i].CloudEvent != nil {
+			instantiatedCloudEventAction, err := instantiateCloudEventAction(clusterNamespace, clusterName,
+				eventTrigger, objects[i], logger)
+			if err != nil {
+				return nil, err
+			}
+
+			if *instantiatedCloudEventAction == v1beta1.CloudEventActionDelete {
+				// Resources created because of a cloudEvent are ONLY removed when same (same subject/source)
+				// cloudEvent is received and EventTrigger.Spec.CloudEventAction is set to delete.
+				return nil, deleteInstantiatedFromGenerators(ctx, c, clusterNamespace, clusterName, clusterType,
+					eventTrigger, er, objects[i].CloudEvent, logger)
+			}
+		}
+
+		secretInfo, err := instantiateSecrets(ctx, c, eventTrigger, objects[i], clusterNamespace,
+			templateName, labels, logger)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, secretInfo...)
+
+		configMapInfo, err := instantiateConfigMaps(ctx, c, eventTrigger, objects[i], clusterNamespace,
+			templateName, labels, logger)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, configMapInfo...)
+	}
+
+	return result, nil
+}
+
+// instantiateFromGeneratorsPerAllResource instantiates ConfigMaps from ConfigMapGenerator and Secrets from SecretGenerator
+func instantiateFromGeneratorsPerAllResource(ctx context.Context, c client.Client, eventTrigger *v1beta1.EventTrigger,
+	er *libsveltosv1beta1.EventReport, clusterNamespace, clusterName string, clusterType libsveltosv1beta1.ClusterType,
+	logger logr.Logger) ([]libsveltosv1beta1.PolicyRef, error) {
+
+	templateName := getTemplateName(clusterNamespace, clusterName, eventTrigger.Name)
+
+	objects, err := prepareCurrentObjects(ctx, c, clusterNamespace, clusterName, clusterType, er, logger)
+	if err != nil {
+		logger.V(logs.LogInfo).Error(err, "failed to prepare currentObjects")
+		return nil, err
+	}
+
+	labels := getInstantiatedObjectLabels(clusterNamespace, clusterName, eventTrigger.Name,
+		er, clusterType)
+	labels = appendGeneratorLabel(labels)
+	labels = appendServiceAccountLabels(eventTrigger, labels)
+
+	result, err := instantiateSecrets(ctx, c, eventTrigger, objects, clusterNamespace,
+		templateName, labels, logger)
+	if err != nil {
+		return nil, err
+	}
+
+	configMapInfo, err := instantiateConfigMaps(ctx, c, eventTrigger, objects, clusterNamespace,
+		templateName, labels, logger)
+	if err != nil {
+		return nil, err
+	}
+
+	result = append(result, configMapInfo...)
+
+	return result, nil
+}
+
+// instantiateSecrets instantiates Secrets in the management cluster from eventTrigger.Spec.SecretGenerator
+func instantiateSecrets(ctx context.Context, c client.Client, e *v1beta1.EventTrigger,
+	data any, clusterNamespace, templateName string, labels map[string]string, logger logr.Logger,
+) ([]libsveltosv1beta1.PolicyRef, error) {
+
+	resources := make([]libsveltosv1beta1.PolicyRef, 0)
+
+	for i := range e.Spec.SecretGenerator {
+		generator := &e.Spec.SecretGenerator[i]
+		info, err := instantiateResourceFromGenerator(ctx, c, generator, e, clusterNamespace, templateName,
+			string(libsveltosv1beta1.SecretReferencedResourceKind), data, labels, logger)
+		if err != nil {
+			return nil, err
+		}
+		if info != nil {
+			resources = append(resources, libsveltosv1beta1.PolicyRef{
+				Namespace: info.Namespace,
+				Name:      info.Name,
+				Kind:      string(libsveltosv1beta1.SecretReferencedResourceKind),
+			})
+		}
+	}
+
+	return resources, nil
+}
+
+// instantiateConfigMaps instantiates ConfigMaps in the management cluster from eventTrigger.Spec.ConfigMapGenerator
+func instantiateConfigMaps(ctx context.Context, c client.Client, e *v1beta1.EventTrigger,
+	data any, clusterNamespace, templateName string, labels map[string]string, logger logr.Logger,
+) ([]libsveltosv1beta1.PolicyRef, error) {
+
+	resources := make([]libsveltosv1beta1.PolicyRef, 0)
+
+	for i := range e.Spec.ConfigMapGenerator {
+		generator := &e.Spec.ConfigMapGenerator[i]
+		info, err := instantiateResourceFromGenerator(ctx, c, generator, e, clusterNamespace, templateName,
+			string(libsveltosv1beta1.ConfigMapReferencedResourceKind), data, labels, logger)
+		if err != nil {
+			return nil, err
+		}
+		if info != nil {
+			resources = append(resources, libsveltosv1beta1.PolicyRef{
+				Namespace: info.Namespace,
+				Name:      info.Name,
+				Kind:      string(libsveltosv1beta1.ConfigMapReferencedResourceKind),
+			})
+		}
+	}
+
+	return resources, nil
+}
+
+// instantiateResourceFromGenerator creates a resource from generator and patch it to the management cluster
+func instantiateResourceFromGenerator(ctx context.Context, c client.Client, generator *v1beta1.GeneratorReference,
+	e *v1beta1.EventTrigger, clusterNamespace, templateName, kind string, data any, labels map[string]string,
+	logger logr.Logger) (*types.NamespacedName, error) {
+
+	var namespace string
+	// The name of the referenced resource can be expressed as a template
+	if generator.Namespace == "" {
+		namespace = clusterNamespace
+	} else {
+		referencedNamespace, err := instantiateSection(templateName, []byte(generator.Namespace), data,
+			funcmap.HasTextTemplateAnnotation(e.Annotations), logger)
+		if err != nil {
+			return nil, err
+		}
+		namespace = string(referencedNamespace)
+	}
+
+	// The name of the referenced resource can be expressed as a template
+	referencedName, err := instantiateSection(templateName, []byte(generator.Name), data,
+		funcmap.HasTextTemplateAnnotation(e.Annotations), logger)
+	if err != nil {
+		return nil, err
+	}
+
+	var referencedResource client.Object
+	if kind == string(libsveltosv1beta1.ConfigMapReferencedResourceKind) {
+		referencedResource, err = getConfigMap(ctx, c,
+			types.NamespacedName{Namespace: namespace, Name: string(referencedName)})
+	} else {
+		referencedResource, err = getSecret(ctx, c,
+			types.NamespacedName{Namespace: namespace, Name: string(referencedName)})
+	}
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			logger.V(logs.LogInfo).Info(fmt.Sprintf("%s %s/%s does not exist yet",
+				kind, namespace, string(referencedName)))
+			return nil, fmt.Errorf("referenced resource %s %s/%s does not exist yet",
+				kind, namespace, string(referencedName))
+		}
+		return nil, err
+	}
+
+	// Keep track of all referenced Generators. When those changes, EventTrigger will be reconciled.
+	resourceTracker := getTrackerInstance()
+	resourceTracker.trackResourceForConsumer(
+		&corev1.ObjectReference{Kind: referencedResource.GetObjectKind().GroupVersionKind().Kind,
+			Namespace: referencedResource.GetNamespace(), Name: referencedResource.GetName(), APIVersion: coreAPIVersion},
+		&corev1.ObjectReference{Kind: v1beta1.EventTriggerKind, Name: e.GetName(), APIVersion: v1beta1.GroupVersion.String()},
+	)
+
+	instantiatedName, err := instantiateSection(templateName, []byte(generator.InstantiatedResourceNameFormat), data,
+		funcmap.HasTextTemplateAnnotation(e.Annotations), logger)
+	if err != nil {
+		logger.V(logs.LogInfo).Error(err,
+			fmt.Sprintf("failed to instantiate %q", generator.InstantiatedResourceNameFormat))
+		return nil, err
+	}
+
+	info, err := instantiateReferencedPolicy(ctx, e, referencedResource, templateName, string(instantiatedName), data, labels, logger)
+	if err != nil {
+		return nil, err
+	}
+
+	return info, nil
+}
+
+func getValuesFrom(ctx context.Context, c client.Client, valuesFrom []configv1beta1.ValueFrom,
+	templateName string, cluster *corev1.ObjectReference, data any, useTxtFuncMap bool, logger logr.Logger) []client.Object {
+
+	result := make([]client.Object, 0, len(valuesFrom))
+	for i := range valuesFrom {
+		ref := &valuesFrom[i]
+
+		var namespace string
+		if ref.Namespace == "" {
+			namespace = cluster.Namespace
+		} else {
+			instantiatedNamespace, err := instantiateSection(templateName, []byte(ref.Namespace), data, useTxtFuncMap, logger)
+			if err != nil {
+				continue
+			}
+			namespace = string(instantiatedNamespace)
+		}
+
+		name, err := instantiateSection(templateName, []byte(ref.Name), data, useTxtFuncMap, logger)
+		if err != nil {
+			continue
+		}
+
+		var resource client.Object
+		if ref.Kind == string(libsveltosv1beta1.ConfigMapReferencedResourceKind) {
+			resource, err = getConfigMap(ctx, c, types.NamespacedName{Namespace: namespace, Name: string(name)})
+		} else {
+			resource, err = getSecret(ctx, c, types.NamespacedName{Namespace: namespace, Name: string(name)})
+		}
+		if err != nil {
+			continue
+		}
+
+		result = append(result, resource)
+	}
+	return result
+}
+
+// zeroMatchCounts tracks the number of consecutive collection cycles in which a given
+// (EventReport, EventTrigger) pair reported zero matching resources.
+// Key format: "<erNamespace>/<erName>/<eventTriggerName>".
+// Not persisted across event-manager restarts; that is intentional.
+var (
+	zeroMatchCounts sync.Map
+)
+
+const (
+	zeroMatchThreshold = 3
+)
+
+func zeroMatchKey(er *libsveltosv1beta1.EventReport, eventTriggerName string) string {
+	return er.Namespace + "/" + er.Name + "/" + eventTriggerName
+}
+
+// incrementZeroMatchCount bumps the counter and returns the new value.
+func incrementZeroMatchCount(er *libsveltosv1beta1.EventReport, eventTriggerName string) int {
+	key := zeroMatchKey(er, eventTriggerName)
+	for {
+		existing, loaded := zeroMatchCounts.Load(key)
+		var cur int
+		if loaded {
+			cur = existing.(int)
+		}
+		next := cur + 1
+		if !loaded {
+			if _, loaded2 := zeroMatchCounts.LoadOrStore(key, next); !loaded2 {
+				return next
+			}
+			// Another goroutine stored first; retry.
+			continue
+		}
+		if zeroMatchCounts.CompareAndSwap(key, cur, next) {
+			return next
+		}
+	}
+}
+
+// resetZeroMatchCount removes the counter entry for this (EventReport, EventTrigger) pair.
+func resetZeroMatchCount(er *libsveltosv1beta1.EventReport, eventTriggerName string) {
+	zeroMatchCounts.Delete(zeroMatchKey(er, eventTriggerName))
+}
+
+func hasMatchingResources(er *libsveltosv1beta1.EventReport) bool {
+	return len(er.Spec.CloudEvents) != 0 || len(er.Spec.MatchingResources) != 0
+}
+
+func appendCloudEventClusterProfiles(ctx context.Context, c client.Client,
+	clusterNamespace, clusterName, eventTriggerName string, clusterType libsveltosv1beta1.ClusterType,
+	eventReport *libsveltosv1beta1.EventReport, clusterProfiles []*configv1beta1.ClusterProfile,
+) ([]*configv1beta1.ClusterProfile, error) {
+
+	currentClusterProfiles := &configv1beta1.ClusterProfileList{}
+	labels := getInstantiatedObjectLabels(clusterNamespace, clusterName, eventTriggerName,
+		eventReport, clusterType)
+	listOptions := []client.ListOption{
+		client.MatchingLabels(labels),
+	}
+	err := c.List(ctx, currentClusterProfiles, listOptions...)
+	if err != nil {
+		return nil, err
+	}
+
+	// Include only the one generated because of cloudEvents
+	for i := range currentClusterProfiles.Items {
+		cp := &currentClusterProfiles.Items[i]
+		if isGeneratedFromCloudEvent(cp) {
+			clusterProfiles = append(clusterProfiles, cp)
+		}
+	}
+
+	return clusterProfiles, nil
+}
+
+func deleteClusterProfile(ctx context.Context, c client.Client, clusterProfile *configv1beta1.ClusterProfile,
+	logger logr.Logger) error {
+
+	currentClusterProfile := &configv1beta1.ClusterProfile{}
+	err := c.Get(ctx, types.NamespacedName{Name: clusterProfile.Name}, currentClusterProfile)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+
+	logger.V(logs.LogInfo).Info(fmt.Sprintf("delete ClusterProfile %s", clusterProfile.Name))
+	return c.Delete(ctx, currentClusterProfile)
+}
+
+func deleteInstantiatedFromGenerators(ctx context.Context, c client.Client, clusterNamespace, clusterName string,
+	clusterType libsveltosv1beta1.ClusterType, eventTrigger *v1beta1.EventTrigger, er *libsveltosv1beta1.EventReport,
+	cloudEvent map[string]interface{}, logger logr.Logger) error {
+
+	labels := getInstantiatedObjectLabels(clusterNamespace, clusterName, eventTrigger.Name,
+		er, clusterType)
+	labels = appendGeneratorLabel(labels)
+	labels = appendInstantiatedObjectLabelsForCloudEvent(labels, getCESource(cloudEvent),
+		getCESubject(cloudEvent))
+
+	listOptions := []client.ListOption{
+		client.MatchingLabels(labels),
+		client.InNamespace(getSveltosNamespace()),
+	}
+
+	configMaps := &corev1.ConfigMapList{}
+	err := c.List(ctx, configMaps, listOptions...)
+	if err != nil {
+		return err
+	}
+
+	for i := range configMaps.Items {
+		cm := &configMaps.Items[i]
+		// For existing EventTrigger and EventReport
+		logger.V(logs.LogInfo).Info(fmt.Sprintf("deleting configMap %s/%s", cm.Namespace, cm.Name))
+		err = c.Delete(ctx, cm)
+		if err != nil {
+			return err
+		}
+	}
+
+	secrets := &corev1.SecretList{}
+	err = c.List(ctx, secrets, listOptions...)
+	if err != nil {
+		return err
+	}
+
+	for i := range secrets.Items {
+		secret := &secrets.Items[i]
+		// For existing EventTrigger and EventReport
+		logger.V(logs.LogInfo).Info(fmt.Sprintf("deleting secret %s/%s", secret.Namespace, secret.Name))
+		err = c.Delete(ctx, secret)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func instantiateCloudEventAction(clusterNamespace, clusterName string, eventTrigger *v1beta1.EventTrigger,
+	data any, logger logr.Logger) (*v1beta1.CloudEventAction, error) {
+
+	templateName := getTemplateName(clusterNamespace, clusterName, eventTrigger.Name)
+
+	instantiatedData, err := instantiateSection(templateName, []byte(eventTrigger.Spec.CloudEventAction), data,
+		funcmap.HasTextTemplateAnnotation(eventTrigger.Annotations), logger)
+	if err != nil {
+		logger.V(logs.LogInfo).Error(err, "failed to instantiate CloudEventAction template")
+		return nil, err
+	}
+
+	instantiatedCloudEventAction := v1beta1.CloudEventAction(string(instantiatedData))
+
+	if instantiatedCloudEventAction != v1beta1.CloudEventActionCreate &&
+		instantiatedCloudEventAction != v1beta1.CloudEventActionDelete {
+
+		logger.V(logs.LogInfo).Info(fmt.Sprintf("failed to unmarshal CloudEventAction. Possible actions %s %s",
+			v1beta1.CloudEventActionCreate, v1beta1.CloudEventActionDelete))
+		return nil, err
+	}
+
+	return &instantiatedCloudEventAction, nil
+}
+
+func getClusterProfileSpec(eventTrigger *v1beta1.EventTrigger) *configv1beta1.Spec {
+	return &configv1beta1.Spec{
+		StopMatchingBehavior: eventTrigger.Spec.StopMatchingBehavior,
+		SyncMode:             eventTrigger.Spec.SyncMode,
+		Tier:                 eventTrigger.Spec.Tier,
+		ContinueOnConflict:   eventTrigger.Spec.ContinueOnConflict,
+		Reloader:             eventTrigger.Spec.Reloader,
+		MaxUpdate:            eventTrigger.Spec.MaxUpdate,
+		TemplateResourceRefs: nil, // this needs to be instantiated
+		PreDeployChecks:      eventTrigger.Spec.PreDeployChecks,
+		ValidateHealths:      eventTrigger.Spec.ValidateHealths,
+		PreDeleteChecks:      eventTrigger.Spec.PreDeleteChecks,
+		PostDeleteChecks:     eventTrigger.Spec.PostDeleteChecks,
+		HealthMonitoring:     eventTrigger.Spec.HealthMonitoring,
+		Patches:              eventTrigger.Spec.Patches,
+		ExtraLabels:          eventTrigger.Spec.ExtraLabels,
+		ExtraAnnotations:     eventTrigger.Spec.ExtraAnnotations,
+		DriftExclusions:      eventTrigger.Spec.DriftExclusions,
+		DependsOn:            eventTrigger.Spec.DependsOn,
+	}
+}
+
+func prepareSetters(eventTrigger *v1beta1.EventTrigger, configurationHash []byte) []pullmode.Option {
+	setters := make([]pullmode.Option, 0)
+	setters = append(setters, pullmode.WithRequestorHash(configurationHash))
+	sourceRef := corev1.ObjectReference{
+		APIVersion: eventTrigger.APIVersion,
+		Kind:       eventTrigger.Kind,
+		Name:       eventTrigger.Name,
+		UID:        eventTrigger.UID,
+	}
+
+	setters = append(setters, pullmode.WithSourceRef(&sourceRef))
+
+	return setters
+}
+
+func waitForClusterProfile(ctx context.Context, c client.Client, clusterProfileName string) {
+	clusterProfile := &configv1beta1.ClusterProfile{}
+
+	const waitTimeout = 30 * time.Second
+	timeout := time.After(waitTimeout)
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-timeout:
+			return // Exit after 30 seconds
+		case <-ticker.C:
+			err := c.Get(ctx, types.NamespacedName{Name: clusterProfileName}, clusterProfile)
+			if err == nil {
+				return // Found the resource
+			}
+			// Continue retrying on error
+		}
+	}
+}
+
+func (r *EventTriggerReconciler) isClusterPresent(ctx context.Context,
+	clusterRef *corev1.ObjectReference) (present, deleted bool, err error) {
+
+	var cluster client.Object
+
+	cluster, err = clusterproxy.GetCluster(ctx, r.Client, clusterRef.Namespace,
+		clusterRef.Name, clusterproxy.GetClusterType(clusterRef))
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, false, nil
+		}
+	}
+
+	return true, !cluster.GetDeletionTimestamp().IsZero(), err
+}
+
+func (r *EventTriggerReconciler) resetEventReportStatus(ctx context.Context,
+	eventTrigger *v1beta1.EventTrigger, clusterRef *corev1.ObjectReference, isPullMode bool,
+	logger logr.Logger) error {
+
+	clusterType := clusterproxy.GetClusterType(clusterRef)
+	var kubernetesClient client.Client
+	var err error
+	var eventReportNamespace, eventReportName string
+	if getAgentInMgmtCluster() || isPullMode {
+		// Reset EventReport in the management cluster
+
+		eventReportName = libsveltosv1beta1.GetEventReportName(eventTrigger.Spec.EventSourceName,
+			clusterRef.Name, &clusterType)
+		eventReportNamespace = clusterRef.Namespace
+		kubernetesClient = r.Client
+	} else {
+		eventReportName = eventTrigger.Spec.EventSourceName
+		eventReportNamespace = sveltosNamespace
+		kubernetesClient, err = clustercache.GetManager().GetKubernetesClient(ctx, r.Client, clusterRef.Namespace,
+			clusterRef.Name, "", "", clusterType, logger)
+		if err != nil {
+			logger.V(logs.LogInfo).Error(err, "failed to get client")
+			return err
+		}
+	}
+
+	currentEventReport := &libsveltosv1beta1.EventReport{}
+	err = kubernetesClient.Get(ctx,
+		types.NamespacedName{Namespace: eventReportNamespace, Name: eventReportName},
+		currentEventReport)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+
+	if currentEventReport.Status.Phase == nil ||
+		*currentEventReport.Status.Phase != libsveltosv1beta1.ReportProcessed {
+
+		return nil
+	}
+	delivering := libsveltosv1beta1.ReportDelivering
+	currentEventReport.Status.Phase = &delivering
+	logger.V(logs.LogDebug).Info(fmt.Sprintf("Reset EventReport %s/%s Status.Phase",
+		currentEventReport.Namespace, currentEventReport.Name))
+	return kubernetesClient.Status().Update(ctx, currentEventReport)
+}

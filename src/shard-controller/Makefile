@@ -1,0 +1,427 @@
+
+# Image URL to use all building/pushing image targets
+IMG ?= controller:latest
+# KUBEBUILDER_ENVTEST_KUBERNETES_VERSION refers to the version of kubebuilder assets to be downloaded by envtest binary.
+KUBEBUILDER_ENVTEST_KUBERNETES_VERSION = 1.37.0
+
+# Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)
+ifeq (,$(shell go env GOBIN))
+GOBIN=$(shell go env GOPATH)/bin
+else
+GOBIN=$(shell go env GOBIN)
+endif
+GO_INSTALL := ./scripts/go_install.sh
+
+# Setting SHELL to bash allows bash commands to be executed by recipes.
+# This is a requirement for 'setup-envtest.sh' in the test target.
+# Options are set to exit when a recipe line exits non-zero or a piped command fails.
+SHELL = /usr/bin/env bash -o pipefail
+.SHELLFLAGS = -ec
+
+.PHONY: all
+all: build
+
+# Directories.
+ROOT_DIR:=$(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
+TOOLS_DIR := hack/tools
+BIN_DIR := bin
+TOOLS_BIN_DIR := $(abspath $(TOOLS_DIR)/$(BIN_DIR))
+
+GOBUILD=go build
+
+# Define Docker related variables.
+REGISTRY ?= projectsveltos
+IMAGE_NAME ?= shard-controller
+ARCH ?= amd64
+OS ?= $(shell uname -s | tr A-Z a-z)
+K8S_LATEST_VER ?= $(shell curl -s https://storage.googleapis.com/kubernetes-release/release/stable.txt)
+export CONTROLLER_IMG ?= $(REGISTRY)/$(IMAGE_NAME)
+TAG ?= v1.17.0
+
+## Tool Binaries
+CONTROLLER_GEN := $(TOOLS_BIN_DIR)/controller-gen
+ENVSUBST := $(TOOLS_BIN_DIR)/envsubst
+GOIMPORTS := $(TOOLS_BIN_DIR)/goimports
+GOLANGCI_LINT := $(TOOLS_BIN_DIR)/golangci-lint
+GINKGO := $(TOOLS_BIN_DIR)/ginkgo
+SETUP_ENVTEST := $(TOOLS_BIN_DIR)/setup_envs
+KIND := $(TOOLS_BIN_DIR)/kind
+KUBECTL := $(TOOLS_BIN_DIR)/kubectl
+CLUSTERCTL := $(TOOLS_BIN_DIR)/clusterctl
+
+GOLANGCI_LINT_VERSION := "v2.15.0"
+CLUSTERCTL_VERSION := v1.14.3
+
+KUSTOMIZE_VER := v5.8.0
+KUSTOMIZE_BIN := kustomize
+KUSTOMIZE := $(abspath $(TOOLS_BIN_DIR)/$(KUSTOMIZE_BIN)-$(KUSTOMIZE_VER))
+KUSTOMIZE_PKG := sigs.k8s.io/kustomize/kustomize/v5
+$(KUSTOMIZE): # Build kustomize from tools folder.
+	CGO_ENABLED=0 GOBIN=$(TOOLS_BIN_DIR) $(GO_INSTALL) $(KUSTOMIZE_PKG) $(KUSTOMIZE_BIN) $(KUSTOMIZE_VER)
+
+SETUP_ENVTEST_VER := release-0.25
+SETUP_ENVTEST_BIN := setup-envtest
+SETUP_ENVTEST := $(abspath $(TOOLS_BIN_DIR)/$(SETUP_ENVTEST_BIN)-$(SETUP_ENVTEST_VER))
+SETUP_ENVTEST_PKG := sigs.k8s.io/controller-runtime/tools/setup-envtest
+setup-envtest: $(SETUP_ENVTEST) ## Set up envtest (download kubebuilder assets)
+	@echo KUBEBUILDER_ASSETS=$(KUBEBUILDER_ASSETS)
+
+$(SETUP_ENVTEST_BIN): $(SETUP_ENVTEST) ## Build a local copy of setup-envtest.
+
+$(SETUP_ENVTEST): # Build setup-envtest from tools folder.
+	GOBIN=$(TOOLS_BIN_DIR) $(GO_INSTALL) $(SETUP_ENVTEST_PKG) $(SETUP_ENVTEST_BIN) $(SETUP_ENVTEST_VER)
+
+$(CONTROLLER_GEN): $(TOOLS_DIR)/go.mod # Build controller-gen from tools folder.
+	cd $(TOOLS_DIR); $(GOBUILD) -tags=tools -o $(subst $(TOOLS_DIR)/hack/tools/,,$@) sigs.k8s.io/controller-tools/cmd/controller-gen
+
+$(ENVSUBST): $(TOOLS_DIR)/go.mod # Build envsubst from tools folder.
+	cd $(TOOLS_DIR); $(GOBUILD) -tags=tools -o $(subst $(TOOLS_DIR)/hack/tools/,,$@) github.com/a8m/envsubst/cmd/envsubst
+
+$(GOLANGCI_LINT): # Build golangci-lint from tools folder.
+	cd $(TOOLS_DIR); ./get-golangci-lint.sh $(GOLANGCI_LINT_VERSION)
+
+$(GOIMPORTS):
+	cd $(TOOLS_DIR); $(GOBUILD) -tags=tools -o $(subst $(TOOLS_DIR)/hack/tools/,,$@) golang.org/x/tools/cmd/goimports
+
+$(GINKGO): $(TOOLS_DIR)/go.mod
+	cd $(TOOLS_DIR) && $(GOBUILD) -tags tools -o $(subst $(TOOLS_DIR)/hack/tools/,,$@) github.com/onsi/ginkgo/v2/ginkgo
+
+$(KIND): $(TOOLS_DIR)/go.mod
+	cd $(TOOLS_DIR) && $(GOBUILD) -tags tools -o $(subst $(TOOLS_DIR)/hack/tools/,,$@) sigs.k8s.io/kind
+
+$(CLUSTERCTL): $(TOOLS_DIR)/go.mod ## Build clusterctl binary
+	curl -L https://github.com/kubernetes-sigs/cluster-api/releases/download/$(CLUSTERCTL_VERSION)/clusterctl-$(OS)-$(ARCH) -o $@
+	chmod +x $@
+	mkdir -p $(HOME)/.cluster-api # create cluster api init directory, if not present
+
+$(KUBECTL):
+	curl -L https://storage.googleapis.com/kubernetes-release/release/$(K8S_LATEST_VER)/bin/$(OS)/$(ARCH)/kubectl -o $@
+	chmod +x $@
+
+.PHONY: tools
+tools: $(CONTROLLER_GEN) $(ENVSUBST) $(KUSTOMIZE) $(GOLANGCI_LINT) $(SETUP_ENVTEST) $(GOIMPORTS) $(GINKGO) ## build all tools
+
+.PHONY: clean
+clean: ## Remove all built tools
+	rm -rf $(TOOLS_BIN_DIR)/*
+
+##@ General
+
+# The help target prints out all targets with their descriptions organized
+# beneath their categories. The categories are represented by '##@' and the
+# target descriptions by '##'. The awk commands is responsible for reading the
+# entire set of makefiles included in this invocation, looking for lines of the
+# file as xyz: ## something, and then pretty-format the target and help. Then,
+# if there's a line with ##@ something, that gets pretty-printed as a category.
+# More info on the usage of ANSI control characters for terminal formatting:
+# https://en.wikipedia.org/wiki/ANSI_escape_code#SGR_parameters
+# More info on the awk command:
+# http://linuxcommand.org/lc3_adv_awk.php
+
+.PHONY: help
+help: ## Display this help.
+	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make \033[36m<target>\033[0m\n"} /^[a-zA-Z_0-9-]+:.*?##/ { printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2 } /^##@/ { printf "\n\033[1m%s\033[0m\n", substr($$0, 5) } ' $(MAKEFILE_LIST)
+
+##@ Development
+
+.PHONY: manifests
+manifests: $(CONTROLLER_GEN) $(KUSTOMIZE) $(ENVSUBST) fmt generate ## Generate WebhookConfiguration, ClusterRole and CustomResourceDefinition objects.
+	$(CONTROLLER_GEN) rbac:roleName=manager-role crd webhook paths="./..." output:crd:artifacts:config=config/crd/bases
+	MANIFEST_IMG=$(CONTROLLER_IMG) MANIFEST_TAG=$(TAG) $(MAKE) set-manifest-image
+	$(KUSTOMIZE) build config/default | $(ENVSUBST) > manifest/manifest.yaml
+	$(if $(LOCAL_MANIFESTS),,$(MAKE) shard-deployment)
+
+.PHONY: generate
+generate: $(CONTROLLER_GEN) ## Generate code containing DeepCopy, DeepCopyInto, and DeepCopyObject method implementations.
+	$(CONTROLLER_GEN) object:headerFile="hack/boilerplate.go.txt" paths="./..."
+
+.PHONY: fmt
+fmt: $(GOIMPORTS) ## Run go fmt against code.
+	$(GOIMPORTS) -local github.com/projectsveltos -w .
+	go fmt ./...
+
+.PHONY: vet
+vet: ## Run go vet against code.
+	go vet ./...
+
+.PHONY: lint
+lint: $(GOLANGCI_LINT) generate ## Lint codebase
+	$(GOLANGCI_LINT) run -v --max-issues-per-linter 0 --max-same-issues 0 --timeout 5m
+
+##@ Testing
+
+KUBEBUILDER_ASSETS ?= $(shell $(SETUP_ENVTEST) use --use-env -p path $(KUBEBUILDER_ENVTEST_KUBERNETES_VERSION))
+
+# K8S_VERSION for the Kind cluster can be set as environment variable. If not defined,
+# this default value is used
+ifndef K8S_VERSION
+K8S_VERSION := v1.37.0
+endif
+
+KIND_CONFIG ?= kind-cluster.yaml
+CONTROL_CLUSTER_NAME ?= sveltos-management
+WORKLOAD_CLUSTER_NAME ?= clusterapi-workload
+KIND_CLUSTER_YAML ?= test/$(WORKLOAD_CLUSTER_NAME).yaml
+TIMEOUT ?= 10m
+NUM_NODES ?= 5
+
+.PHONY: kind-test
+kind-test: test create-cluster fv ## Build docker image; start kind cluster; load docker image; install all cluster api components and run fv
+
+.PHONY: fv
+fv: $(GINKGO) ## Run Sveltos Controller tests using existing cluster
+	cd test/fv; $(GINKGO) -nodes $(NUM_NODES) --label-filter='FV' --v --trace --randomize-all
+
+.PHONY: kind-test-namespace
+kind-test-namespace: test create-cluster-infra fv-namespace ## Build image; create cluster infra; deploy in random namespace and run fv
+
+.PHONY: fv-namespace
+fv-namespace: $(GINKGO) $(KUBECTL) $(KUSTOMIZE) $(ENVSUBST) ## Deploy Sveltos in a randomly named namespace and run fv
+	$(MAKE) load-image
+	$(MAKE) deploy-crds
+	@SVELTOS_NS="sveltos-$$(openssl rand -hex 4)"; \
+	echo "Deploying in namespace: $$SVELTOS_NS"; \
+	curl -s https://raw.githubusercontent.com/projectsveltos/addon-controller/$(TAG)/manifest/manifest.yaml | \
+	    sed -E 's/^([[:space:]]+)(name|namespace): projectsveltos$$/\1\2: '"$$SVELTOS_NS"'/' | \
+	    $(KUBECTL) apply -f-; \
+	$(KUBECTL) wait --for=condition=Available deployment/addon-controller -n "$$SVELTOS_NS" --timeout=$(TIMEOUT); \
+	for component in classifier:classifier-manager event-manager:event-manager healthcheck-manager:hc-manager sveltoscluster-manager:sc-manager; do \
+	    repo=$${component%%:*}; depl=$${component##*:}; \
+	    curl -s https://raw.githubusercontent.com/projectsveltos/$$repo/$(TAG)/manifest/manifest.yaml | \
+	        sed -E 's/^([[:space:]]+)(name|namespace): projectsveltos$$/\1\2: '"$$SVELTOS_NS"'/' | \
+	        $(KUBECTL) apply -f-; \
+	    $(KUBECTL) wait --for=condition=Available deployment/$$depl -n "$$SVELTOS_NS" --timeout=$(TIMEOUT); \
+	done; \
+	$(KUSTOMIZE) build config/default | $(ENVSUBST) | \
+	    sed -E 's/^([[:space:]]+)(name|namespace): projectsveltos$$/\1\2: '"$$SVELTOS_NS"'/' | \
+	    $(KUBECTL) apply -f-; \
+	$(KUBECTL) wait --for=condition=Available deployment/shard-controller -n "$$SVELTOS_NS" --timeout=$(TIMEOUT); \
+	cd test/fv && SVELTOS_NAMESPACE="$$SVELTOS_NS" $(GINKGO) -nodes $(NUM_NODES) --label-filter='FV' --v --trace --randomize-all
+
+.PHONY: test
+test: manifests generate fmt vet $(SETUP_ENVTEST) ## Run uts.
+	KUBEBUILDER_ASSETS="$(KUBEBUILDER_ASSETS)" go test $(shell go list ./... |grep -v test/fv |grep -v test/helpers) $(TEST_ARGS) -coverprofile cover.out
+
+.PHONY: create-cluster-infra
+create-cluster-infra: $(KIND) $(CLUSTERCTL) $(KUBECTL) $(ENVSUBST) ## Create cluster infrastructure without deploying Sveltos
+	$(MAKE) create-control-cluster
+
+	@echo wait for capd-system pod
+	$(KUBECTL) wait --for=condition=Available deployment/capd-controller-manager -n capd-system --timeout=$(TIMEOUT)
+
+	@echo wait for capi-kubeadm-bootstrap-system pod
+	$(KUBECTL) wait --for=condition=Available deployment/capi-kubeadm-bootstrap-controller-manager -n capi-kubeadm-bootstrap-system --timeout=$(TIMEOUT)
+
+	@echo wait for capi-kubeadm-control-plane-system pod
+	$(KUBECTL) wait --for=condition=Available deployment/capi-kubeadm-control-plane-controller-manager -n capi-kubeadm-control-plane-system --timeout=$(TIMEOUT)
+
+	@echo "sleep allowing webhook to be ready"
+	sleep 10
+
+	@echo "Create a workload cluster"
+	$(KUBECTL) apply -f $(KIND_CLUSTER_YAML)
+
+	@echo "wait for cluster to be provisioned"
+	$(KUBECTL) wait cluster $(WORKLOAD_CLUSTER_NAME) -n default --for=jsonpath='{.status.phase}'=Provisioned --timeout=$(TIMEOUT)
+
+	@echo "sleep allowing control plane to be ready"
+	sleep 60
+
+	@echo "get kubeconfig to access workload cluster"
+	$(KIND) get kubeconfig --name $(WORKLOAD_CLUSTER_NAME) > test/fv/workload_kubeconfig
+
+	@echo "install calico on workload cluster"
+	$(KUBECTL) --kubeconfig=./test/fv/workload_kubeconfig apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.32.0/manifests/calico.yaml
+
+	@echo wait for calico pod
+	$(KUBECTL) --kubeconfig=./test/fv/workload_kubeconfig wait --for=condition=Available deployment/calico-kube-controllers -n kube-system --timeout=$(TIMEOUT)
+
+.PHONY: create-cluster
+create-cluster: $(KIND) $(CLUSTERCTL) $(KUBECTL) $(ENVSUBST) ## Create a new kind cluster designed for development
+	$(MAKE) create-cluster-infra
+	$(MAKE) deploy-projectsveltos
+
+.PHONY: delete-cluster
+delete-cluster: $(KIND) ## Deletes the kind cluster $(CONTROL_CLUSTER_NAME)
+	$(KIND) delete cluster --name $(CONTROL_CLUSTER_NAME)
+	$(KIND) delete cluster --name $(WORKLOAD_CLUSTER_NAME)
+
+##@ Build
+
+.PHONY: build
+build: generate fmt vet ## Build manager binary.
+	go build -o bin/manager cmd/main.go
+
+.PHONY: run
+run: manifests generate fmt vet ## Run a controller from your host.
+	go run ./main.go
+
+.PHONY: docker-build
+docker-build: ## Build docker image with the manager.
+	docker build --load --build-arg BUILDOS=linux --build-arg TARGETARCH=amd64 --build-arg GIT_VERSION=$(TAG) -t $(CONTROLLER_IMG):$(TAG) .
+	MANIFEST_IMG=$(CONTROLLER_IMG) MANIFEST_TAG=$(TAG) $(MAKE) set-manifest-image
+	$(MAKE) set-manifest-pull-policy
+
+.PHONY: docker-push
+docker-push: ## Push docker image with the manager.
+	docker push ${IMG}
+
+.PHONY: docker-buildx
+docker-buildx: ## docker build for multiple arch and push to docker hub
+	docker buildx build --push --platform linux/amd64,linux/arm64 --build-arg GIT_VERSION=$(TAG) -t $(CONTROLLER_IMG):$(TAG) .
+
+.PHONY: load-image
+load-image: docker-build $(KIND)
+	$(KIND) load docker-image $(CONTROLLER_IMG):$(TAG) --name $(CONTROL_CLUSTER_NAME)
+
+##@ Deployment
+
+ifndef ignore-not-found
+  ignore-not-found = false
+endif
+
+.PHONY: install
+install: manifests kustomize ## Install CRDs into the K8s cluster specified in ~/.kube/config.
+	$(KUSTOMIZE) build config/crd | kubectl apply -f -
+
+.PHONY: uninstall
+uninstall: manifests kustomize ## Uninstall CRDs from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.
+	$(KUSTOMIZE) build config/crd | kubectl delete --ignore-not-found=$(ignore-not-found) -f -
+
+.PHONY: deploy
+deploy: manifests $(CONTROLLER_GEN) $(KUSTOMIZE) ## Deploy controller to the K8s cluster specified in ~/.kube/config.
+	$(CONTROLLER_GEN) rbac:roleName=manager-role crd webhook paths="./..." output:crd:artifacts:config=config/crd/bases
+	MANIFEST_IMG=$(CONTROLLER_IMG) MANIFEST_TAG=$(TAG) $(MAKE) set-manifest-image
+	$(KUSTOMIZE) build config/default | kubectl apply -f -
+
+.PHONY: undeploy
+undeploy: $(CONTROLLER_GEN) $(KUSTOMIZE) ## Undeploy controller from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.
+	$(CONTROLLER_GEN) rbac:roleName=manager-role crd webhook paths="./..." output:crd:artifacts:config=config/crd/bases
+	MANIFEST_IMG=$(CONTROLLER_IMG) MANIFEST_TAG=$(TAG) $(MAKE) set-manifest-image
+	$(KUSTOMIZE) build config/default | kubectl delete --ignore-not-found=$(ignore-not-found) -f -
+
+##
+set-manifest-image:
+	$(info Updating kustomize image patch file for manager resource)
+	sed -i'' -e 's@image: .*@image: 'docker.io/"${MANIFEST_IMG}:$(MANIFEST_TAG)"'@' ./config/default/manager_image_patch.yaml
+
+set-manifest-pull-policy:
+	$(info Updating kustomize pull policy file for manager resource)
+	sed -i'' -e 's@imagePullPolicy: .*@imagePullPolicy: '"$(PULL_POLICY)"'@' ./config/default/manager_pull_policy.yaml
+
+
+## fv helpers
+
+# In order to avoid this error
+# Error: failed to read "cluster-template-development.yaml" from provider's repository "infrastructure-docker": failed to get GitHub release v1.2.0: rate limit for github api has been reached.
+# Please wait one hour or get a personal API token and assign it to the GITHUB_TOKEN environment variable
+#
+# add this target. It needs to be run only when changing cluster-api version. create-cluster target uses the output of this command which is stored within repo
+# It requires control cluster to exist. So first "make create-control-cluster" then run this target before any workload cluster is created.
+ # Once generated, remove
+ #      enforce: "{{ .podSecurityStandard.enforce }}"
+ #      enforce-version: "latest"
+create-clusterapi-kind-cluster-yaml: $(CLUSTERCTL)
+	CLUSTER_TOPOLOGY=ok KUBERNETES_VERSION=$(K8S_VERSION) SERVICE_CIDR=["10.225.0.0/16"] POD_CIDR=["10.220.0.0/16"] $(CLUSTERCTL) generate cluster $(WORKLOAD_CLUSTER_NAME) --flavor development \
+		--control-plane-machine-count=1 \
+  		--worker-machine-count=1 > $(KIND_CLUSTER_YAML)
+
+create-control-cluster:
+	sed -e "s/K8S_VERSION/$(K8S_VERSION)/g"  test/$(KIND_CONFIG) > test/$(KIND_CONFIG).tmp
+	$(KIND) create cluster --name=$(CONTROL_CLUSTER_NAME) --config test/$(KIND_CONFIG).tmp
+	@echo "Create control cluster with docker as infrastructure provider"
+	CLUSTER_TOPOLOGY=true $(CLUSTERCTL) init --infrastructure docker
+
+deploy-crds:
+	@echo 'Install libsveltos CRDs'
+	$(KUBECTL) apply -f https://raw.githubusercontent.com/projectsveltos/libsveltos/$(TAG)/config/crd/bases/lib.projectsveltos.io_accessrequests.yaml
+	$(KUBECTL) apply -f https://raw.githubusercontent.com/projectsveltos/libsveltos/$(TAG)/config/crd/bases/lib.projectsveltos.io_classifierreports.yaml
+	$(KUBECTL) apply -f https://raw.githubusercontent.com/projectsveltos/libsveltos/$(TAG)/config/crd/bases/lib.projectsveltos.io_classifiers.yaml
+	$(KUBECTL) apply -f https://raw.githubusercontent.com/projectsveltos/libsveltos/$(TAG)/config/crd/bases/lib.projectsveltos.io_clustersets.yaml
+	$(KUBECTL) apply -f https://raw.githubusercontent.com/projectsveltos/libsveltos/$(TAG)/config/crd/bases/lib.projectsveltos.io_sets.yaml
+	$(KUBECTL) apply -f https://raw.githubusercontent.com/projectsveltos/libsveltos/$(TAG)/config/crd/bases/lib.projectsveltos.io_clusterhealthchecks.yaml
+	$(KUBECTL) apply -f https://raw.githubusercontent.com/projectsveltos/libsveltos/$(TAG)/config/crd/bases/lib.projectsveltos.io_debuggingconfigurations.yaml
+	$(KUBECTL) apply -f https://raw.githubusercontent.com/projectsveltos/libsveltos/$(TAG)/config/crd/bases/lib.projectsveltos.io_eventreports.yaml
+	$(KUBECTL) apply -f https://raw.githubusercontent.com/projectsveltos/libsveltos/$(TAG)/config/crd/bases/lib.projectsveltos.io_eventsources.yaml
+	$(KUBECTL) apply -f https://raw.githubusercontent.com/projectsveltos/libsveltos/$(TAG)/config/crd/bases/lib.projectsveltos.io_healthcheckreports.yaml
+	$(KUBECTL) apply -f https://raw.githubusercontent.com/projectsveltos/libsveltos/$(TAG)/config/crd/bases/lib.projectsveltos.io_healthchecks.yaml
+	$(KUBECTL) apply -f https://raw.githubusercontent.com/projectsveltos/libsveltos/$(TAG)/config/crd/bases/lib.projectsveltos.io_reloaderreports.yaml
+	$(KUBECTL) apply -f https://raw.githubusercontent.com/projectsveltos/libsveltos/$(TAG)/config/crd/bases/lib.projectsveltos.io_reloaders.yaml
+	$(KUBECTL) apply -f https://raw.githubusercontent.com/projectsveltos/libsveltos/$(TAG)/config/crd/bases/lib.projectsveltos.io_resourcesummaries.yaml
+	$(KUBECTL) apply -f https://raw.githubusercontent.com/projectsveltos/libsveltos/$(TAG)/config/crd/bases/lib.projectsveltos.io_rolerequests.yaml
+	$(KUBECTL) apply -f https://raw.githubusercontent.com/projectsveltos/libsveltos/$(TAG)/config/crd/bases/lib.projectsveltos.io_sveltosclusters.yaml
+	$(KUBECTL) apply -f https://raw.githubusercontent.com/projectsveltos/libsveltos/$(TAG)/config/crd/bases/lib.projectsveltos.io_configurationbundles.yaml
+	$(KUBECTL) apply -f https://raw.githubusercontent.com/projectsveltos/libsveltos/$(TAG)/config/crd/bases/lib.projectsveltos.io_configurationgroups.yaml
+	$(KUBECTL) apply -f https://raw.githubusercontent.com/projectsveltos/libsveltos/$(TAG)/config/crd/bases/lib.projectsveltos.io_managementclusterclassifiers.yaml
+	$(KUBECTL) apply -f https://raw.githubusercontent.com/projectsveltos/libsveltos/$(TAG)/config/crd/bases/lib.projectsveltos.io_managementclusterclassifierreports.yaml
+	$(KUBECTL) apply -f https://raw.githubusercontent.com/projectsveltos/libsveltos/$(TAG)/config/crd/bases/lib.projectsveltos.io_sveltoslicenses.yaml
+	$(KUBECTL) apply -f https://raw.githubusercontent.com/projectsveltos/libsveltos/$(TAG)/config/crd/bases/lib.projectsveltos.io_techsupports.yaml
+	@echo 'Install event-manager CRD'
+	$(KUBECTL) apply -f https://raw.githubusercontent.com/projectsveltos/event-manager/$(TAG)/config/crd/bases/lib.projectsveltos.io_eventtriggers.yaml
+
+deploy-projectsveltos: $(KUSTOMIZE)
+	# Load projectsveltos image into cluster
+	@echo 'Load projectsveltos image into cluster'
+	$(MAKE) load-image
+	$(MAKE) deploy-crds
+
+	@echo "Deploying addon-controller"
+	$(KUBECTL) apply -f https://raw.githubusercontent.com/projectsveltos/addon-controller/$(TAG)/manifest/manifest.yaml
+
+	@echo "Waiting for projectsveltos addon-controller to be available..."
+	$(KUBECTL) wait --for=condition=Available deployment/addon-controller -n projectsveltos --timeout=$(TIMEOUT)
+
+	# The sharded deployments use the service accounts and RBAC shipped in each component manifest
+	@for component in classifier:classifier-manager event-manager:event-manager healthcheck-manager:hc-manager sveltoscluster-manager:sc-manager; do \
+	    repo=$${component%%:*}; depl=$${component##*:}; \
+	    echo "Deploying $$repo"; \
+	    $(KUBECTL) apply -f https://raw.githubusercontent.com/projectsveltos/$$repo/$(TAG)/manifest/manifest.yaml; \
+	    $(KUBECTL) wait --for=condition=Available deployment/$$depl -n projectsveltos --timeout=$(TIMEOUT); \
+	done
+
+	# Install projectsveltos shard-controller
+	@echo 'Install projectsveltos shard-controller'
+	cd config/manager && $(KUSTOMIZE) edit set image controller=${IMG}
+	$(KUSTOMIZE) build config/default | $(ENVSUBST) | $(KUBECTL) apply -f-
+
+	@echo "Waiting for projectsveltos shard-controller to be available..."
+	$(KUBECTL) wait --for=condition=Available deployment/shard-controller -n projectsveltos --timeout=$(TIMEOUT)
+
+
+define get_ac_digest
+$(shell skopeo inspect --format '{{.Digest}}' "docker://projectsveltos/addon-controller:${TAG}" --override-os="linux" --override-arch="amd64" --override-variant="v8" 2>/dev/null)
+endef
+
+define get_em_digest
+$(shell skopeo inspect --format '{{.Digest}}' "docker://projectsveltos/event-manager:${TAG}" --override-os="linux" --override-arch="amd64" --override-variant="v8" 2>/dev/null)
+endef
+
+define get_hcm_digest
+$(shell skopeo inspect --format '{{.Digest}}' "docker://projectsveltos/healthcheck-manager:${TAG}" --override-os="linux" --override-arch="amd64" --override-variant="v8" 2>/dev/null)
+endef
+
+define get_scm_digest
+$(shell skopeo inspect --format '{{.Digest}}' "docker://projectsveltos/sveltoscluster-manager:${TAG}" --override-os="linux" --override-arch="amd64" --override-variant="v8" 2>/dev/null)
+endef
+
+define get_cm_digest
+$(shell skopeo inspect --format '{{.Digest}}' "docker://projectsveltos/classifier:${TAG}" --override-os="linux" --override-arch="amd64" --override-variant="v8" 2>/dev/null)
+endef
+
+shard-deployment:
+	curl -L https://raw.githubusercontent.com/projectsveltos/addon-controller/$(TAG)/manifest/deployment-shard.yaml -o ./pkg/sharding/ac.yaml
+	$(eval ac_digest :=$(call get_ac_digest))
+	sed -i'' -e "s#image: docker.io/projectsveltos/addon-controller:${TAG}#image: docker.io/projectsveltos/addon-controller@${ac_digest}#g" ./pkg/sharding/ac.yaml
+	curl -L https://raw.githubusercontent.com/projectsveltos/event-manager/$(TAG)/manifest/deployment-shard.yaml -o ./pkg/sharding/em.yaml
+	$(eval em_digest :=$(call get_em_digest))
+	sed -i'' -e "s#image: docker.io/projectsveltos/event-manager:${TAG}#image: docker.io/projectsveltos/event-manager@${em_digest}#g" ./pkg/sharding/em.yaml
+	curl -L https://raw.githubusercontent.com/projectsveltos/healthcheck-manager/$(TAG)/manifest/deployment-shard.yaml -o ./pkg/sharding/hm.yaml
+	$(eval hcm_digest :=$(call get_hcm_digest))
+	sed -i'' -e "s#image: docker.io/projectsveltos/healthcheck-manager:${TAG}#image: docker.io/projectsveltos/healthcheck-manager@${hcm_digest}#g" ./pkg/sharding/hm.yaml
+	curl -L https://raw.githubusercontent.com/projectsveltos/sveltoscluster-manager/$(TAG)/manifest/deployment-shard.yaml -o ./pkg/sharding/sc.yaml
+	$(eval scm_digest :=$(call get_scm_digest))
+	sed -i'' -e "s#image: docker.io/projectsveltos/sveltoscluster-manager:${TAG}#image: docker.io/projectsveltos/sveltoscluster-manager@${scm_digest}#g" ./pkg/sharding/sc.yaml
+	curl -L https://raw.githubusercontent.com/projectsveltos/classifier/$(TAG)/manifest/deployment-shard.yaml -o ./pkg/sharding/classifier.yaml
+	$(eval cm_digest :=$(call get_cm_digest))
+	sed -i'' -e "s#image: docker.io/projectsveltos/classifier:${TAG}#image: docker.io/projectsveltos/classifier@${cm_digest}#g" ./pkg/sharding/classifier.yaml
+	cd pkg/sharding; go generate

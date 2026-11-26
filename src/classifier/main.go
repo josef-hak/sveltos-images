@@ -1,0 +1,461 @@
+/*
+Copyright 2022. projectsveltos.io. All rights reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package main
+
+import (
+	"context"
+	"flag"
+	"fmt"
+	"os"
+	"regexp"
+	"sync"
+	"syscall"
+	"time"
+
+	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
+	// to ensure that exec-entrypoint and run can make use of them.
+
+	"github.com/go-logr/logr"
+	"github.com/spf13/pflag"
+	corev1 "k8s.io/api/core/v1"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
+	_ "k8s.io/client-go/plugin/pkg/client/auth"
+	cliflag "k8s.io/component-base/cli/flag"
+	"k8s.io/klog/v2"
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
+	"sigs.k8s.io/controller-runtime/pkg/healthz"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
+	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
+	"sigs.k8s.io/controller-runtime/pkg/webhook"
+
+	"github.com/projectsveltos/classifier/controllers"
+	libsveltosv1beta1 "github.com/projectsveltos/libsveltos/api/v1beta1"
+	"github.com/projectsveltos/libsveltos/lib/crd"
+	"github.com/projectsveltos/libsveltos/lib/deployer"
+	logs "github.com/projectsveltos/libsveltos/lib/logsettings"
+	libsveltosset "github.com/projectsveltos/libsveltos/lib/set"
+	//+kubebuilder:scaffold:imports
+)
+
+var (
+	setupLog                              = ctrl.Log.WithName("setup")
+	diagnosticsAddress                    string
+	insecureDiagnostics                   bool
+	concurrentReconciles                  int
+	workers                               int
+	agentInMgmtCluster                    bool
+	reportMode                            controllers.ReportMode
+	shardKey                              string
+	tmpReportMode                         int
+	managementClusterControlPlaneEndpoint string
+	restConfigQPS                         float32
+	restConfigBurst                       int
+	webhookPort                           int
+	syncPeriod                            time.Duration
+	version                               string
+	healthAddr                            string
+	sveltosAgentConfigMap                 string
+	sveltosApplierConfigMap               string
+	capiOnboardAnnotation                 string
+	registry                              string
+	enableNatsWatcher                     bool
+)
+
+const (
+	defaultReconcilers  = 10
+	defaultWorkers      = 10
+	defaulReportMode    = int(controllers.CollectFromManagementCluster)
+	cpEndpointREPattern = `^https://[0-9a-zA-Z][0-9a-zA-Z-.]+[0-9a-zA-Z]:\d+$`
+)
+
+// Add RBAC for the authorized diagnostics endpoint.
+// +kubebuilder:rbac:groups=authentication.k8s.io,resources=tokenreviews,verbs=create
+// +kubebuilder:rbac:groups=authorization.k8s.io,resources=subjectaccessreviews,verbs=create
+
+func main() {
+	scheme, err := controllers.InitScheme()
+	if err != nil {
+		os.Exit(1)
+	}
+
+	klog.InitFlags(nil)
+	ctrl.SetLogger(klog.Background())
+
+	initFlags(pflag.CommandLine)
+	pflag.CommandLine.SetNormalizeFunc(cliflag.WordSepNormalizeFunc)
+	pflag.CommandLine.AddGoFlagSet(flag.CommandLine)
+	pflag.Parse()
+
+	reportMode = controllers.ReportMode(tmpReportMode)
+
+	ctrlOptions := getCtrlOptions(scheme)
+
+	restConfig := ctrl.GetConfigOrDie()
+	restConfig.QPS = restConfigQPS
+	restConfig.Burst = restConfigBurst
+
+	mgr, err := ctrl.NewManager(restConfig, ctrlOptions)
+	if err != nil {
+		setupLog.Error(err, "unable to start manager")
+		os.Exit(1)
+	}
+
+	sveltosNamespace := getSveltosNamespace()
+	configureGlobalState(mgr, sveltosNamespace)
+
+	if isInitContainer() {
+		setupLog.V(logs.LogInfo).Info("running migration")
+		runMigrateMode(scheme)
+		os.Exit(0)
+	}
+
+	setupLog.V(logs.LogInfo).Info(fmt.Sprintf("Running in managemnt cluster: %t", agentInMgmtCluster))
+
+	// Setup the context that's going to be used in controllers and for the manager.
+	ctx := ctrl.SetupSignalHandler()
+
+	d := deployer.GetClient(ctx, ctrl.Log.WithName("deployer"), mgr.GetClient(), workers)
+	controllers.RegisterFeatures(d, setupLog)
+
+	logs.RegisterForLogSettings(ctx,
+		libsveltosv1beta1.ComponentClassifier, ctrl.Log.WithName("log-setter"),
+		ctrl.GetConfigOrDie())
+
+	if managementClusterControlPlaneEndpoint != "" {
+		serverRegExp := regexp.MustCompile(cpEndpointREPattern)
+		if !serverRegExp.MatchString(managementClusterControlPlaneEndpoint) {
+			setupLog.WithValues("controlPlaneEndpoint", managementClusterControlPlaneEndpoint).Info("incorrect format")
+			os.Exit(1)
+		}
+	}
+
+	controllers.SetVersion(version)
+
+	classifierReconciler := getClassifierReconciler(mgr)
+	classifierReconciler.Deployer = d
+	var classifierController controller.Controller
+	classifierController, err = classifierReconciler.SetupWithManager(ctx, mgr, ctrl.Log.WithName("classifierreconcilier"))
+	if err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "Classifier")
+		os.Exit(1)
+	}
+
+	setupMgmtClassifierReconciler(ctx, mgr)
+
+	startSveltosClusterReconciler(mgr)
+	//+kubebuilder:scaffold:builder
+
+	setupChecks(mgr)
+
+	go capiWatchers(ctx, mgr,
+		classifierReconciler, classifierController,
+		setupLog)
+
+	setupLog.Info("starting manager")
+	if err := mgr.Start(ctx); err != nil {
+		setupLog.Error(err, "problem running manager")
+		os.Exit(1)
+	}
+}
+
+func initFlags(fs *pflag.FlagSet) {
+	fs.IntVar(&tmpReportMode, "report-mode", defaulReportMode,
+		"Indicates how ClassifierReport needs to be collected")
+
+	fs.BoolVar(&agentInMgmtCluster, "agent-in-mgmt-cluster", false,
+		"When set, indicates drift-detection-manager needs to be started in the management cluster")
+
+	fs.StringVar(&shardKey, "shard-key", "",
+		"If set, and report-mode is set to collect, this deployment will fetch only from clusters matching this shard")
+
+	fs.StringVar(&capiOnboardAnnotation, "capi-onboard-annotation", "",
+		"If provided, Sveltos will only manage CAPI clusters that have this exact annotation.")
+
+	fs.StringVar(&managementClusterControlPlaneEndpoint, "control-plane-endpoint", "",
+		"The management cluster controlplane endpoint. Format <ip>:<port>.")
+
+	fs.StringVar(&diagnosticsAddress, "diagnostics-address", ":8443",
+		"The address the diagnostics endpoint binds to. Per default metrics are served via https and with"+
+			"authentication/authorization. To serve via http and without authentication/authorization set --insecure-diagnostics."+
+			"If --insecure-diagnostics is not set the diagnostics endpoint also serves pprof endpoints and an endpoint to change the log level.")
+
+	fs.BoolVar(&insecureDiagnostics, "insecure-diagnostics", false,
+		"Enable insecure diagnostics serving. For more details see the description of --diagnostics-address.")
+
+	fs.IntVar(&workers, "worker-number", defaultWorkers,
+		"Number of worker. Workers are used to deploy classifiers in CAPI clusters")
+
+	fs.IntVar(&concurrentReconciles, "concurrent-reconciles", defaultReconcilers,
+		"concurrent reconciles is the maximum number of concurrent Reconciles which can be run. Defaults to 10")
+
+	fs.StringVar(&version, "version", "",
+		"current sveltos version")
+
+	fs.StringVar(&sveltosAgentConfigMap, "sveltos-agent-config", "",
+		"The name of the ConfigMap in the projectsveltos namespace containing the sveltos-agent configuration")
+
+	fs.StringVar(&sveltosApplierConfigMap, "sveltos-applier-config", "",
+		"The name of the ConfigMap in the projectsveltos namespace containing the sveltos-applier configuration")
+
+	fs.StringVar(&healthAddr, "health-addr", ":9440",
+		"The address the health endpoint binds to.")
+
+	fs.StringVar(&registry, "registry", "",
+		"Container registry for sveltos-agent images. Defaults to docker.io/ if empty.")
+
+	fs.BoolVar(&enableNatsWatcher, "enable-nats-watcher", false,
+		"Enable NATS.io configuration watcher on sveltos-agents to listen for cloud events. Disabled by default.")
+
+	const defautlRestConfigQPS = 20
+	fs.Float32Var(&restConfigQPS, "kube-api-qps", defautlRestConfigQPS,
+		fmt.Sprintf("Maximum queries per second from the controller client to the Kubernetes API server. Defaults to %d",
+			defautlRestConfigQPS))
+
+	const defaultRestConfigBurst = 30
+	fs.IntVar(&restConfigBurst, "kube-api-burst", defaultRestConfigBurst,
+		fmt.Sprintf("Maximum number of queries that should be allowed in one burst from the controller client to the Kubernetes API server. Default %d",
+			defaultRestConfigBurst))
+
+	const defaultWebhookPort = 9443
+	fs.IntVar(&webhookPort, "webhook-port", defaultWebhookPort,
+		"Webhook Server port")
+
+	const defaultSyncPeriod = 10
+	fs.DurationVar(&syncPeriod, "sync-period", defaultSyncPeriod*time.Minute,
+		fmt.Sprintf("The minimum interval at which watched resources are reconciled (e.g. 15m). Default: %d minutes",
+			defaultSyncPeriod))
+}
+
+func setupChecks(mgr ctrl.Manager) {
+	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
+		setupLog.Error(err, "unable to set up health check")
+		os.Exit(1)
+	}
+	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
+		setupLog.Error(err, "unable to set up ready check")
+		os.Exit(1)
+	}
+}
+
+// isInitContainer returns true when the binary is running as the migration init container.
+// The init container sets IS_INITIALIZATION=true in its env to signal this mode.
+func isInitContainer() bool {
+	return os.Getenv("IS_INITIALIZATION") == "true"
+}
+
+// configureGlobalState sets all package-level state that controllers depend on.
+// Extracted to keep main() within the funlen limit.
+func configureGlobalState(mgr ctrl.Manager, sveltosNamespace string) {
+	controllers.SetManagementClusterAccess(mgr.GetConfig(), mgr.GetClient())
+	controllers.SetSveltosAgentConfigMap(sveltosAgentConfigMap)
+	controllers.SetSveltosApplierConfigMap(sveltosApplierConfigMap)
+	controllers.SetSveltosAgentRegistry(registry)
+	controllers.SetAgentInMgmtCluster(agentInMgmtCluster)
+	controllers.SetSveltosNamespace(sveltosNamespace)
+}
+
+// runMigrateMode runs the one-shot Classifier status migration and exits.
+// Extracted to keep main() within the funlen limit.
+func runMigrateMode(scheme *runtime.Scheme) {
+	restConfig := ctrl.GetConfigOrDie()
+	migrationClient, err := client.New(restConfig, client.Options{Scheme: scheme})
+	if err != nil {
+		setupLog.Error(err, "failed to create client for migration")
+		os.Exit(1)
+	}
+	if err := runMigration(context.Background(), migrationClient,
+		ctrl.Log.WithName("migrate")); err != nil {
+		setupLog.Error(err, "migration failed")
+		os.Exit(1)
+	}
+}
+
+// capiCRDHandler restarts process if a CAPI CRD is updated
+func capiCRDHandler(gvk *schema.GroupVersionKind, action crd.ChangeType) {
+	if action == crd.Modify {
+		return
+	}
+	if gvk.Group == clusterv1.GroupVersion.Group && gvk.Version == clusterv1.GroupVersion.Version {
+		setupLog.V(logs.LogInfo).Info("Initiating graceful restart due to CAPI CRD update",
+			"GVK", gvk.String(), "Action", string(action))
+
+		if killErr := syscall.Kill(syscall.Getpid(), syscall.SIGTERM); killErr != nil {
+			panic("kill -TERM failed")
+		}
+	}
+}
+
+// isCAPIInstalled returns true if CAPI is installed with v1beta2 served, false otherwise
+func isCAPIInstalled(ctx context.Context, c client.Client, logger logr.Logger) (bool, error) {
+	clusterCRD := &apiextensionsv1.CustomResourceDefinition{}
+
+	err := c.Get(ctx, types.NamespacedName{Name: "clusters.cluster.x-k8s.io"}, clusterCRD)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+
+	for _, version := range clusterCRD.Spec.Versions {
+		if version.Name == clusterv1.GroupVersion.Version && version.Served {
+			return true, nil
+		}
+	}
+
+	logger.V(logs.LogInfo).Info("clusterCRD CRD present but v1beta2 not served")
+	return false, nil
+}
+
+func capiWatchers(ctx context.Context, mgr ctrl.Manager,
+	classifierReconciler *controllers.ClassifierReconciler, classifierController controller.Controller,
+	logger logr.Logger) {
+
+	const maxRetries = 20
+	retries := 0
+	for {
+		capiPresent, err := isCAPIInstalled(ctx, mgr.GetClient(), logger)
+		if err != nil {
+			if retries < maxRetries {
+				logger.Info(fmt.Sprintf("failed to verify if CAPI is present: %v", err))
+				time.Sleep(time.Second)
+			}
+			retries++
+		} else {
+			if !capiPresent {
+				setupLog.V(logs.LogInfo).Info("CAPI currently not present. Starting CRD watcher")
+				go crd.WatchCustomResourceDefinition(ctx, mgr.GetConfig(), capiCRDHandler, setupLog)
+			} else {
+				setupLog.V(logs.LogInfo).Info("CAPI present.")
+				err = classifierReconciler.WatchForCAPI(mgr, classifierController)
+				if err != nil {
+					continue
+				}
+				if err = (&controllers.ClusterReconciler{
+					Client: mgr.GetClient(),
+					Scheme: mgr.GetScheme(),
+				}).SetupWithManager(mgr); err != nil {
+					logger.Error(err, "unable to create controller", "controller", "Cluster")
+					continue
+				}
+			}
+			return
+		}
+	}
+}
+
+func setupMgmtClassifierReconciler(ctx context.Context, mgr manager.Manager) {
+	if _, err := getMgmtClassifierReconciler(mgr).SetupWithManager(
+		ctx, mgr, ctrl.Log.WithName("managementclusterclassifierreconciler")); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "ManagementClusterClassifier")
+		os.Exit(1)
+	}
+}
+
+func getMgmtClassifierReconciler(mgr manager.Manager) *controllers.ManagementClusterClassifierReconciler {
+	return &controllers.ManagementClusterClassifierReconciler{
+		Client:           mgr.GetClient(),
+		Scheme:           mgr.GetScheme(),
+		ShardKey:         shardKey,
+		GVKToClassifiers: make(map[schema.GroupVersionKind]*libsveltosset.Set),
+		EventRecorder:    mgr.GetEventRecorder("event-recorder"),
+		Logger:           ctrl.Log.WithName("managementclusterclassifierreconciler"),
+	}
+}
+
+func getClassifierReconciler(mgr manager.Manager) *controllers.ClassifierReconciler {
+	return &controllers.ClassifierReconciler{
+		Client:                mgr.GetClient(),
+		Scheme:                mgr.GetScheme(),
+		ConcurrentReconciles:  concurrentReconciles,
+		ClusterMap:            make(map[corev1.ObjectReference]*libsveltosset.Set),
+		ClassifierMap:         make(map[corev1.ObjectReference]*libsveltosset.Set),
+		ShardKey:              shardKey,
+		CapiOnboardAnnotation: capiOnboardAnnotation,
+		AgentInMgmtCluster:    agentInMgmtCluster,
+		ClassifierReportMode:  reportMode,
+		ControlPlaneEndpoint:  managementClusterControlPlaneEndpoint,
+		Mux:                   sync.Mutex{},
+		EventRecorder:         mgr.GetEventRecorder("event-recorder"),
+		Logger:                ctrl.Log.WithName("classifierreconiler"),
+	}
+}
+
+// getDiagnosticsOptions returns metrics options which can be used to configure a Manager.
+func getDiagnosticsOptions() metricsserver.Options {
+	// If "--insecure-diagnostics" is set, serve metrics via http
+	// and without authentication/authorization.
+	if insecureDiagnostics {
+		return metricsserver.Options{
+			BindAddress:   diagnosticsAddress,
+			SecureServing: false,
+		}
+	}
+
+	// If "--insecure-diagnostics" is not set, serve metrics via https
+	// and with authentication/authorization. As the endpoint is protected,
+	// we also serve pprof endpoints and an endpoint to change the log level.
+	return metricsserver.Options{
+		BindAddress:    diagnosticsAddress,
+		SecureServing:  true,
+		FilterProvider: filters.WithAuthenticationAndAuthorization,
+	}
+}
+
+func getCtrlOptions(scheme *runtime.Scheme) ctrl.Options {
+	return ctrl.Options{
+		Scheme:                 scheme,
+		Metrics:                getDiagnosticsOptions(),
+		HealthProbeBindAddress: healthAddr,
+		WebhookServer: webhook.NewServer(
+			webhook.Options{
+				Port: webhookPort,
+			}),
+		Cache: cache.Options{
+			SyncPeriod:       &syncPeriod,
+			DefaultTransform: cache.TransformStripManagedFields(),
+		},
+	}
+}
+
+func startSveltosClusterReconciler(mgr manager.Manager) {
+	if err := (&controllers.SveltosClusterReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "SveltosCluster")
+		os.Exit(1)
+	}
+}
+
+func getSveltosNamespace() string {
+	sveltosNamespace := os.Getenv("NAMESPACE")
+	if sveltosNamespace == "" {
+		setupLog.V(logs.LogInfo).Error(nil, "Missing required environment variables NAMESPACE")
+		os.Exit(1)
+	}
+	return sveltosNamespace
+}

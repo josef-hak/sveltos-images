@@ -1,0 +1,24 @@
+# permissions for end users to edit clusterprofiles.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: clusterprofile-editor-role
+rules:
+- apiGroups:
+  - config.projectsveltos.io
+  resources:
+  - clusterprofiles
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - config.projectsveltos.io
+  resources:
+  - clusterprofiles/status
+  verbs:
+  - get

@@ -1,0 +1,471 @@
+/*
+Copyright 2022. projectsveltos.io. All rights reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package controllers_test
+
+import (
+	"context"
+	"fmt"
+	"unicode/utf8"
+
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/util/retry"
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
+	"sigs.k8s.io/cluster-api/util"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/metrics"
+
+	configv1beta1 "github.com/projectsveltos/addon-controller/api/v1beta1"
+	"github.com/projectsveltos/addon-controller/controllers"
+	"github.com/projectsveltos/addon-controller/lib/clusterops"
+	libsveltosv1beta1 "github.com/projectsveltos/libsveltos/api/v1beta1"
+)
+
+const (
+	kubeconfigPostfix = "-kubeconfig"
+)
+
+// addOwnerReference adds owner as OwnerReference of obj.
+// This method can be invoked by different tests in parallel, all touching the same obj
+// (e.g. a shared ClusterConfiguration), so the get-modify-update is wrapped in a retry:
+// otherwise a conflicting write between the Get and the Update below would fail the
+// calling spec outright instead of retrying against the latest version.
+func addOwnerReference(ctx context.Context, c client.Client, obj, owner client.Object) {
+	Expect(addTypeInformationToObject(testEnv.Scheme(), owner)).To(Succeed())
+
+	objCopy := obj.DeepCopyObject().(client.Object)
+	key := client.ObjectKeyFromObject(obj)
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		if err := c.Get(ctx, key, objCopy); err != nil {
+			return err
+		}
+		refs := objCopy.GetOwnerReferences()
+		if refs == nil {
+			refs = make([]metav1.OwnerReference, 0)
+		}
+		refs = append(refs,
+			metav1.OwnerReference{
+				UID:        owner.GetUID(),
+				Name:       owner.GetName(),
+				Kind:       owner.GetObjectKind().GroupVersionKind().Kind,
+				APIVersion: owner.GetObjectKind().GroupVersionKind().GroupVersion().String(),
+			})
+		objCopy.SetOwnerReferences(refs)
+		return c.Update(ctx, objCopy)
+	})
+	Expect(err).To(Succeed())
+}
+
+// waitForObject waits for the cache to be updated helps in preventing test flakes due to the cache sync delays.
+func waitForObject(ctx context.Context, c client.Client, obj client.Object) error {
+	// Makes sure the cache is updated with the new object
+	objCopy := obj.DeepCopyObject().(client.Object)
+	key := client.ObjectKeyFromObject(obj)
+	if err := wait.ExponentialBackoff(
+		cacheSyncBackoff,
+		func() (done bool, err error) {
+			if err := c.Get(ctx, key, objCopy); err != nil {
+				if apierrors.IsNotFound(err) {
+					return false, nil
+				}
+				return false, err
+			}
+			return true, nil
+		}); err != nil {
+		return fmt.Errorf("object %s, %s is not being added to the testenv client cache: %w",
+			obj.GetObjectKind().GroupVersionKind().String(), key, err)
+	}
+	return nil
+}
+
+// createConfigMapWithPolicy creates a configMap with Data policies
+func createConfigMapWithPolicy(namespace, configMapName string, policyStrs ...string) *corev1.ConfigMap {
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      configMapName,
+		},
+		Data: map[string]string{},
+	}
+	for i := range policyStrs {
+		key := fmt.Sprintf("policy%d.yaml", i)
+		if utf8.Valid([]byte(policyStrs[i])) {
+			cm.Data[key] = policyStrs[i]
+		} else {
+			cm.BinaryData[key] = []byte(policyStrs[i])
+		}
+	}
+
+	Expect(addTypeInformationToObject(scheme, cm)).To(Succeed())
+
+	return cm
+}
+
+// createSecretWithPolicy creates a Secret with Data containing base64 encoded policies
+func createSecretWithPolicy(namespace, secretName string, policyStrs ...string) *corev1.Secret {
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      secretName,
+		},
+		Type: libsveltosv1beta1.ClusterProfileSecretType,
+		Data: map[string][]byte{},
+	}
+	for i := range policyStrs {
+		key := fmt.Sprintf("policy%d.yaml", i)
+		secret.Data[key] = []byte(policyStrs[i])
+	}
+
+	Expect(addTypeInformationToObject(scheme, secret)).To(Succeed())
+
+	return secret
+}
+
+// updateConfigMapWithPolicy updates a configMap with passed in policies
+func updateConfigMapWithPolicy(cm *corev1.ConfigMap, policyStrs ...string) *corev1.ConfigMap {
+	for i := range policyStrs {
+		key := fmt.Sprintf("policy%d.yaml", i)
+		if utf8.Valid([]byte(policyStrs[i])) {
+			cm.Data[key] = policyStrs[i]
+		} else {
+			cm.BinaryData[key] = []byte(policyStrs[i])
+		}
+	}
+
+	return cm
+}
+
+// newTestUnstructured builds a minimal unstructured object with the given apiVersion, kind and name.
+func newTestUnstructured(apiVersion, kind, name string) *unstructured.Unstructured {
+	u := &unstructured.Unstructured{}
+	u.SetAPIVersion(apiVersion)
+	u.SetKind(kind)
+	u.SetName(name)
+	return u
+}
+
+func randomString() string {
+	const length = 10
+	return "a-" + util.RandomString(length)
+}
+
+func addLabelsToClusterSummary(clusterSummary *configv1beta1.ClusterSummary, clusterProfileName, clusterName string,
+	clusterType libsveltosv1beta1.ClusterType) {
+
+	labels := clusterSummary.Labels
+	if labels == nil {
+		labels = make(map[string]string)
+	}
+	labels[clusterops.ClusterProfileLabelName] = clusterProfileName
+	labels[configv1beta1.ClusterTypeLabel] = string(clusterType)
+	labels[configv1beta1.ClusterNameLabel] = clusterName
+
+	clusterSummary.Labels = labels
+}
+
+// getClusterSummaryWithFinalizer returns a ClusterSummary created by a ClusterProfile/Profile for a CAPI Cluster.
+// The ClusterSummary has a finalizer: when deleted, it stays with a deletionTimestamp, as it happens
+// when the ClusterSummary controller cannot process it (for instance, cluster is paused).
+func getClusterSummaryWithFinalizer(profileKind string, profile client.Object, cluster *clusterv1.Cluster,
+) *configv1beta1.ClusterSummary {
+
+	profileLabelName := clusterops.ClusterProfileLabelName
+	if profileKind == configv1beta1.ProfileKind {
+		profileLabelName = clusterops.ProfileLabelName
+	}
+
+	return &configv1beta1.ClusterSummary{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      clusterops.GetClusterSummaryName(profileKind, profile.GetName(), cluster.Name, false),
+			Namespace: cluster.Namespace,
+			Labels: map[string]string{
+				profileLabelName:               profile.GetName(),
+				configv1beta1.ClusterTypeLabel: string(libsveltosv1beta1.ClusterTypeCapi),
+				configv1beta1.ClusterNameLabel: cluster.Name,
+			},
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: configv1beta1.GroupVersion.String(),
+					Kind:       profileKind,
+					Name:       profile.GetName(),
+				},
+			},
+			Finalizers: []string{configv1beta1.ClusterSummaryFinalizer},
+		},
+		Spec: configv1beta1.ClusterSummarySpec{
+			ClusterNamespace: cluster.Namespace,
+			ClusterName:      cluster.Name,
+			ClusterType:      libsveltosv1beta1.ClusterTypeCapi,
+		},
+	}
+}
+
+// profileMetricLabels returns the labels identifying a ClusterProfile/Profile in the projectsveltos metrics.
+func profileMetricLabels(profileKind, profileNamespace, profileName string) map[string]string {
+	return map[string]string{
+		"profile_kind":      profileKind,
+		"profile_namespace": profileNamespace,
+		"profile_name":      profileName,
+	}
+}
+
+// clusterSummaryMetricLabels returns the labels identifying, in the projectsveltos metrics, the ClusterSummary
+// created by the ClusterProfile/Profile for a cluster.
+func clusterSummaryMetricLabels(clusterSummary *configv1beta1.ClusterSummary,
+	profileKind, profileNamespace, profileName string) map[string]string {
+
+	labels := profileMetricLabels(profileKind, profileNamespace, profileName)
+	labels["cluster_type"] = string(clusterSummary.Spec.ClusterType)
+	labels["cluster_namespace"] = clusterSummary.Spec.ClusterNamespace
+	labels["cluster_name"] = clusterSummary.Spec.ClusterName
+	return labels
+}
+
+// hasMetricSeries returns true if the metric called name has a series, in the controller-runtime
+// registry, whose labels include all of labels.
+func hasMetricSeries(name string, labels map[string]string) bool {
+	families, err := metrics.Registry.Gather()
+	Expect(err).To(BeNil())
+
+	for _, family := range families {
+		if family.GetName() != name {
+			continue
+		}
+		for _, metric := range family.GetMetric() {
+			matched := 0
+			for _, label := range metric.GetLabel() {
+				if value, ok := labels[label.GetName()]; ok && value == label.GetValue() {
+					matched++
+				}
+			}
+			if matched == len(labels) {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+// getMetricValue returns the value of the counter or gauge called name, in the controller-runtime registry,
+// for the series whose labels include all of labels. It returns 0 when there is no such series.
+func getMetricValue(name string, labels map[string]string) float64 {
+	families, err := metrics.Registry.Gather()
+	Expect(err).To(BeNil())
+
+	for _, family := range families {
+		if family.GetName() != name {
+			continue
+		}
+		for _, metric := range family.GetMetric() {
+			matched := 0
+			for _, label := range metric.GetLabel() {
+				if value, ok := labels[label.GetName()]; ok && value == label.GetValue() {
+					matched++
+				}
+			}
+			if matched != len(labels) {
+				continue
+			}
+			if metric.GetCounter() != nil {
+				return metric.GetCounter().GetValue()
+			}
+			return metric.GetGauge().GetValue()
+		}
+	}
+
+	return 0
+}
+
+// deleteResources deletes following resources:
+// - clusterProfile
+// - clusterSummary
+// - all clusterConfigurations in namespace
+// - namespace
+func deleteResources(namespace string,
+	clusterProfile *configv1beta1.ClusterProfile,
+	clusterSummary *configv1beta1.ClusterSummary) {
+
+	ns := &corev1.Namespace{}
+	err := testEnv.Get(context.TODO(), types.NamespacedName{Name: namespace}, ns)
+	if err != nil {
+		Expect(apierrors.IsNotFound(err)).To(BeTrue())
+		return
+	}
+	err = testEnv.Delete(context.TODO(), ns)
+	if err != nil {
+		Expect(apierrors.IsNotFound(err)).To(BeTrue())
+	}
+
+	listOptions := []client.ListOption{
+		client.InNamespace(namespace),
+	}
+	clusterConfigurationList := &configv1beta1.ClusterConfigurationList{}
+	Expect(testEnv.List(context.TODO(), clusterConfigurationList, listOptions...)).To(Succeed())
+	for i := range clusterConfigurationList.Items {
+		Expect(testEnv.Delete(context.TODO(), &clusterConfigurationList.Items[i])).To(Succeed())
+	}
+
+	err = testEnv.Delete(context.TODO(), clusterSummary)
+	if err != nil {
+		Expect(apierrors.IsNotFound(err)).To(BeTrue())
+	}
+	err = testEnv.Delete(context.TODO(), clusterProfile)
+	if err != nil {
+		Expect(apierrors.IsNotFound(err)).To(BeTrue())
+	}
+}
+
+func addTypeInformationToObject(scheme *runtime.Scheme, obj client.Object) error {
+	gvks, _, err := scheme.ObjectKinds(obj)
+	if err != nil {
+		return fmt.Errorf("missing apiVersion or kind and cannot assign it; %w", err)
+	}
+
+	for _, gvk := range gvks {
+		if gvk.Kind == "" {
+			continue
+		}
+		if gvk.Version == "" || gvk.Version == runtime.APIVersionInternal {
+			continue
+		}
+		obj.GetObjectKind().SetGroupVersionKind(gvk)
+		break
+	}
+
+	return nil
+}
+
+// prepareForDeployment creates following:
+// - CAPI cluster (and its namespace)
+// - secret containing kubeconfig to access CAPI Cluster
+// - clusterProfile/clusterSummary/clusterConfiguration
+// - adds ClusterProfile as OwnerReference for both ClusterSummary and ClusterConfiguration
+func prepareForDeployment(clusterProfile *configv1beta1.ClusterProfile, //nolint: funlen // preparing for ut
+	clusterSummary *configv1beta1.ClusterSummary,
+	cluster *clusterv1.Cluster) {
+
+	By("Add proper labels to ClusterSummary")
+	addLabelsToClusterSummary(clusterSummary, clusterProfile.Name, cluster.Name, libsveltosv1beta1.ClusterTypeCapi)
+
+	Expect(addTypeInformationToObject(testEnv.Scheme(), clusterProfile)).To(Succeed())
+	Expect(addTypeInformationToObject(testEnv.Scheme(), clusterSummary)).To(Succeed())
+
+	By("Create the secret with cluster kubeconfig")
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: clusterSummary.Spec.ClusterNamespace,
+			Name:      clusterSummary.Spec.ClusterName + kubeconfigPostfix,
+		},
+		Data: map[string][]byte{
+			testValueKey: testEnv.Kubeconfig,
+		},
+	}
+
+	By("Create the cluster's namespace")
+	ns := &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: clusterSummary.Spec.ClusterNamespace,
+		},
+	}
+
+	clusterConfiguration := &configv1beta1.ClusterConfiguration{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: cluster.Namespace,
+			Name:      controllers.GetClusterConfigurationName(cluster.Name, libsveltosv1beta1.ClusterTypeCapi),
+		},
+	}
+
+	Expect(testEnv.Create(context.TODO(), ns)).To(Succeed())
+	Expect(testEnv.Create(context.TODO(), clusterSummary)).To(Succeed())
+	Expect(testEnv.Create(context.TODO(), clusterConfiguration)).To(Succeed())
+	Expect(testEnv.Create(context.TODO(), clusterProfile)).To(Succeed())
+
+	Expect(waitForObject(context.TODO(), testEnv.Client, clusterSummary)).To(Succeed())
+	Expect(waitForObject(context.TODO(), testEnv.Client, clusterProfile)).To(Succeed())
+
+	currentClusterProfile := &configv1beta1.ClusterProfile{}
+	Expect(testEnv.Get(context.TODO(),
+		types.NamespacedName{Name: clusterProfile.Name}, currentClusterProfile)).To(Succeed())
+
+	currentClusterSummary := &configv1beta1.ClusterSummary{}
+	Expect(testEnv.Get(context.TODO(),
+		types.NamespacedName{Namespace: clusterSummary.Namespace, Name: clusterSummary.Name}, currentClusterSummary)).To(Succeed())
+
+	By("Set ClusterSummary OwnerReference")
+	addOwnerReference(context.TODO(), testEnv.Client, currentClusterSummary, currentClusterProfile)
+
+	Expect(testEnv.Create(context.TODO(), cluster)).To(Succeed())
+	Expect(waitForObject(context.TODO(), testEnv.Client, cluster)).To(Succeed())
+	currentCluster := clusterv1.Cluster{}
+	Expect(testEnv.Get(context.TODO(),
+		types.NamespacedName{Namespace: cluster.Namespace, Name: cluster.Name},
+		&currentCluster)).To(Succeed())
+	initialized := true
+	currentCluster.Status.Initialization.ControlPlaneInitialized = &initialized
+	Expect(testEnv.Status().Update(ctx, &currentCluster)).To(Succeed())
+
+	Eventually(func() bool {
+		err := testEnv.Get(context.TODO(),
+			types.NamespacedName{Namespace: cluster.Namespace, Name: cluster.Name},
+			&currentCluster)
+		if err != nil {
+			return false
+		}
+		return currentCluster.Status.Initialization.ControlPlaneInitialized != nil &&
+			*currentCluster.Status.Initialization.ControlPlaneInitialized
+	}, timeout, pollingInterval).Should(BeTrue())
+
+	// This method is invoked by different tests in parallel, all touching same clusterConfiguration.
+	// So add this logic in a Retry
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		currentClusterConfiguration := &configv1beta1.ClusterConfiguration{}
+		clusterConfigurationName := controllers.GetClusterConfigurationName(cluster.Name, libsveltosv1beta1.ClusterTypeCapi)
+		err := testEnv.Get(context.TODO(),
+			types.NamespacedName{Namespace: cluster.Namespace, Name: clusterConfigurationName}, currentClusterConfiguration)
+		if err != nil {
+			return err
+		}
+		By("Set ClusterConfiguration OwnerReference")
+		addOwnerReference(context.TODO(), testEnv.Client, currentClusterConfiguration, currentClusterProfile)
+
+		err = testEnv.Get(context.TODO(),
+			types.NamespacedName{Namespace: cluster.Namespace, Name: clusterConfigurationName}, currentClusterConfiguration)
+		if err != nil {
+			return err
+		}
+		currentClusterConfiguration.Status.ClusterProfileResources = []configv1beta1.ClusterProfileResource{
+			{
+				ClusterProfileName: clusterProfile.Name,
+				Features:           make([]configv1beta1.Feature, 0),
+			},
+		}
+		return testEnv.Status().Update(ctx, currentClusterConfiguration)
+	})
+	Expect(err).To(BeNil())
+
+	Expect(testEnv.Create(context.TODO(), secret)).To(Succeed())
+	Expect(waitForObject(context.TODO(), testEnv.Client, secret)).To(Succeed())
+}

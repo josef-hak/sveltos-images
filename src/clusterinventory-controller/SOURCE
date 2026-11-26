@@ -1,0 +1,5 @@
+upstream: https://github.com/projectsveltos/clusterinventory-controller
+tag: v1.17.0
+commit: 5f07bcf0589374bb1fdd14fc056a931f47255d29
+vendored: 2026-11-26T11:50:40Z
+pruned: .git doc/

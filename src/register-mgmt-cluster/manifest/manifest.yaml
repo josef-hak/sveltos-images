@@ -1,0 +1,71 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: projectsveltos
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: register-mgmt-cluster
+  namespace: projectsveltos
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: register-mgmt-cluster-rolebinding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+subjects:
+- kind: ServiceAccount
+  name: register-mgmt-cluster
+  namespace: projectsveltos
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: register-mgmt-cluster-job
+  namespace: projectsveltos
+spec:
+  ttlSecondsAfterFinished: 240
+  template:
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: register-mgmt-cluster
+        image: docker.io/projectsveltos/register-mgmt-cluster:v1.17.0
+        imagePullPolicy: IfNotPresent
+        args:
+        - --labels=
+        - --service-account-token=false
+        env:
+        - name: GOMEMLIMIT
+          valueFrom:
+            resourceFieldRef:
+              resource: limits.memory
+        - name: GOMAXPROCS
+          valueFrom:
+            resourceFieldRef:
+              resource: limits.cpu
+        - name: NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        resources:
+          requests:
+            memory: 128Mi
+        securityContext:
+          seccompProfile:
+            type: RuntimeDefault
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+              - "ALL"
+      serviceAccountName: register-mgmt-cluster
+      restartPolicy: Never
+  backoffLimit: 4
+---

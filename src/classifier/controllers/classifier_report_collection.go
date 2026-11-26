@@ -1,0 +1,597 @@
+/*
+Copyright 2022. projectsveltos.io. All rights reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package controllers
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/go-logr/logr"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	libsveltosv1beta1 "github.com/projectsveltos/libsveltos/api/v1beta1"
+	"github.com/projectsveltos/libsveltos/lib/clustercache"
+	"github.com/projectsveltos/libsveltos/lib/clusterproxy"
+	logs "github.com/projectsveltos/libsveltos/lib/logsettings"
+	"github.com/projectsveltos/libsveltos/lib/sveltos_upgrade"
+)
+
+const (
+	compatibilityCheckErrorMsg = "compatibility checks failed"
+)
+
+// Classifier instances reside in the same cluster as the sveltos-agent component.
+// This function dynamically selects the appropriate Kubernetes client:
+// - Management cluster's client if sveltos-agent is deployed there.
+// - A managed cluster's client (obtained via clusterproxy) if sveltos-agent is in a managed cluster.
+func getClassifierClient(ctx context.Context, clusterNamespace, clusterName string, clusterType libsveltosv1beta1.ClusterType,
+	logger logr.Logger) (client.Client, error) {
+
+	if getAgentInMgmtCluster() {
+		return getManagementClusterClient(), nil
+	}
+
+	// ResourceSummary is a Sveltos resource created in managed clusters.
+	// Sveltos resources are always created using cluster-admin so that admin does not need to be
+	// given such permissions.
+	return clustercache.GetManager().GetKubernetesClient(ctx, getManagementClusterClient(),
+		clusterNamespace, clusterName, "", "", clusterType, logger)
+}
+
+// removeAccessRequest removes AccessRequest generated for SveltosAgent
+func removeAccessRequest(ctx context.Context, c client.Client, logger logr.Logger) error {
+	accessRequestList := &libsveltosv1beta1.AccessRequestList{}
+
+	listOptions := []client.ListOption{
+		client.MatchingLabels{
+			accessRequestClassifierLabel: accessRequestClassifierLabelValue,
+		},
+	}
+
+	err := c.List(ctx, accessRequestList, listOptions...)
+	if err != nil {
+		return err
+	}
+
+	for i := range accessRequestList.Items {
+		ar := &accessRequestList.Items[i]
+		err = c.Delete(ctx, ar)
+		if err != nil {
+			return err
+		}
+	}
+
+	logger.V(logs.LogDebug).Info("remove AccessRequest for SveltosAgents")
+	return nil
+}
+
+// removeClassifierReports deletes all ClassifierReport corresponding to Classifier instance
+func removeClassifierReports(ctx context.Context, c client.Client, classifier *libsveltosv1beta1.Classifier,
+	logger logr.Logger) error {
+
+	listOptions := []client.ListOption{
+		client.MatchingLabels{
+			libsveltosv1beta1.ClassifierlNameLabel: classifier.Name,
+		},
+	}
+
+	classifierReportList := &libsveltosv1beta1.ClassifierReportList{}
+	err := c.List(ctx, classifierReportList, listOptions...)
+	if err != nil {
+		logger.V(logs.LogInfo).Info(fmt.Sprintf("failed to list ClassifierReports. Err: %v", err))
+		return err
+	}
+
+	for i := range classifierReportList.Items {
+		cr := &classifierReportList.Items[i]
+		err = c.Delete(ctx, cr)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// removeClusterClassifierReports deletes all ClassifierReport corresponding to Cluster instance
+func removeClusterClassifierReports(ctx context.Context, c client.Client, clusterNamespace, clusterName string,
+	clusterType libsveltosv1beta1.ClusterType, logger logr.Logger) error {
+
+	listOptions := []client.ListOption{
+		client.MatchingLabels{
+			libsveltosv1beta1.ClassifierReportClusterNameLabel: clusterName,
+			libsveltosv1beta1.ClassifierReportClusterTypeLabel: strings.ToLower(string(clusterType)),
+		},
+	}
+
+	classifierReportList := &libsveltosv1beta1.ClassifierReportList{}
+	err := c.List(ctx, classifierReportList, listOptions...)
+	if err != nil {
+		logger.V(logs.LogInfo).Info(fmt.Sprintf("failed to list ClassifierReports. Err: %v", err))
+		return err
+	}
+
+	for i := range classifierReportList.Items {
+		cr := &classifierReportList.Items[i]
+		err = c.Delete(ctx, cr)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// ClassifierReports are collected from managed cluster to the management cluster.
+// When an ClassifierReport is collected from a managed cluster and created in the
+// management cluster, the label classifier.projectsveltos.io/cluster-name
+// is added. All ClassifierReport found in the management cluster with this
+// labels should be ignored as collected from other managed clusters.
+func shouldIgnore(cr *libsveltosv1beta1.ClassifierReport, isPullMode bool) bool {
+	if isPullMode {
+		// Sveltos-applier copies the EventReports to the management cluster
+		// and add this label to the EventReport
+		return false
+	}
+
+	if getAgentInMgmtCluster() {
+		// If sveltos-agent is in the management cluster, EventReports
+		// are directly generated by sveltos-agent here. So there is no
+		// copy to ignore.
+		return false
+	}
+
+	if cr.Labels == nil {
+		return false
+	}
+
+	_, ok := cr.Labels[libsveltosv1beta1.ClassifierReportClusterNameLabel]
+	return ok
+}
+
+// Periodically collects ClassifierReports from each cluster.
+// If sharding is used, it will collect only from clusters matching shard.
+func collectClassifierReports(ctx context.Context, c client.Client, shardKey, capiOnboardAnnotation, version string,
+	logger logr.Logger) {
+
+	interval := 10 * time.Second
+	if shardKey != "" {
+		// This controller will only fetch ClassifierReport instances
+		// so it can be more aggressive
+		interval = 5 * time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			logger.Info("stopping collecting ClassifierReports")
+			return
+		case <-ticker.C:
+			logger.V(logs.LogDebug).Info("collecting ClassifierReports")
+			// Get a selectors that matches everything
+			clusterList, err := clusterproxy.GetListOfClustersForShardKey(ctx, c, "", capiOnboardAnnotation, shardKey, logger)
+			if err != nil {
+				logger.V(logs.LogInfo).Info(fmt.Sprintf("failed to get clusters: %v", err))
+			}
+
+			// In agentless mode all ClassifierReports live in the management cluster.
+			// A single List call covers every cluster, avoiding N per-cluster API calls.
+			if getAgentInMgmtCluster() {
+				if err := collectAndProcessAllClassifierReports(ctx, c, clusterList, version, logger); err != nil {
+					logger.V(logs.LogInfo).Info(fmt.Sprintf("failed to collect ClassifierReports: %v", err))
+				}
+			} else {
+				for i := range clusterList {
+					cluster := &clusterList[i]
+					l := logger.WithValues("cluster", fmt.Sprintf("%s:%s/%s", cluster.Kind, cluster.Namespace, cluster.Name))
+					err = collectClassifierReportsFromCluster(ctx, c, cluster, version, l)
+					if err != nil {
+						l.V(logs.LogInfo).Info(fmt.Sprintf("failed to collect ClassifierReports from cluster: %s/%s %v",
+							cluster.Namespace, cluster.Name, err))
+						continue
+					}
+				}
+			}
+		}
+	}
+}
+
+// clusterKey uniquely identifies a cluster by namespace, name, and type so that a
+// SveltosCluster and a CAPI Cluster sharing the same namespace and name are treated separately.
+type clusterKey struct{ ns, name, clusterType string }
+
+// classifierReportGroup holds a cluster reference and all ClassifierReports belonging to it.
+type classifierReportGroup struct {
+	ref   corev1.ObjectReference
+	items []*libsveltosv1beta1.ClassifierReport
+}
+
+// buildShardClustersMap returns a lookup of shard-local clusters keyed by clusterKey.
+func buildShardClustersMap(clusterList []corev1.ObjectReference) map[clusterKey]corev1.ObjectReference {
+	m := make(map[clusterKey]corev1.ObjectReference, len(clusterList))
+	for i := range clusterList {
+		ref := clusterList[i]
+		ct := strings.ToLower(string(clusterproxy.GetClusterType(&ref)))
+		m[clusterKey{ref.Namespace, ref.Name, ct}] = ref
+	}
+	return m
+}
+
+// groupClassifierReportsByCluster groups ClassifierReports by the cluster identified via labels,
+// filtering to only shard-local clusters.
+func groupClassifierReportsByCluster(
+	reports []libsveltosv1beta1.ClassifierReport,
+	shardClusters map[clusterKey]corev1.ObjectReference,
+) []*classifierReportGroup {
+
+	byCluster := make(map[clusterKey]*classifierReportGroup)
+	for i := range reports {
+		cr := &reports[i]
+		if cr.Labels == nil {
+			continue
+		}
+		clusterName := cr.Labels[libsveltosv1beta1.ClassifierReportClusterNameLabel]
+		clusterType := cr.Labels[libsveltosv1beta1.ClassifierReportClusterTypeLabel]
+		if clusterName == "" || clusterType == "" {
+			continue
+		}
+		key := clusterKey{cr.Namespace, clusterName, clusterType}
+		ref, ok := shardClusters[key]
+		if !ok {
+			continue
+		}
+		g, exists := byCluster[key]
+		if !exists {
+			g = &classifierReportGroup{ref: ref}
+			byCluster[key] = g
+		}
+		g.items = append(g.items, cr)
+	}
+
+	groups := make([]*classifierReportGroup, 0, len(byCluster))
+	for _, g := range byCluster {
+		groups = append(groups, g)
+	}
+	return groups
+}
+
+// collectAndProcessAllClassifierReports is used in agentless mode. It fetches all
+// ClassifierReports from the management cluster in a single List call, groups them by
+// cluster, and processes only clusters that have reports — avoiding N per-cluster List calls.
+func collectAndProcessAllClassifierReports(ctx context.Context, c client.Client,
+	clusterList []corev1.ObjectReference, version string, logger logr.Logger) error {
+
+	crList := &libsveltosv1beta1.ClassifierReportList{}
+	if err := c.List(ctx, crList); err != nil {
+		return err
+	}
+
+	groups := groupClassifierReportsByCluster(crList.Items, buildShardClustersMap(clusterList))
+
+	var retErr error
+	for _, g := range groups {
+		l := logger.WithValues("cluster", fmt.Sprintf("%s %s/%s", g.ref.Kind, g.ref.Namespace, g.ref.Name))
+		if err := processClassifierReportsForClusterInAgentlessMode(ctx, c, &g.ref, g.items, version, l); err != nil {
+			retErr = err
+		}
+	}
+
+	return retErr
+}
+
+// processClassifierReportsForClusterInAgentlessMode handles all ClassifierReports for a single
+// cluster in agentless mode. It checks readiness, version compatibility, and processes each report.
+func processClassifierReportsForClusterInAgentlessMode(ctx context.Context, c client.Client,
+	ref *corev1.ObjectReference, crs []*libsveltosv1beta1.ClassifierReport,
+	version string, logger logr.Logger) error {
+
+	skip, err := skipCollecting(ctx, c, ref, logger)
+	if err != nil {
+		return err
+	}
+	if skip {
+		return nil
+	}
+
+	isPullMode, err := clusterproxy.IsClusterInPullMode(ctx, c, ref.Namespace, ref.Name,
+		clusterproxy.GetClusterType(ref), logger)
+	if err != nil {
+		return err
+	}
+	if isPullMode {
+		return nil
+	}
+
+	if !sveltos_upgrade.IsSveltosAgentVersionCompatible(ctx, getManagementClusterClient(), getSveltosNamespace(),
+		version, ref.Namespace, ref.Name, clusterproxy.GetClusterType(ref), true, logger) {
+
+		logger.V(logs.LogDebug).Info(compatibilityCheckErrorMsg)
+		return errors.New(compatibilityCheckErrorMsg)
+	}
+
+	var retErr error
+	for _, cr := range crs {
+		if !cr.DeletionTimestamp.IsZero() {
+			continue
+		}
+		l := logger.WithValues("classifierReport", cr.Name)
+		if err := markClassifierReportProcessed(ctx, c, cr, l); err != nil {
+			retErr = err
+		}
+	}
+
+	return retErr
+}
+
+// markClassifierReportProcessed marks as Processed a ClassifierReport written directly in the management cluster
+// by sveltos-agent.
+//
+// Unlike in a managed cluster, there is no copy to refresh: the listed ClassifierReport and the one in the management
+// cluster are the same object. Spec must not be copied over it, because the listed one can be older than what
+// sveltos-agent wrote since it was listed. Copying it would revert Spec.Match, and nothing would evaluate the
+// Classifier again to set it back.
+func markClassifierReportProcessed(ctx context.Context, c client.Client,
+	listedReport *libsveltosv1beta1.ClassifierReport, logger logr.Logger) error {
+
+	currentReport := &libsveltosv1beta1.ClassifierReport{}
+	err := c.Get(ctx, client.ObjectKeyFromObject(listedReport), currentReport)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		logger.V(logs.LogInfo).Error(err, "failed to get ClassifierReport")
+		return err
+	}
+
+	return updateClassifierReportStatus(ctx, c, currentReport, logger)
+}
+
+func skipCollecting(ctx context.Context, c client.Client, cluster *corev1.ObjectReference,
+	logger logr.Logger) (bool, error) {
+
+	clusterRef := &corev1.ObjectReference{
+		Namespace:  cluster.Namespace,
+		Name:       cluster.Name,
+		APIVersion: cluster.APIVersion,
+		Kind:       cluster.Kind,
+	}
+	ready, err := clusterproxy.IsClusterReadyToBeConfigured(ctx, c, clusterRef, logger)
+	if err != nil {
+		logger.V(logs.LogDebug).Info("cluster is not ready yet")
+		return true, err
+	}
+
+	if !ready {
+		return true, nil
+	}
+
+	paused, err := clusterproxy.IsClusterPaused(ctx, c, cluster.Namespace, cluster.Name,
+		clusterproxy.GetClusterType(cluster))
+	if err != nil {
+		logger.V(logs.LogDebug).Error(err, "failed to verify if cluster is paused")
+		return true, err
+	}
+
+	if paused {
+		return true, nil
+	}
+
+	return false, nil
+}
+
+func collectClassifierReportsFromCluster(ctx context.Context, c client.Client,
+	cluster *corev1.ObjectReference, version string, logger logr.Logger) error {
+
+	skipCollecting, err := skipCollecting(ctx, c, cluster, logger)
+	if err != nil {
+		return err
+	}
+
+	if skipCollecting {
+		return nil
+	}
+
+	isPullMode, err := clusterproxy.IsClusterInPullMode(ctx, c, cluster.Namespace, cluster.Name,
+		clusterproxy.GetClusterType(cluster), logger)
+	if err != nil {
+		return err
+	}
+	if isPullMode {
+		return nil
+	}
+
+	if !sveltos_upgrade.IsSveltosAgentVersionCompatible(ctx, getManagementClusterClient(), getSveltosNamespace(), version,
+		cluster.Namespace, cluster.Name, clusterproxy.GetClusterType(cluster), getAgentInMgmtCluster(), logger) {
+
+		logger.V(logs.LogDebug).Info(compatibilityCheckErrorMsg)
+		return errors.New(compatibilityCheckErrorMsg)
+	}
+
+	// Classifier instance location depends on sveltos-agent: management cluster if it's running there,
+	// otherwise managed cluster.
+	clusterClient, err := getClassifierClient(ctx, cluster.Namespace, cluster.Name,
+		clusterproxy.GetClusterType(cluster), logger)
+	if err != nil {
+		clustercache.GetManager().InvalidateOnAuthError(cluster.Namespace, cluster.Name,
+			clusterproxy.GetClusterType(cluster), err)
+		return err
+	}
+
+	logger.V(logs.LogDebug).Info("collecting ClassifierReports from cluster")
+
+	var listOptions []client.ListOption
+	if getAgentInMgmtCluster() || isPullMode {
+		clusterType := clusterproxy.GetClusterType(cluster)
+		// If agent is in the management cluster or in pull mode, ClassifierReport for this
+		// cluster are also in the management cluuster in the cluster namespace.
+		listOptions = []client.ListOption{
+			client.InNamespace(cluster.Namespace),
+			client.MatchingLabels{
+				libsveltosv1beta1.ClassifierReportClusterNameLabel: cluster.Name,
+				libsveltosv1beta1.ClassifierReportClusterTypeLabel: strings.ToLower(string(clusterType)),
+			},
+		}
+	}
+
+	classifierReportList := libsveltosv1beta1.ClassifierReportList{}
+	err = clusterClient.List(ctx, &classifierReportList, listOptions...)
+	if err != nil {
+		// getClassifierClient succeeding only means the cached rest.Config was non-nil - it
+		// does not verify the credentials still work, since client.New performs no network
+		// call. A token that expired since the config was cached surfaces here, on first
+		// actual use, not there. Evict so the next collection cycle rebuilds the client from a
+		// freshly-read kubeconfig Secret instead of retrying the same stale credentials forever.
+		clustercache.GetManager().InvalidateOnAuthError(cluster.Namespace, cluster.Name,
+			clusterproxy.GetClusterType(cluster), err)
+		return err
+	}
+
+	for i := range classifierReportList.Items {
+		cr := &classifierReportList.Items[i]
+
+		if shouldIgnore(cr, isPullMode) {
+			continue
+		}
+
+		l := logger.WithValues("classifierReport", cr.Name)
+
+		if !cr.DeletionTimestamp.IsZero() {
+			// ignore deleted ClassifierReport
+			continue
+		}
+
+		processOneClassifierReport(ctx, c, clusterClient, cluster, cr, l)
+	}
+
+	return nil
+}
+
+// processOneClassifierReport updates cr's management-cluster copy and marks that copy Processed
+// (this is the object mcp-server/dashboard read to determine pipeline health), then also marks cr
+// itself Processed in the managed cluster, mirroring healthcheck-manager/event-manager. Split out
+// of collectClassifierReportsFromCluster to keep that function's cyclomatic complexity down.
+func processOneClassifierReport(ctx context.Context, c, clusterClient client.Client,
+	cluster *corev1.ObjectReference, cr *libsveltosv1beta1.ClassifierReport, logger logr.Logger) {
+
+	mgmtClassifierReport, err := updateClassifierReport(ctx, c, cluster, cr, logger)
+	if err != nil {
+		logger.V(logs.LogInfo).Error(err, "failed to update ClassifierReport in management cluster")
+		return
+	}
+
+	// AgentFailureMessage is set by sveltos-agent itself, in the managed cluster, when it cannot
+	// refresh cr.Spec.Match; carry it over so the management-cluster copy reflects it too.
+	mgmtClassifierReport.Status.AgentFailureMessage = cr.Status.AgentFailureMessage
+
+	if err := updateClassifierReportStatus(ctx, c, mgmtClassifierReport, logger); err != nil {
+		return
+	}
+
+	_ = updateClassifierReportStatus(ctx, clusterClient, cr, logger)
+}
+
+func updateClassifierReport(ctx context.Context, c client.Client, cluster *corev1.ObjectReference,
+	classiferReport *libsveltosv1beta1.ClassifierReport, logger logr.Logger,
+) (*libsveltosv1beta1.ClassifierReport, error) {
+
+	if classiferReport.Labels == nil {
+		msg := "classifierReport is malformed. Labels is empty"
+		logger.V(logs.LogInfo).Info(msg)
+		return nil, errors.New(msg)
+	}
+
+	classifierName, ok := classiferReport.Labels[libsveltosv1beta1.ClassifierlNameLabel]
+	if !ok {
+		msg := "classifierReport is malformed. Label missing"
+		logger.V(logs.LogInfo).Info(msg)
+		return nil, errors.New(msg)
+	}
+
+	// Verify Classifier still exists
+	currentClassifier := libsveltosv1beta1.Classifier{}
+	err := c.Get(ctx, types.NamespacedName{Name: classifierName}, &currentClassifier)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return classiferReport, nil
+		}
+		return nil, err
+	}
+	if !currentClassifier.DeletionTimestamp.IsZero() {
+		return classiferReport, nil
+	}
+
+	clusterType := clusterproxy.GetClusterType(cluster)
+	classifierReportName := libsveltosv1beta1.GetClassifierReportName(classifierName, cluster.Name, &clusterType)
+
+	currentClassifierReport := &libsveltosv1beta1.ClassifierReport{}
+	err = c.Get(ctx,
+		types.NamespacedName{Namespace: cluster.Namespace, Name: classifierReportName},
+		currentClassifierReport)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			logger.V(logs.LogDebug).Info("create ClassifierReport in management cluster")
+			currentClassifierReport.Namespace = cluster.Namespace
+			currentClassifierReport.Name = classifierReportName
+			currentClassifierReport.Labels = libsveltosv1beta1.GetClassifierReportLabels(
+				classifierName, cluster.Name, &clusterType)
+			currentClassifierReport.Spec = classiferReport.Spec
+			currentClassifierReport.Spec.ClusterNamespace = cluster.Namespace
+			currentClassifierReport.Spec.ClusterName = cluster.Name
+			currentClassifierReport.Spec.ClusterType = clusterType
+			if err := c.Create(ctx, currentClassifierReport); err != nil {
+				return nil, err
+			}
+			return currentClassifierReport, nil
+		}
+		return nil, err
+	}
+
+	logger.V(logs.LogDebug).Info("update ClassifierReport in management cluster")
+	currentClassifierReport.Spec = classiferReport.Spec
+	currentClassifierReport.Spec.ClusterNamespace = cluster.Namespace
+	currentClassifierReport.Spec.ClusterName = cluster.Name
+	currentClassifierReport.Spec.ClusterType = clusterType
+	currentClassifierReport.Labels = libsveltosv1beta1.GetClassifierReportLabels(
+		classifierName, cluster.Name, &clusterType)
+	if err := c.Update(ctx, currentClassifierReport); err != nil {
+		return nil, err
+	}
+	return currentClassifierReport, nil
+}
+
+// updateClassifierReportStatus marks report Processed in the management cluster, mirroring
+// healthcheck-manager's/event-manager's HealthCheckReport/EventReport collection pattern so
+// ClassifierReport doesn't stay stuck at WaitingForDelivery once it has actually been collected.
+func updateClassifierReportStatus(ctx context.Context, c client.Client,
+	report *libsveltosv1beta1.ClassifierReport, logger logr.Logger) error {
+
+	phase := libsveltosv1beta1.ReportProcessed
+	report.Status.Phase = &phase
+	if err := c.Status().Update(ctx, report); err != nil {
+		logger.V(logs.LogInfo).Error(err, "failed to update ClassifierReport status")
+		return err
+	}
+	return nil
+}

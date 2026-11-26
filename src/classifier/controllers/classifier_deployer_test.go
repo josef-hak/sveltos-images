@@ -1,0 +1,1747 @@
+/*
+Copyright 2022. projectsveltos.io. All rights reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package controllers_test
+
+import (
+	"context"
+	"crypto/sha256"
+	"fmt"
+	"reflect"
+	"strings"
+	"time"
+
+	"github.com/go-logr/logr"
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+
+	"github.com/gdexlab/go-render/render"
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/klog/v2/textlogger"
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+
+	"github.com/projectsveltos/classifier/controllers"
+	"github.com/projectsveltos/classifier/controllers/keymanager"
+	libsveltosv1beta1 "github.com/projectsveltos/libsveltos/api/v1beta1"
+	"github.com/projectsveltos/libsveltos/lib/deployer"
+	fakedeployer "github.com/projectsveltos/libsveltos/lib/deployer/fake"
+	"github.com/projectsveltos/libsveltos/lib/pullmode"
+	"github.com/projectsveltos/libsveltos/lib/sveltos_upgrade"
+)
+
+const (
+	classifierCRDName            = "classifiers.lib.projectsveltos.io"
+	agentWatchNamespacesAnnotKey = "agent.projectsveltos.io/watch-namespaces"
+	watchNamespaceNs1            = "ns1"
+	watchNamespaceNs2            = "ns2"
+)
+
+var _ = Describe("Classifier Deployer", func() {
+	var logger logr.Logger
+
+	BeforeEach(func() {
+		logger = textlogger.NewLogger(textlogger.NewConfig(textlogger.Verbosity(1)))
+		controllers.SetVersion(version)
+	})
+
+	It("classifierHash returns Classifier hash", func() {
+		classifier := getClassifierInstance(randomString())
+		classifier.Spec.DeployedResourceConstraint = &libsveltosv1beta1.DeployedResourceConstraint{
+			ResourceSelectors: []libsveltosv1beta1.ResourceSelector{
+				{
+					Namespace: randomString(),
+					Group:     randomString(),
+					Kind:      randomString(),
+					Version:   randomString(),
+					LabelFilters: []libsveltosv1beta1.LabelFilter{
+						{
+							Key:   randomString(),
+							Value: randomString(),
+						},
+					},
+				},
+				{
+					Namespace: randomString(),
+					Group:     randomString(),
+					Kind:      randomString(),
+					Version:   randomString(),
+					LabelFilters: []libsveltosv1beta1.LabelFilter{
+						{
+							Key:   randomString(),
+							Value: randomString(),
+						},
+					},
+				},
+			},
+		}
+
+		h := sha256.New()
+		var config string
+
+		config += version
+		config += render.AsCode(classifier.Spec)
+		h.Write([]byte(config))
+		hash := h.Sum(nil)
+
+		currentHash := controllers.ClassifierHash(classifier)
+		Expect(reflect.DeepEqual(currentHash, hash)).To(BeTrue())
+	})
+
+	It("deployClassifierCRD deploys Classifier CRD", func() {
+		cluster := prepareCluster()
+
+		Expect(controllers.DeployClassifierCRD(context.TODO(), cluster.Namespace, cluster.Name, randomString(),
+			libsveltosv1beta1.ClusterTypeCapi, false, logger)).To(Succeed())
+
+		// Eventual loop so testEnv Cache is synced
+		Eventually(func() error {
+			classifierCRD := &apiextensionsv1.CustomResourceDefinition{}
+			return testEnv.Get(context.TODO(),
+				types.NamespacedName{Name: classifierCRDName}, classifierCRD)
+		}, timeout, pollingInterval).Should(BeNil())
+	})
+
+	It("deployClassifierReportCRD deploys ClassifierReport CRD", func() {
+		cluster := prepareCluster()
+
+		Expect(controllers.DeployClassifierReportCRD(context.TODO(), cluster.Namespace, cluster.Name, randomString(),
+			libsveltosv1beta1.ClusterTypeCapi, false, logger)).To(Succeed())
+
+		// Eventual loop so testEnv Cache is synced
+		Eventually(func() error {
+			classifierReportCRD := &apiextensionsv1.CustomResourceDefinition{}
+			return testEnv.Get(context.TODO(),
+				types.NamespacedName{Name: "classifierreports.lib.projectsveltos.io"}, classifierReportCRD)
+		}, timeout, pollingInterval).Should(BeNil())
+	})
+
+	It("deployHealthCheckCRD deploys HealthCheck CRD", func() {
+		cluster := prepareCluster()
+
+		Expect(controllers.DeployHealthCheckCRD(context.TODO(), cluster.Namespace, cluster.Name, randomString(),
+			libsveltosv1beta1.ClusterTypeCapi, false, logger)).To(Succeed())
+
+		// Eventual loop so testEnv Cache is synced
+		Eventually(func() error {
+			healthCheckCRD := &apiextensionsv1.CustomResourceDefinition{}
+			return testEnv.Get(context.TODO(),
+				types.NamespacedName{Name: "healthchecks.lib.projectsveltos.io"}, healthCheckCRD)
+		}, timeout, pollingInterval).Should(BeNil())
+	})
+
+	It("deployHealthCheckReportCRD deploys HealthCheckReport CRD", func() {
+		cluster := prepareCluster()
+
+		Expect(controllers.DeployHealthCheckReportCRD(context.TODO(), cluster.Namespace, cluster.Name, randomString(),
+			libsveltosv1beta1.ClusterTypeCapi, false, logger)).To(Succeed())
+
+		// Eventual loop so testEnv Cache is synced
+		Eventually(func() error {
+			healthCheckReportCRD := &apiextensionsv1.CustomResourceDefinition{}
+			return testEnv.Get(context.TODO(),
+				types.NamespacedName{Name: "healthcheckreports.lib.projectsveltos.io"}, healthCheckReportCRD)
+		}, timeout, pollingInterval).Should(BeNil())
+	})
+
+	It("deployEventSourceCRD deploys EventSource CRD", func() {
+		cluster := prepareCluster()
+
+		Expect(controllers.DeployEventSourceCRD(context.TODO(), cluster.Namespace, cluster.Name, randomString(),
+			libsveltosv1beta1.ClusterTypeCapi, false, logger)).To(Succeed())
+
+		// Eventual loop so testEnv Cache is synced
+		Eventually(func() error {
+			eventSourceCRD := &apiextensionsv1.CustomResourceDefinition{}
+			return testEnv.Get(context.TODO(),
+				types.NamespacedName{Name: "eventsources.lib.projectsveltos.io"}, eventSourceCRD)
+		}, timeout, pollingInterval).Should(BeNil())
+	})
+
+	It("deployEventReportCRD deploys EventReport CRD", func() {
+		cluster := prepareCluster()
+
+		Expect(controllers.DeployEventReportCRD(context.TODO(), cluster.Namespace, cluster.Name, randomString(),
+			libsveltosv1beta1.ClusterTypeCapi, false, logger)).To(Succeed())
+
+		// Eventual loop so testEnv Cache is synced
+		Eventually(func() error {
+			eventReportCRD := &apiextensionsv1.CustomResourceDefinition{}
+			return testEnv.Get(context.TODO(),
+				types.NamespacedName{Name: "eventreports.lib.projectsveltos.io"}, eventReportCRD)
+		}, timeout, pollingInterval).Should(BeNil())
+	})
+
+	It("deployClassifierInstance creates Classifier instance", func() {
+		c := fake.NewClientBuilder().WithScheme(scheme).Build()
+
+		classifier := getClassifierInstance(randomString())
+		Expect(controllers.DeployClassifierInstance(ctx, c, randomString(), randomString(),
+			classifier, false, logger)).To(Succeed())
+
+		currentClassifier := &libsveltosv1beta1.Classifier{}
+		Expect(c.Get(context.TODO(), types.NamespacedName{Name: classifier.Name}, currentClassifier)).To(Succeed())
+	})
+
+	It("deployDebuggingConfigurationCRD deploys DebuggingConfiguration CRD", func() {
+		cluster := prepareCluster()
+
+		Expect(controllers.DeployDebuggingConfigurationCRD(context.TODO(), cluster.Namespace, cluster.Name, randomString(),
+			libsveltosv1beta1.ClusterTypeCapi, false, logger)).To(Succeed())
+
+		// Eventual loop so testEnv Cache is synced
+		Eventually(func() error {
+			dcCRD := &apiextensionsv1.CustomResourceDefinition{}
+			return testEnv.Get(context.TODO(),
+				types.NamespacedName{Name: "debuggingconfigurations.lib.projectsveltos.io"}, dcCRD)
+		}, timeout, pollingInterval).Should(BeNil())
+	})
+
+	It("deployReloaderCRD deploys Reloader CRD", func() {
+		cluster := prepareCluster()
+
+		Expect(controllers.DeployReloaderCRD(context.TODO(), cluster.Namespace, cluster.Name, randomString(),
+			libsveltosv1beta1.ClusterTypeCapi, false, logger)).To(Succeed())
+
+		// Eventual loop so testEnv Cache is synced
+		Eventually(func() error {
+			reloaderCRD := &apiextensionsv1.CustomResourceDefinition{}
+			return testEnv.Get(context.TODO(),
+				types.NamespacedName{Name: "reloaders.lib.projectsveltos.io"}, reloaderCRD)
+		}, timeout, pollingInterval).Should(BeNil())
+	})
+
+	It("deployReloaderReportCRD deploys ReloaderReport CRD", func() {
+		cluster := prepareCluster()
+
+		Expect(controllers.DeployReloaderReportCRD(context.TODO(), cluster.Namespace, cluster.Name, randomString(),
+			libsveltosv1beta1.ClusterTypeCapi, false, logger)).To(Succeed())
+
+		// Eventual loop so testEnv Cache is synced
+		Eventually(func() error {
+			reloaderReportCRD := &apiextensionsv1.CustomResourceDefinition{}
+			return testEnv.Get(context.TODO(),
+				types.NamespacedName{Name: "reloaderreports.lib.projectsveltos.io"}, reloaderReportCRD)
+		}, timeout, pollingInterval).Should(BeNil())
+	})
+
+	It("deployClassifierInstance creates Classifier instance", func() {
+		c := fake.NewClientBuilder().WithScheme(scheme).Build()
+
+		classifier := getClassifierInstance(randomString())
+		Expect(controllers.DeployClassifierInstance(ctx, c, randomString(), randomString(),
+			classifier, false, logger)).To(Succeed())
+
+		currentClassifier := &libsveltosv1beta1.Classifier{}
+		Expect(c.Get(context.TODO(), types.NamespacedName{Name: classifier.Name}, currentClassifier)).To(Succeed())
+	})
+
+	It("deployClassifierInstance updates Classifier instance", func() {
+		classifier := getClassifierInstance(randomString())
+
+		initObjects := []client.Object{
+			classifier,
+		}
+
+		c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(initObjects...).
+			WithObjects(initObjects...).Build()
+
+		classifier.Spec.ClassifierLabels = []libsveltosv1beta1.ClassifierLabel{{Key: randomString(), Value: randomString()}}
+		Expect(controllers.DeployClassifierInstance(ctx, c, randomString(), randomString(), classifier,
+			false, logger)).To(Succeed())
+
+		currentClassifier := &libsveltosv1beta1.Classifier{}
+		Expect(c.Get(context.TODO(), types.NamespacedName{Name: classifier.Name}, currentClassifier)).To(Succeed())
+		Expect(reflect.DeepEqual(currentClassifier.Spec, classifier.Spec)).To(BeTrue())
+	})
+
+	It("deployClassifierInCluster deploys Classifier CRD and instance in remote cluster", func() {
+		cluster := prepareCluster()
+		classifier := getClassifierInstance(randomString())
+
+		Expect(testEnv.Create(context.TODO(), classifier))
+
+		// Just verify result is success (testEnv is used to simulate both management and workload cluster and because
+		// classifier is expected in the management cluster, above line is required
+		Expect(controllers.DeployClassifierInCluster(context.TODO(), testEnv.Client, cluster.Namespace, cluster.Name,
+			classifier.Name, libsveltosv1beta1.FeatureClassifier, libsveltosv1beta1.ClusterTypeCapi, deployer.Options{},
+			logger)).To(Succeed())
+
+		// Eventual loop so testEnv Cache is synced
+		Eventually(func() error {
+			classifierCRD := &apiextensionsv1.CustomResourceDefinition{}
+			return testEnv.Get(context.TODO(),
+				types.NamespacedName{Name: classifierCRDName}, classifierCRD)
+		}, timeout, pollingInterval).Should(BeNil())
+	})
+
+	It("processClassifier detects classifier needs to be deployed in cluster", func() {
+		dep := fakedeployer.GetClient(context.TODO(), logger, testEnv.Client)
+		Expect(dep.RegisterFeatureID(libsveltosv1beta1.FeatureClassifier)).To(Succeed())
+
+		classifierReconciler := getClassifierReconciler(testEnv.Client, dep)
+		classifier := getClassifierInstance(randomString())
+		classifierScope := getClassifierScope(testEnv.Client, logger, classifier)
+
+		cluster := prepareCluster()
+
+		f := controllers.GetHandlersForFeature(libsveltosv1beta1.FeatureClassifier)
+		clusterInfo, err := controllers.ProcessClassifier(classifierReconciler, context.TODO(), classifierScope, "",
+			getClusterRef(cluster), f, logger)
+		Expect(err).To(BeNil())
+		Expect(clusterInfo).ToNot(BeNil())
+		Expect(clusterInfo.Status).To(Equal(libsveltosv1beta1.SveltosStatusProvisioning))
+	})
+
+	It("processClassifier detects classifier does not need to be deployed in cluster", func() {
+		dep := fakedeployer.GetClient(context.TODO(),
+			logger, testEnv.Client)
+		Expect(dep.RegisterFeatureID(libsveltosv1beta1.FeatureClassifier)).To(Succeed())
+
+		cluster := prepareCluster()
+
+		classifierReconciler := getClassifierReconciler(testEnv.Client, dep)
+		classifier := getClassifierInstance(randomString())
+
+		// Following are needed to make ProcessClassifier think all that is needed is already deployed
+		// Deploy Classifier CRD
+		Expect(controllers.DeployClassifierCRD(context.TODO(), cluster.Namespace, cluster.Name, classifier.Name,
+			libsveltosv1beta1.ClusterTypeCapi, false, logger)).To(Succeed())
+		// Deploy Classifier instance
+		Expect(controllers.DeployClassifierInstance(ctx, testEnv, cluster.Namespace, cluster.Name, classifier,
+			false, logger)).To(Succeed())
+
+		Expect(waitForObject(context.TODO(), testEnv.Client, classifier)).To(Succeed())
+
+		hash := controllers.ClassifierHash(classifier)
+
+		// Create a ClassifierReport for the cluster carrying the current hash and provisioned status
+		// so that processClassifier detects the configuration is already deployed.
+		clusterType := libsveltosv1beta1.ClusterTypeCapi
+		reportName := libsveltosv1beta1.GetClassifierReportName(classifier.Name, cluster.Name, &clusterType)
+		provisioned := libsveltosv1beta1.SveltosStatusProvisioned
+		classifierReport := &libsveltosv1beta1.ClassifierReport{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: cluster.Namespace,
+				Name:      reportName,
+				Labels: libsveltosv1beta1.GetClassifierReportLabels(
+					classifier.Name, cluster.Name, &clusterType),
+			},
+			Spec: libsveltosv1beta1.ClassifierReportSpec{
+				ClusterNamespace: cluster.Namespace,
+				ClusterName:      cluster.Name,
+				ClusterType:      clusterType,
+				ClassifierName:   classifier.Name,
+			},
+		}
+		Expect(testEnv.Create(context.TODO(), classifierReport)).To(Succeed())
+		Expect(waitForObject(context.TODO(), testEnv.Client, classifierReport)).To(Succeed())
+
+		Expect(testEnv.Get(context.TODO(),
+			types.NamespacedName{Namespace: cluster.Namespace, Name: reportName}, classifierReport)).To(Succeed())
+		classifierReport.Status.Hash = hash
+		classifierReport.Status.DeploymentStatus = &provisioned
+		Expect(testEnv.Status().Update(context.TODO(), classifierReport)).To(Succeed())
+
+		Eventually(func() bool {
+			r := &libsveltosv1beta1.ClassifierReport{}
+			if err := testEnv.Get(context.TODO(),
+				types.NamespacedName{Namespace: cluster.Namespace, Name: reportName}, r); err != nil {
+				return false
+			}
+			return r.Status.DeploymentStatus != nil &&
+				*r.Status.DeploymentStatus == libsveltosv1beta1.SveltosStatusProvisioned
+		}, timeout, pollingInterval).Should(BeTrue())
+
+		classifierScope := getClassifierScope(testEnv.Client, logger, classifier)
+
+		f := controllers.GetHandlersForFeature(libsveltosv1beta1.FeatureClassifier)
+		clusterInfo, err := controllers.ProcessClassifier(classifierReconciler, context.TODO(), classifierScope, "",
+			getClusterRef(cluster), f, logger)
+		Expect(err).To(BeNil())
+		Expect(clusterInfo).ToNot(BeNil())
+		Expect(clusterInfo.Status).To(Equal(libsveltosv1beta1.SveltosStatusProvisioned))
+	})
+
+	It("removeClassifier queue job to remove Classifier from Cluster", func() {
+		dep := fakedeployer.GetClient(context.TODO(), logger, testEnv.Client)
+		Expect(dep.RegisterFeatureID(libsveltosv1beta1.FeatureClassifier)).To(Succeed())
+
+		classifierReconciler := getClassifierReconciler(testEnv.Client, dep)
+		classifier := getClassifierInstance(randomString())
+		classifierScope := getClassifierScope(testEnv.Client, logger, classifier)
+
+		cluster := prepareCluster()
+		Expect(testEnv.Create(context.TODO(), classifier)).To(Succeed())
+
+		Expect(waitForObject(context.TODO(), testEnv.Client, classifier)).To(Succeed())
+
+		f := controllers.GetHandlersForFeature(libsveltosv1beta1.FeatureClassifier)
+		removed, err := controllers.RemoveClassifier(classifierReconciler, context.TODO(), classifierScope,
+			getClusterRef(cluster), f, logger)
+		Expect(removed).To(BeFalse())
+		Expect(err).ToNot(BeNil())
+		Expect(err.Error()).To(Equal("cleanup request is queued"))
+
+		key := deployer.GetKey(cluster.Namespace, cluster.Name,
+			classifier.Name, libsveltosv1beta1.FeatureClassifier, libsveltosv1beta1.ClusterTypeCapi, true)
+		Expect(dep.IsKeyInProgress(key)).To(BeTrue())
+	})
+
+	It("undeployClassifierFromCluster does not remove the Classifier when the cluster is the management cluster", func() {
+		dep := fakedeployer.GetClient(context.TODO(), logger, testEnv.Client)
+		Expect(dep.RegisterFeatureID(libsveltosv1beta1.FeatureClassifier)).To(Succeed())
+
+		classifier := getClassifierInstance(randomString())
+		classifier.Finalizers = []string{libsveltosv1beta1.ClassifierFinalizer}
+
+		// prepareCluster registers testEnv, the cluster the Classifier is created in, as the managed cluster
+		cluster := prepareCluster()
+		Expect(testEnv.Create(context.TODO(), classifier)).To(Succeed())
+
+		Expect(waitForObject(context.TODO(), testEnv.Client, classifier)).To(Succeed())
+
+		err := controllers.UndeployClassifierFromCluster(context.TODO(), testEnv, cluster.Namespace, cluster.Name,
+			classifier.Name, libsveltosv1beta1.FeatureClassifier, libsveltosv1beta1.ClusterTypeCapi,
+			deployer.Options{}, logger)
+		Expect(err).To(BeNil())
+
+		verifyClassifierIsUntouched(classifier.Name)
+		removeFinalizersAndDeleteClassifier(classifier.Name)
+	})
+
+	It("removeClassifierInstance leaves the Classifier alone when the instance is the Classifier itself", func() {
+		classifier := getClassifierInstance(randomString())
+		classifier.Finalizers = []string{libsveltosv1beta1.ClassifierFinalizer}
+		Expect(testEnv.Create(context.TODO(), classifier)).To(Succeed())
+		Expect(waitForObject(context.TODO(), testEnv.Client, classifier)).To(Succeed())
+
+		// Management cluster and managed cluster are the same cluster, so the instance is the Classifier
+		Expect(controllers.RemoveClassifierInstance(context.TODO(), testEnv, testEnv, classifier, logger)).To(Succeed())
+
+		verifyClassifierIsUntouched(classifier.Name)
+		removeFinalizersAndDeleteClassifier(classifier.Name)
+	})
+
+	It("removeClassifierInstance removes the legacy finalizer and deletes the instance of a managed cluster", func() {
+		const agentFinalizer = "sveltos-agent.projectsveltos.io/classifier"
+
+		instance := getClassifierInstance(randomString())
+		instance.Finalizers = []string{libsveltosv1beta1.ClassifierFinalizer, agentFinalizer}
+		Expect(testEnv.Create(context.TODO(), instance)).To(Succeed())
+		Expect(waitForObject(context.TODO(), testEnv.Client, instance)).To(Succeed())
+
+		// The Classifier in the management cluster is a different object from the instance in the managed cluster
+		classifier := getClassifierInstance(instance.Name)
+		classifier.UID = types.UID(randomString())
+		managementClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(classifier).Build()
+
+		Expect(controllers.RemoveClassifierInstance(context.TODO(), managementClient, testEnv, instance, logger)).To(Succeed())
+
+		// The finalizer of sveltos-agent is still there, so the instance is terminating
+		Eventually(func() bool {
+			currentInstance := &libsveltosv1beta1.Classifier{}
+			err := testEnv.Get(context.TODO(), types.NamespacedName{Name: instance.Name}, currentInstance)
+			if err != nil {
+				return false
+			}
+			return !currentInstance.DeletionTimestamp.IsZero() &&
+				!controllerutil.ContainsFinalizer(currentInstance, libsveltosv1beta1.ClassifierFinalizer) &&
+				controllerutil.ContainsFinalizer(currentInstance, agentFinalizer)
+		}, timeout, pollingInterval).Should(BeTrue())
+
+		removeFinalizersAndDeleteClassifier(instance.Name)
+	})
+
+	It("undeployClassifier queues a job to remove classifier from cluster", func() {
+		dep := fakedeployer.GetClient(context.TODO(), logger, testEnv.Client)
+		Expect(dep.RegisterFeatureID(libsveltosv1beta1.FeatureClassifier)).To(Succeed())
+		classifierReconciler := getClassifierReconciler(testEnv.Client, dep)
+
+		classifier := getClassifierInstance(randomString())
+
+		cluster := prepareCluster()
+
+		Expect(testEnv.Create(context.TODO(), classifier)).To(Succeed())
+
+		Expect(waitForObject(context.TODO(), testEnv.Client, classifier)).To(Succeed())
+
+		// Create a ClassifierReport for the cluster so undeployClassifier finds it and queues removal.
+		clusterType := libsveltosv1beta1.ClusterTypeCapi
+		reportName := libsveltosv1beta1.GetClassifierReportName(classifier.Name, cluster.Name, &clusterType)
+		classifierReport := &libsveltosv1beta1.ClassifierReport{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: cluster.Namespace,
+				Name:      reportName,
+				Labels: libsveltosv1beta1.GetClassifierReportLabels(
+					classifier.Name, cluster.Name, &clusterType),
+			},
+			Spec: libsveltosv1beta1.ClassifierReportSpec{
+				ClusterNamespace: cluster.Namespace,
+				ClusterName:      cluster.Name,
+				ClusterType:      clusterType,
+				ClassifierName:   classifier.Name,
+			},
+		}
+		Expect(testEnv.Create(context.TODO(), classifierReport)).To(Succeed())
+		Expect(waitForObject(context.TODO(), testEnv.Client, classifierReport)).To(Succeed())
+
+		currentClassifier := &libsveltosv1beta1.Classifier{}
+		Expect(testEnv.Get(context.TODO(), types.NamespacedName{Name: classifier.Name},
+			currentClassifier)).To(Succeed())
+
+		classifierScope := getClassifierScope(testEnv.Client, logger, currentClassifier)
+
+		f := controllers.GetHandlersForFeature(libsveltosv1beta1.FeatureClassifier)
+		err := controllers.UndeployClassifier(classifierReconciler, context.TODO(), classifierScope, f, logger)
+		Expect(err).ToNot(BeNil())
+		Expect(err.Error()).To(Equal("still in the process of removing Classifier from 1 clusters"))
+
+		key := deployer.GetKey(cluster.Namespace, cluster.Name,
+			classifier.Name, libsveltosv1beta1.FeatureClassifier, libsveltosv1beta1.ClusterTypeCapi, true)
+		Expect(dep.IsKeyInProgress(key)).To(BeTrue())
+	})
+
+	It("undeployClassifier does not queue a job for a cluster whose ClassifierReport says the Classifier was removed", func() {
+		dep := fakedeployer.GetClient(context.TODO(), logger, testEnv.Client)
+		Expect(dep.RegisterFeatureID(libsveltosv1beta1.FeatureClassifier)).To(Succeed())
+		classifierReconciler := getClassifierReconciler(testEnv.Client, dep)
+
+		classifier := createClassifier(getClassifierInstance(randomString()))
+		cluster := prepareCluster()
+		removed := libsveltosv1beta1.SveltosStatusRemoved
+		report := createClassifierReport(classifier, cluster, &removed)
+
+		classifierScope := getClassifierScope(testEnv.Client, logger, classifier)
+		f := controllers.GetHandlersForFeature(libsveltosv1beta1.FeatureClassifier)
+		Expect(controllers.UndeployClassifier(classifierReconciler, context.TODO(), classifierScope, f, logger)).To(Succeed())
+
+		key := deployer.GetKey(cluster.Namespace, cluster.Name,
+			classifier.Name, libsveltosv1beta1.FeatureClassifier, libsveltosv1beta1.ClusterTypeCapi, true)
+		Expect(dep.IsKeyInProgress(key)).To(BeFalse())
+
+		// The report is left alone: removeClassifierReports deletes it once all the clusters are done
+		currentReport := &libsveltosv1beta1.ClassifierReport{}
+		Expect(testEnv.Get(context.TODO(), client.ObjectKeyFromObject(report), currentReport)).To(Succeed())
+	})
+
+	It("undeployClassifier records in the ClassifierReport the Classifier was removed from the cluster", func() {
+		dep := &removedDeployer{DeployerInterface: fakedeployer.GetClient(context.TODO(), logger, testEnv.Client)}
+		classifierReconciler := getClassifierReconciler(testEnv.Client, dep)
+
+		classifier := createClassifier(getClassifierInstance(randomString()))
+		cluster := prepareCluster()
+		report := createClassifierReport(classifier, cluster, nil)
+
+		classifierScope := getClassifierScope(testEnv.Client, logger, classifier)
+		f := controllers.GetHandlersForFeature(libsveltosv1beta1.FeatureClassifier)
+		Expect(controllers.UndeployClassifier(classifierReconciler, context.TODO(), classifierScope, f, logger)).To(Succeed())
+
+		// Eventual loop so testEnv Cache is synced
+		Eventually(func() bool {
+			currentReport := &libsveltosv1beta1.ClassifierReport{}
+			err := testEnv.Get(context.TODO(), client.ObjectKeyFromObject(report), currentReport)
+			if err != nil {
+				return false
+			}
+			return currentReport.Status.DeploymentStatus != nil &&
+				*currentReport.Status.DeploymentStatus == libsveltosv1beta1.SveltosStatusRemoved
+		}, timeout, pollingInterval).Should(BeTrue())
+	})
+
+	It("undeployClassifier does not record the Classifier as removed from a paused cluster", func() {
+		dep := &removedDeployer{DeployerInterface: fakedeployer.GetClient(context.TODO(), logger, testEnv.Client)}
+		classifierReconciler := getClassifierReconciler(testEnv.Client, dep)
+
+		classifier := getClassifierInstance(randomString())
+		classifier.Annotations = map[string]string{clusterv1.PausedAnnotation: ""}
+		classifier = createClassifier(classifier)
+		cluster := prepareCluster()
+		report := createClassifierReport(classifier, cluster, nil)
+
+		classifierScope := getClassifierScope(testEnv.Client, logger, classifier)
+		f := controllers.GetHandlersForFeature(libsveltosv1beta1.FeatureClassifier)
+		Expect(controllers.UndeployClassifier(classifierReconciler, context.TODO(), classifierScope, f, logger)).To(Succeed())
+
+		Consistently(func() bool {
+			currentReport := &libsveltosv1beta1.ClassifierReport{}
+			Expect(testEnv.Get(context.TODO(), client.ObjectKeyFromObject(report), currentReport)).To(Succeed())
+			return currentReport.Status.DeploymentStatus == nil
+		}, 3*time.Second, time.Second).Should(BeTrue())
+	})
+
+	It("undeployClassifier does not queue a job for a push mode cluster when sveltos-agent runs in the management cluster",
+		func() {
+			sveltosCluster, classifier, c := prepareAgentlessUndeploy(false)
+			dep := fakedeployer.GetClient(context.TODO(), logger, c)
+			Expect(dep.RegisterFeatureID(libsveltosv1beta1.FeatureClassifier)).To(Succeed())
+			classifierReconciler := getClassifierReconciler(c, dep)
+			classifierReconciler.AgentInMgmtCluster = true
+
+			classifierScope := getClassifierScope(c, logger, classifier)
+			f := controllers.GetHandlersForFeature(libsveltosv1beta1.FeatureClassifier)
+			Expect(controllers.UndeployClassifier(classifierReconciler, context.TODO(), classifierScope, f,
+				logger)).To(Succeed())
+
+			key := deployer.GetKey(sveltosCluster.Namespace, sveltosCluster.Name,
+				classifier.Name, libsveltosv1beta1.FeatureClassifier, libsveltosv1beta1.ClusterTypeSveltos, true)
+			Expect(dep.IsKeyInProgress(key)).To(BeFalse())
+		})
+
+	It("undeployClassifier queues a job for a pull mode cluster when sveltos-agent runs in the management cluster",
+		func() {
+			sveltosCluster, classifier, c := prepareAgentlessUndeploy(true)
+			dep := fakedeployer.GetClient(context.TODO(), logger, c)
+			Expect(dep.RegisterFeatureID(libsveltosv1beta1.FeatureClassifier)).To(Succeed())
+			classifierReconciler := getClassifierReconciler(c, dep)
+			classifierReconciler.AgentInMgmtCluster = true
+
+			classifierScope := getClassifierScope(c, logger, classifier)
+			f := controllers.GetHandlersForFeature(libsveltosv1beta1.FeatureClassifier)
+			err := controllers.UndeployClassifier(classifierReconciler, context.TODO(), classifierScope, f, logger)
+			Expect(err).ToNot(BeNil())
+			Expect(err.Error()).To(Equal("still in the process of removing Classifier from 1 clusters"))
+
+			key := deployer.GetKey(sveltosCluster.Namespace, sveltosCluster.Name,
+				classifier.Name, libsveltosv1beta1.FeatureClassifier, libsveltosv1beta1.ClusterTypeSveltos, true)
+			Expect(dep.IsKeyInProgress(key)).To(BeTrue())
+		})
+
+	It("deploySveltosAgent deploys sveltos agent", func() {
+		watchNamespaces := []string{watchNamespaceNs1, watchNamespaceNs2}
+		Expect(controllers.DeploySveltosAgentInManagedCluster(ctx, testEnv.Config, randomString(), randomString(),
+			randomString(), "do-not-send-reports", libsveltosv1beta1.ClusterTypeCapi, nil, false,
+			watchNamespaces, logger)).To(Succeed())
+
+		// Eventual loop so testEnv Cache is synced
+		currentSveltosAgent := &appsv1.Deployment{}
+		Eventually(func() error {
+			return testEnv.Get(context.TODO(),
+				types.NamespacedName{Namespace: sveltosNamespace, Name: "sveltos-agent-manager"},
+				currentSveltosAgent)
+		}, timeout, pollingInterval).Should(BeNil())
+
+		Expect(currentSveltosAgent.Spec.Template.Spec.Containers).ToNot(BeEmpty())
+		Expect(currentSveltosAgent.Spec.Template.Spec.Containers[0].Args).To(
+			ContainElement("--watch-namespaces=ns1,ns2"))
+	})
+
+	It("prepareSveltosApplierYAML relays watch-namespaces into the sveltos-applier manifest", func() {
+		agentYAML := `- --cluster-namespace=
+- --cluster-name=
+- --cluster-type=
+- --secret-with-kubeconfig=
+- --watch-namespaces=`
+
+		clusterNamespace := randomString()
+		clusterName := randomString()
+		watchNamespaces := []string{watchNamespaceNs1, watchNamespaceNs2}
+
+		result := controllers.PrepareSveltosApplierYAML(agentYAML, clusterNamespace, clusterName,
+			libsveltosv1beta1.ClusterTypeCapi, watchNamespaces)
+
+		Expect(result).To(ContainSubstring("--watch-namespaces=ns1,ns2"))
+		Expect(result).To(ContainSubstring(fmt.Sprintf("--cluster-namespace=%s", clusterNamespace)))
+		Expect(result).To(ContainSubstring(fmt.Sprintf("--cluster-name=%s", clusterName)))
+	})
+
+	It("prepareSveltosApplierYAML leaves watch-namespaces empty when no namespaces are configured", func() {
+		agentYAML := `- --watch-namespaces=`
+
+		result := controllers.PrepareSveltosApplierYAML(agentYAML, randomString(), randomString(),
+			libsveltosv1beta1.ClusterTypeCapi, nil)
+
+		Expect(result).To(Equal(agentYAML))
+	})
+
+	It("createAccessRequest creates AccessRequest instance", func() {
+		classifier := getClassifierInstance(randomString())
+
+		clusterNamespace := randomString()
+		clusterName := randomString()
+
+		ns := &corev1.Namespace{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: clusterNamespace,
+			},
+		}
+
+		initObjects := []client.Object{classifier, ns}
+
+		options := deployer.Options{
+			HandlerOptions: map[string]any{controllers.Controlplaneendpoint: "http://192.168.10.1:443"},
+		}
+
+		c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(initObjects...).
+			WithObjects(initObjects...).Build()
+		Expect(controllers.CreateAccessRequest(ctx, c, clusterNamespace, clusterName, libsveltosv1beta1.ClusterTypeCapi,
+			options)).To(Succeed())
+
+		accessRequest := &libsveltosv1beta1.AccessRequest{}
+		Expect(c.Get(context.TODO(),
+			types.NamespacedName{
+				Namespace: clusterNamespace,
+				Name:      controllers.GetAccessRequestName(clusterName, libsveltosv1beta1.ClusterTypeCapi),
+			},
+			accessRequest)).To(Succeed())
+	})
+
+	It("getKubeconfigFromAccessRequest returns Kubeconfig contained in the AccessRequest Secret", func() {
+		classifier := getClassifierInstance(randomString())
+
+		clusterNamespace := randomString()
+		clusterName := randomString()
+
+		ns := &corev1.Namespace{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: clusterNamespace,
+			},
+		}
+
+		kubeconfig := []byte(randomString())
+		secret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: randomString(),
+				Name:      randomString(),
+			},
+			Data: map[string][]byte{
+				"kubeconfig": kubeconfig,
+			},
+		}
+
+		accessRequest := libsveltosv1beta1.AccessRequest{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      controllers.GetAccessRequestName(clusterName, libsveltosv1beta1.ClusterTypeCapi),
+				Namespace: clusterNamespace,
+			},
+			Status: libsveltosv1beta1.AccessRequestStatus{
+				SecretRef: &corev1.ObjectReference{
+					Namespace: secret.Namespace,
+					Name:      secret.Name,
+				},
+			},
+		}
+
+		initObjects := []client.Object{classifier, secret, ns, &accessRequest}
+
+		c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(initObjects...).
+			WithObjects(initObjects...).Build()
+		currentKubeconfig, err := controllers.GetKubeconfigFromAccessRequest(context.TODO(), c,
+			clusterNamespace, clusterName, libsveltosv1beta1.ClusterTypeCapi, logger)
+		Expect(err).To(BeNil())
+		Expect(currentKubeconfig).ToNot(BeNil())
+		Expect(reflect.DeepEqual(currentKubeconfig, kubeconfig)).To(BeTrue())
+	})
+
+	It("updateSecretWithAccessManagementKubeconfig creates a secret containing kubeconfig to access management cluster", func() {
+		classifier := getClassifierInstance(randomString())
+		Expect(testEnv.Create(context.TODO(), classifier)).To(Succeed())
+		Expect(waitForObject(context.TODO(), testEnv.Client, classifier)).To(Succeed())
+
+		kubeconfig := []byte(randomString())
+
+		cluster := prepareCluster()
+
+		Expect(controllers.UpdateSecretWithAccessManagementKubeconfig(context.TODO(), testEnv.Client, cluster.Namespace, cluster.Name,
+			classifier.Name, libsveltosv1beta1.ClusterTypeCapi, kubeconfig, logger)).To(BeNil())
+
+		Eventually(func() bool {
+			secret := &corev1.Secret{}
+			err := testEnv.Get(context.TODO(),
+				types.NamespacedName{Namespace: sveltosNamespace, Name: libsveltosv1beta1.ClassifierSecretName},
+				secret)
+			return err == nil
+		}, timeout, pollingInterval).Should(BeTrue())
+	})
+
+	It("deploy/remove SveltosAgent resources to/from management cluster", func() {
+		clusterNamespace := randomString()
+		clusterName := randomString()
+		clusterType := libsveltosv1beta1.ClusterTypeSveltos
+
+		// The version ConfigMap is created in clusterNamespace itself (matching a real CAPI/Sveltos
+		// cluster's namespace), so - unlike the rest of this test, which never touches clusterNamespace
+		// as a real object - it needs to actually exist for that Create to pass namespace admission.
+		ns := &corev1.Namespace{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: clusterNamespace,
+			},
+		}
+		Expect(testEnv.Create(context.TODO(), ns)).To(Succeed())
+		Expect(waitForObject(context.TODO(), testEnv.Client, ns)).To(Succeed())
+
+		_, err := keymanager.GetKeyManagerInstance(context.TODO(), testEnv.Client)
+		Expect(err).To(BeNil())
+
+		watchNamespaces := []string{watchNamespaceNs1, watchNamespaceNs2}
+		Expect(controllers.DeploySveltosAgentInManagementCluster(context.TODO(), testEnv.Config,
+			testEnv.Client, clusterNamespace, clusterName, randomString(), "", clusterType, nil,
+			watchNamespaces, logger)).To(Succeed())
+
+		expectedLabels := controllers.GetSveltosAgentLabels(clusterNamespace, clusterName, clusterType)
+
+		listOptions := []client.ListOption{
+			client.InNamespace(controllers.GetSveltosAgentNamespace(sveltosNamespace)),
+		}
+		var matchingDeployment *appsv1.Deployment
+		Eventually(func() bool {
+			deployments := &appsv1.DeploymentList{}
+			err := testEnv.List(context.TODO(), deployments, listOptions...)
+			if err != nil {
+				return false
+			}
+
+			if len(deployments.Items) == 0 {
+				return false
+			}
+
+			for i := range deployments.Items {
+				d := &deployments.Items[i]
+				if verifyLabels(d.Labels, expectedLabels) {
+					matchingDeployment = d
+					return true
+				}
+			}
+			return false
+		}, timeout, pollingInterval).Should(BeTrue())
+
+		Expect(matchingDeployment.Spec.Template.Spec.Containers).ToNot(BeEmpty())
+		Expect(matchingDeployment.Spec.Template.Spec.Containers[0].Args).To(
+			ContainElement("--watch-namespaces=ns1,ns2"))
+
+		Expect(sveltos_upgrade.StoreSveltosAgentVersion(context.TODO(), testEnv.Client, sveltosNamespace, "v1.0.0",
+			clusterNamespace, clusterName, clusterType, true, logger)).To(Succeed())
+
+		var versionConfigMap corev1.ConfigMap
+		Eventually(func() bool {
+			versionConfigMaps := &corev1.ConfigMapList{}
+			err := testEnv.List(context.TODO(), versionConfigMaps, client.InNamespace(clusterNamespace), client.MatchingLabels{
+				sveltos_upgrade.ClusterNameLabel: clusterName,
+				sveltos_upgrade.ClusterTypeLabel: strings.ToLower(string(clusterType)),
+			})
+			if err != nil || len(versionConfigMaps.Items) != 1 {
+				return false
+			}
+			versionConfigMap = versionConfigMaps.Items[0]
+			return true
+		}, timeout, pollingInterval).Should(BeTrue())
+
+		Expect(controllers.RemoveSveltosAgentFromManagementCluster(context.TODO(), clusterNamespace, clusterName,
+			clusterType, logger)).To(Succeed())
+
+		// Verify resources are gone
+		Eventually(func() bool {
+			deployments := &appsv1.DeploymentList{}
+			err := testEnv.List(context.TODO(), deployments, listOptions...)
+			if err != nil {
+				return false
+			}
+			for i := range deployments.Items {
+				d := &deployments.Items[i]
+				if verifyLabels(d.Labels, expectedLabels) {
+					return false
+				}
+			}
+			return true
+		}, timeout, pollingInterval).Should(BeTrue())
+
+		Eventually(func() bool {
+			err := testEnv.Get(context.TODO(),
+				types.NamespacedName{Namespace: versionConfigMap.Namespace, Name: versionConfigMap.Name},
+				&corev1.ConfigMap{})
+			return apierrors.IsNotFound(err)
+		}, timeout, pollingInterval).Should(BeTrue())
+	})
+
+	It("getSveltosAgentPatches reads post render patches from ConfigMap", func() {
+		sveltosCluster := &libsveltosv1beta1.SveltosCluster{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: randomString(),
+				Name:      upstreamClusterNamePrefix + randomString(),
+			},
+		}
+
+		cmYAML := fmt.Sprintf(`apiVersion: v1
+data:
+  deployment-patch: |-
+      patch: |-
+        - op: replace
+          path: /spec/template/spec/containers/0/resources/requests/cpu
+          value: 500m
+        - op: replace
+          path: /spec/template/spec/containers/0/resources/requests/memory
+          value: 512Mi
+        - op: replace
+          path: /spec/template/spec/containers/0/resources/limits/cpu
+          value: 500m
+        - op: replace
+          path: /spec/template/spec/containers/0/resources/limits/memory
+          value: 1024Mi
+      target:
+        kind: Deployment
+        name: sveltos-agent-manager
+        namespace: %s
+  clusterrole-patch: |-
+      patch: |-
+        - op: remove
+          path: /rules
+      target:
+        kind: ClusterRole
+        name: sveltos-agent-manager-role
+kind: ConfigMap
+metadata:
+  name: sveltos-agent-config
+  namespace: %s`, sveltosNamespace, sveltosNamespace)
+
+		cm, err := deployer.GetUnstructured([]byte(cmYAML), logger)
+		Expect(err).To(BeNil())
+
+		initObjects := []client.Object{sveltosCluster}
+		for i := range cm {
+			initObjects = append(initObjects, cm[i])
+		}
+
+		c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(initObjects...).Build()
+
+		controllers.SetSveltosAgentConfigMap("sveltos-agent-config")
+		patches, err := controllers.GetSveltosAgentPatches(context.TODO(), c, sveltosCluster.Namespace,
+			sveltosCluster.Name, libsveltosv1beta1.ClusterTypeSveltos, logger)
+		Expect(err).To(BeNil())
+		Expect(len(patches)).To(Equal(2))
+		controllers.SetSveltosAgentConfigMap("")
+
+		verifyPatches(patches)
+	})
+
+	It("getSveltosAgentPatches supports mixing legacy and structured patches in the same ConfigMap", func() {
+		sveltosCluster := &libsveltosv1beta1.SveltosCluster{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: randomString(),
+				Name:      upstreamClusterNamePrefix + randomString(),
+			},
+		}
+
+		cmYAML := fmt.Sprintf(`apiVersion: v1
+data:
+  legacy-patch: |-
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: sveltos-agent-manager
+  structured-patch: |-
+    patch: |-
+      - op: add
+        path: /spec/template/spec/imagePullSecrets
+        value:
+        - name: registry-pull-secret
+kind: ConfigMap
+metadata:
+  name: sveltos-agent-config-mixed
+  namespace: %s`, sveltosNamespace)
+
+		cm, err := deployer.GetUnstructured([]byte(cmYAML), logger)
+		Expect(err).To(BeNil())
+
+		initObjects := []client.Object{sveltosCluster}
+		for i := range cm {
+			initObjects = append(initObjects, cm[i])
+		}
+
+		c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(initObjects...).Build()
+
+		controllers.SetSveltosAgentConfigMap("sveltos-agent-config-mixed")
+		patches, err := controllers.GetSveltosAgentPatches(context.TODO(), c, sveltosCluster.Namespace,
+			sveltosCluster.Name, libsveltosv1beta1.ClusterTypeSveltos, logger)
+		Expect(err).To(BeNil())
+		Expect(len(patches)).To(Equal(2))
+		controllers.SetSveltosAgentConfigMap("")
+
+		// Both entries default to targeting Deployment/apps since neither ConfigMap key
+		// specifies a target.
+		for i := range patches {
+			Expect(patches[i].Target).ToNot(BeNil())
+			Expect(patches[i].Target.Kind).To(Equal("Deployment"))
+		}
+
+		// The structured entry must remain structured: its Patch field is the JSON6902
+		// document as-is, not re-wrapped in another "patch:" key.
+		foundStructured := false
+		for i := range patches {
+			if strings.Contains(patches[i].Patch, "op: add") {
+				foundStructured = true
+				Expect(patches[i].Patch).ToNot(ContainSubstring("patch: |-"))
+			}
+		}
+		Expect(foundStructured).To(BeTrue())
+
+		// The legacy entry must still be carried verbatim as the raw patch content.
+		foundLegacy := false
+		for i := range patches {
+			if strings.Contains(patches[i].Patch, "kind: Deployment") {
+				foundLegacy = true
+			}
+		}
+		Expect(foundLegacy).To(BeTrue())
+	})
+
+	It("getSveltosApplierPatches reads post render patches from ConfigMap", func() {
+		sveltosCluster := &libsveltosv1beta1.SveltosCluster{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: randomString(),
+				Name:      upstreamClusterNamePrefix + randomString(),
+			},
+		}
+
+		cmYAML := fmt.Sprintf(`apiVersion: v1
+data:
+  deployment-patch: |-
+      patch: |-
+        - op: replace
+          path: /spec/template/spec/containers/0/resources/requests/cpu
+          value: 500m
+        - op: replace
+          path: /spec/template/spec/containers/0/resources/requests/memory
+          value: 512Mi
+      target:
+        kind: Deployment
+        name: sveltos-applier-manager
+        namespace: %s
+  clusterrole-patch: |-
+      patch: |-
+        - op: remove
+          path: /rules
+      target:
+        kind: ClusterRole
+        name: sveltos-applier-manager-role
+kind: ConfigMap
+metadata:
+  name: sveltos-applier-config
+  namespace: %s`, sveltosNamespace, sveltosNamespace)
+
+		cm, err := deployer.GetUnstructured([]byte(cmYAML), logger)
+		Expect(err).To(BeNil())
+
+		initObjects := []client.Object{sveltosCluster}
+		for i := range cm {
+			initObjects = append(initObjects, cm[i])
+		}
+
+		c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(initObjects...).Build()
+
+		controllers.SetSveltosApplierConfigMap("sveltos-applier-config")
+		patches, err := controllers.GetSveltosApplierPatches(context.TODO(), c, sveltosCluster.Namespace,
+			sveltosCluster.Name, libsveltosv1beta1.ClusterTypeSveltos, logger)
+		Expect(err).To(BeNil())
+		Expect(len(patches)).To(Equal(2))
+		controllers.SetSveltosApplierConfigMap("")
+
+		verifyPatches(patches)
+	})
+
+	It("getSveltosAgentPatches reads post render patches from per cluster ConfigMap", func() {
+		configMapNamespace := randomString()
+		configMapName := randomString()
+		sveltosCluster := &libsveltosv1beta1.SveltosCluster{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: randomString(),
+				Name:      upstreamClusterNamePrefix + randomString(),
+				Annotations: map[string]string{
+					"sveltosagent.projectsveltos.io/config-override-ref": fmt.Sprintf("%s/%s",
+						configMapNamespace, configMapName),
+				},
+			},
+		}
+
+		cmYAML := fmt.Sprintf(`apiVersion: v1
+data:
+  deployment-patch: |-
+      patch: |-
+        - op: replace
+          path: /spec/template/spec/containers/0/resources/requests/cpu
+          value: 100m
+        - op: replace
+          path: /spec/template/spec/containers/0/resources/requests/memory
+          value: 256Mi
+        - op: replace
+          path: /spec/template/spec/containers/0/resources/limits/cpu
+          value: 500m
+        - op: replace
+          path: /spec/template/spec/containers/0/resources/limits/memory
+          value: 1024Mi
+      target:
+        kind: Deployment
+        name: sveltos-agent-manager
+        namespace: %s
+  clusterrole-patch: |-
+      patch: |-
+        - op: remove
+          path: /rules
+      target:
+        kind: ClusterRole
+        name: sveltos-agent-manager-role
+kind: ConfigMap
+metadata:
+  name: %s
+  namespace: %s`, sveltosNamespace, configMapName, configMapNamespace)
+
+		cm, err := deployer.GetUnstructured([]byte(cmYAML), logger)
+		Expect(err).To(BeNil())
+
+		initObjects := []client.Object{sveltosCluster}
+		for i := range cm {
+			initObjects = append(initObjects, cm[i])
+		}
+
+		c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(initObjects...).Build()
+
+		controllers.SetSveltosAgentConfigMap("sveltos-agent-config")
+		patches, err := controllers.GetSveltosAgentPatches(context.TODO(), c, sveltosCluster.Namespace,
+			sveltosCluster.Name, libsveltosv1beta1.ClusterTypeSveltos, logger)
+		Expect(err).To(BeNil())
+		Expect(len(patches)).To(Equal(2))
+		controllers.SetSveltosAgentConfigMap("")
+
+		verifyPatches(patches)
+	})
+
+	It("getAgentWatchNamespaces reads and trims the comma-separated namespace list from the annotation", func() {
+		sveltosCluster := &libsveltosv1beta1.SveltosCluster{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: randomString(),
+				Name:      upstreamClusterNamePrefix + randomString(),
+				Annotations: map[string]string{
+					agentWatchNamespacesAnnotKey: " foo ,bar,, baz",
+				},
+			},
+		}
+
+		c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(sveltosCluster).Build()
+
+		namespaces, err := controllers.GetAgentWatchNamespaces(context.TODO(), c, sveltosCluster.Namespace,
+			sveltosCluster.Name, libsveltosv1beta1.ClusterTypeSveltos, logger)
+		Expect(err).To(BeNil())
+		Expect(namespaces).To(Equal([]string{"foo", "bar", "baz"}))
+	})
+
+	It("getAgentWatchNamespaces returns nil, not an error, when the annotation is absent", func() {
+		sveltosCluster := &libsveltosv1beta1.SveltosCluster{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: randomString(),
+				Name:      upstreamClusterNamePrefix + randomString(),
+			},
+		}
+
+		c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(sveltosCluster).Build()
+
+		namespaces, err := controllers.GetAgentWatchNamespaces(context.TODO(), c, sveltosCluster.Namespace,
+			sveltosCluster.Name, libsveltosv1beta1.ClusterTypeSveltos, logger)
+		Expect(err).To(BeNil())
+		Expect(namespaces).To(BeNil())
+	})
+
+	It("getAgentWatchNamespaces returns nil, not an error, when the annotation value is empty", func() {
+		sveltosCluster := &libsveltosv1beta1.SveltosCluster{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: randomString(),
+				Name:      upstreamClusterNamePrefix + randomString(),
+				Annotations: map[string]string{
+					agentWatchNamespacesAnnotKey: "",
+				},
+			},
+		}
+
+		c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(sveltosCluster).Build()
+
+		namespaces, err := controllers.GetAgentWatchNamespaces(context.TODO(), c, sveltosCluster.Namespace,
+			sveltosCluster.Name, libsveltosv1beta1.ClusterTypeSveltos, logger)
+		Expect(err).To(BeNil())
+		Expect(namespaces).To(BeNil())
+	})
+
+	It("getAgentWatchNamespaces returns nil, not an error, when the Cluster does not exist", func() {
+		c := fake.NewClientBuilder().WithScheme(scheme).Build()
+
+		namespaces, err := controllers.GetAgentWatchNamespaces(context.TODO(), c, randomString(),
+			upstreamClusterNamePrefix+randomString(), libsveltosv1beta1.ClusterTypeSveltos, logger)
+		Expect(err).To(BeNil())
+		Expect(namespaces).To(BeNil())
+	})
+
+	It("getSveltosApplierPatches reads post render patches from per cluster ConfigMap", func() {
+		configMapNamespace := randomString()
+		configMapName := randomString()
+		sveltosCluster := &libsveltosv1beta1.SveltosCluster{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: randomString(),
+				Name:      upstreamClusterNamePrefix + randomString(),
+				Annotations: map[string]string{
+					"sveltosapplier.projectsveltos.io/config-override-ref": fmt.Sprintf("%s/%s",
+						configMapNamespace, configMapName),
+				},
+			},
+		}
+
+		cmYAML := fmt.Sprintf(`apiVersion: v1
+data:
+  deployment-patch: |-
+      patch: |-
+        - op: replace
+          path: /spec/template/spec/containers/0/resources/requests/cpu
+          value: 500m
+        - op: replace
+          path: /spec/template/spec/containers/0/resources/requests/memory
+          value: 512Mi
+      target:
+        kind: Deployment
+        name: sveltos-applier-manager
+        namespace: %s
+  clusterrole-patch: |-
+      patch: |-
+        - op: remove
+          path: /rules
+      target:
+        kind: ClusterRole
+        name: sveltos-applier-manager-role
+kind: ConfigMap
+metadata:
+  name: %s
+  namespace: %s`, sveltosNamespace, configMapName, configMapNamespace)
+
+		cm, err := deployer.GetUnstructured([]byte(cmYAML), logger)
+		Expect(err).To(BeNil())
+
+		initObjects := []client.Object{sveltosCluster}
+		for i := range cm {
+			initObjects = append(initObjects, cm[i])
+		}
+
+		c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(initObjects...).Build()
+
+		controllers.SetSveltosApplierConfigMap("sveltos-applier-config")
+		patches, err := controllers.GetSveltosApplierPatches(context.TODO(), c, sveltosCluster.Namespace,
+			sveltosCluster.Name, libsveltosv1beta1.ClusterTypeSveltos, logger)
+		Expect(err).To(BeNil())
+		Expect(len(patches)).To(Equal(2))
+		controllers.SetSveltosApplierConfigMap("")
+
+		verifyPatches(patches)
+	})
+
+	It("getSveltosAgentPatches with Strategic Merge Patch", func() {
+		sveltosCluster := &libsveltosv1beta1.SveltosCluster{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: randomString(),
+				Name:      upstreamClusterNamePrefix + randomString(),
+			},
+		}
+
+		cmYAML := fmt.Sprintf(`apiVersion: v1
+data:
+  deployment-spec-patch: |-
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: "sveltos-ag*"
+      spec:
+        template:
+          spec:
+            containers:
+            - name: manager
+              resources:
+                requests:
+                  memory: 256Mi
+    target:
+      kind: Deployment
+      group: apps
+      name: "sveltos-ag*"
+kind: ConfigMap
+metadata:
+  name: sveltos-agent-config
+  namespace: %s`, sveltosNamespace)
+
+		cm, err := deployer.GetUnstructured([]byte(cmYAML), logger)
+		Expect(err).To(BeNil())
+
+		initObjects := []client.Object{sveltosCluster}
+		for i := range cm {
+			initObjects = append(initObjects, cm[i])
+		}
+
+		c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(initObjects...).Build()
+
+		controllers.SetSveltosAgentConfigMap("sveltos-agent-config")
+		patches, err := controllers.GetSveltosAgentPatches(context.TODO(), c, sveltosCluster.Namespace,
+			sveltosCluster.Name, libsveltosv1beta1.ClusterTypeSveltos, logger)
+		Expect(err).To(BeNil())
+		Expect(len(patches)).To(Equal(1))
+		Expect(patches[0].Target.Kind).To(Equal("Deployment"))
+		Expect(patches[0].Patch).ToNot(BeEmpty())
+		controllers.SetSveltosAgentConfigMap("")
+	})
+
+	It("getSveltosAgentPatches reads old post render patches from ConfigMap", func() {
+		sveltosCluster := &libsveltosv1beta1.SveltosCluster{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: randomString(),
+				Name:      upstreamClusterNamePrefix + randomString(),
+			},
+		}
+
+		cmYAML := fmt.Sprintf(`apiVersion: v1
+data:
+  deployment-patch: |-
+            image-patch: |-
+              - op: replace
+                path: /spec/template/spec/containers/0/image
+                value: registry.ciroos.ai/samay/third-party-images/projectsveltos/sveltos-agent:f2d27fef1-251024102029-amd64
+              - op: add
+                path: /spec/template/spec/imagePullSecrets
+                value:
+                  - name: regcred
+              - op: replace
+                path: /spec/template/spec/containers/0/resources/requests/cpu
+                value: 500m
+              - op: replace
+                path: /spec/template/spec/containers/0/resources/requests/memory
+                value: 512Mi
+              - op: replace
+                path: /spec/template/spec/containers/0/resources/limits/cpu
+                value: 500m
+              - op: replace
+                path: /spec/template/spec/containers/0/resources/limits/memory
+                value: 1024Mi
+kind: ConfigMap
+metadata:
+  name: sveltos-agent-config-old
+  namespace: %s`, sveltosNamespace)
+
+		cm, err := deployer.GetUnstructured([]byte(cmYAML), logger)
+		Expect(err).To(BeNil())
+
+		initObjects := []client.Object{sveltosCluster}
+		for i := range cm {
+			initObjects = append(initObjects, cm[i])
+		}
+
+		c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(initObjects...).Build()
+
+		controllers.SetSveltosAgentConfigMap("sveltos-agent-config-old")
+		patches, err := controllers.GetSveltosAgentPatches(context.TODO(), c, sveltosCluster.Namespace,
+			sveltosCluster.Name, libsveltosv1beta1.ClusterTypeSveltos, logger)
+		Expect(err).To(BeNil())
+		Expect(len(patches)).To(Equal(1))
+		controllers.SetSveltosAgentConfigMap("")
+	})
+
+	It("getSveltosAgentPatches with old Strategic Merge Patch", func() {
+		sveltosCluster := &libsveltosv1beta1.SveltosCluster{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: randomString(),
+				Name:      upstreamClusterNamePrefix + randomString(),
+			},
+		}
+
+		cmYAML := fmt.Sprintf(`apiVersion: v1
+data:
+  patch: |-
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: "sveltos-ag*"
+    spec:
+      template:
+        spec:
+          containers:
+          - name: manager
+            resources:
+              requests:
+                memory: 256Mi
+kind: ConfigMap
+metadata:
+  name: sveltos-agent-config-old
+  namespace: %s`, sveltosNamespace)
+
+		cm, err := deployer.GetUnstructured([]byte(cmYAML), logger)
+		Expect(err).To(BeNil())
+
+		initObjects := []client.Object{sveltosCluster}
+		for i := range cm {
+			initObjects = append(initObjects, cm[i])
+		}
+
+		c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(initObjects...).Build()
+
+		controllers.SetSveltosAgentConfigMap("sveltos-agent-config-old")
+		patches, err := controllers.GetSveltosAgentPatches(context.TODO(), c, sveltosCluster.Namespace,
+			sveltosCluster.Name, libsveltosv1beta1.ClusterTypeSveltos, logger)
+		Expect(err).To(BeNil())
+		Expect(len(patches)).To(Equal(1))
+		Expect(patches[0].Target.Kind).To(Equal("Deployment"))
+		Expect(patches[0].Patch).ToNot(BeEmpty())
+		controllers.SetSveltosAgentConfigMap("")
+	})
+
+	It("isAgentHealthy returns true for a cluster not in pull mode", func() {
+		sveltosCluster := &libsveltosv1beta1.SveltosCluster{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: randomString(),
+				Name:      randomString(),
+			},
+		}
+
+		c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(sveltosCluster).
+			WithStatusSubresource(sveltosCluster).Build()
+
+		reconciler := &controllers.ClassifierReconciler{
+			Client: c,
+			Scheme: scheme,
+		}
+
+		clusterRef := &corev1.ObjectReference{
+			Namespace:  sveltosCluster.Namespace,
+			Name:       sveltosCluster.Name,
+			Kind:       libsveltosv1beta1.SveltosClusterKind,
+			APIVersion: libsveltosv1beta1.GroupVersion.String(),
+		}
+
+		healthy, err := controllers.IsAgentHealthy(reconciler, context.TODO(), clusterRef, logger)
+		Expect(err).To(BeNil())
+		Expect(healthy).To(BeTrue())
+	})
+
+	It("isAgentHealthy returns false for a pull mode cluster whose agent heartbeat timed out", func() {
+		sveltosCluster := &libsveltosv1beta1.SveltosCluster{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: randomString(),
+				Name:      randomString(),
+			},
+			Spec: libsveltosv1beta1.SveltosClusterSpec{
+				PullMode: true,
+			},
+		}
+
+		c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(sveltosCluster).
+			WithStatusSubresource(sveltosCluster).Build()
+
+		heartbeatTimeout := &pullmode.AgentHeartbeatTimeoutError{}
+		failureMessage := heartbeatTimeout.Error()
+		sveltosCluster.Status.FailureMessage = &failureMessage
+		Expect(c.Status().Update(context.TODO(), sveltosCluster)).To(Succeed())
+
+		reconciler := &controllers.ClassifierReconciler{
+			Client: c,
+			Scheme: scheme,
+		}
+
+		clusterRef := &corev1.ObjectReference{
+			Namespace:  sveltosCluster.Namespace,
+			Name:       sveltosCluster.Name,
+			Kind:       libsveltosv1beta1.SveltosClusterKind,
+			APIVersion: libsveltosv1beta1.GroupVersion.String(),
+		}
+
+		healthy, err := controllers.IsAgentHealthy(reconciler, context.TODO(), clusterRef, logger)
+		Expect(err).To(BeNil())
+		Expect(healthy).To(BeFalse())
+	})
+
+	It("isAgentHealthy returns true for a pull mode cluster with a current heartbeat", func() {
+		sveltosCluster := &libsveltosv1beta1.SveltosCluster{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: randomString(),
+				Name:      randomString(),
+			},
+			Spec: libsveltosv1beta1.SveltosClusterSpec{
+				PullMode: true,
+			},
+		}
+
+		c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(sveltosCluster).
+			WithStatusSubresource(sveltosCluster).Build()
+
+		reconciler := &controllers.ClassifierReconciler{
+			Client: c,
+			Scheme: scheme,
+		}
+
+		clusterRef := &corev1.ObjectReference{
+			Namespace:  sveltosCluster.Namespace,
+			Name:       sveltosCluster.Name,
+			Kind:       libsveltosv1beta1.SveltosClusterKind,
+			APIVersion: libsveltosv1beta1.GroupVersion.String(),
+		}
+
+		healthy, err := controllers.IsAgentHealthy(reconciler, context.TODO(), clusterRef, logger)
+		Expect(err).To(BeNil())
+		Expect(healthy).To(BeTrue())
+	})
+})
+
+func prepareCluster() *clusterv1.Cluster {
+	namespace := randomString()
+	ns := &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: namespace,
+		},
+	}
+	Expect(testEnv.Create(context.TODO(), ns)).To(Succeed())
+	Expect(waitForObject(context.TODO(), testEnv.Client, ns)).To(Succeed())
+
+	cluster := &clusterv1.Cluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      randomString(),
+		},
+	}
+
+	machine := &clusterv1.Machine{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      randomString(),
+			Labels: map[string]string{
+				clusterv1.ClusterNameLabel:         cluster.Name,
+				clusterv1.MachineControlPlaneLabel: "ok",
+			},
+		},
+	}
+
+	Expect(testEnv.Create(context.TODO(), cluster)).To(Succeed())
+	Expect(testEnv.Create(context.TODO(), machine)).To(Succeed())
+	Expect(waitForObject(context.TODO(), testEnv.Client, ns)).To(Succeed())
+
+	initialized := true
+	cluster.Status = clusterv1.ClusterStatus{
+		Initialization: clusterv1.ClusterInitializationStatus{
+			ControlPlaneInitialized: &initialized,
+		},
+	}
+	Expect(testEnv.Status().Update(context.TODO(), cluster)).To(Succeed())
+
+	machine.Status = clusterv1.MachineStatus{
+		Phase: string(clusterv1.MachinePhaseRunning),
+	}
+	Expect(testEnv.Status().Update(context.TODO(), machine)).To(Succeed())
+
+	// Create a secret with cluster kubeconfig
+
+	By("Create the secret with cluster kubeconfig")
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: cluster.Namespace,
+			Name:      cluster.Name + "-kubeconfig",
+		},
+		Data: map[string][]byte{
+			"value": testEnv.Kubeconfig,
+		},
+	}
+	Expect(testEnv.Create(context.TODO(), secret)).To(Succeed())
+	Expect(waitForObject(context.TODO(), testEnv.Client, secret)).To(Succeed())
+
+	By("Create the ConfigMap with sveltos-agent version")
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: sveltosNamespace,
+			Name:      "sveltos-agent-version",
+		},
+		Data: map[string]string{
+			classifierLabelVersion: version,
+		},
+	}
+	err := testEnv.Create(context.TODO(), cm)
+	if err != nil {
+		Expect(apierrors.IsAlreadyExists(err)).To(BeTrue())
+	}
+	Expect(waitForObject(context.TODO(), testEnv.Client, cm)).To(Succeed())
+
+	Expect(addTypeInformationToObject(scheme, cluster)).To(Succeed())
+
+	return cluster
+}
+
+func getClusterRef(cluster client.Object) *corev1.ObjectReference {
+	apiVersion, kind := cluster.GetObjectKind().GroupVersionKind().ToAPIVersionAndKind()
+	return &corev1.ObjectReference{
+		Namespace:  cluster.GetNamespace(),
+		Name:       cluster.GetName(),
+		APIVersion: apiVersion,
+		Kind:       kind,
+	}
+}
+
+// verifyLabels verifies that all labels in expectedLabels are also present
+// in currentLabels with same value
+func verifyLabels(currentLabels, expectedLabels map[string]string) bool {
+	if currentLabels == nil {
+		return false
+	}
+
+	for k := range expectedLabels {
+		v, ok := currentLabels[k]
+		if !ok {
+			return false
+		}
+		if v != expectedLabels[k] {
+			return false
+		}
+	}
+
+	return true
+}
+
+func verifyPatches(patches []libsveltosv1beta1.Patch) {
+	found := false
+	for i := range patches {
+		if patches[i].Target.Kind == "Deployment" {
+			found = true
+		}
+	}
+	Expect(found).To(BeTrue())
+
+	found = false
+	for i := range patches {
+		if patches[i].Target.Kind == "ClusterRole" {
+			found = true
+		}
+	}
+	Expect(found).To(BeTrue())
+}
+
+// verifyClassifierIsUntouched verifies the Classifier is not marked for deletion and still has its finalizer
+func verifyClassifierIsUntouched(name string) {
+	Consistently(func() bool {
+		classifier := &libsveltosv1beta1.Classifier{}
+		err := testEnv.Get(context.TODO(), types.NamespacedName{Name: name}, classifier)
+		if err != nil {
+			return false
+		}
+		return classifier.DeletionTimestamp.IsZero() &&
+			controllerutil.ContainsFinalizer(classifier, libsveltosv1beta1.ClassifierFinalizer)
+	}, 3*time.Second, time.Second).Should(BeTrue())
+}
+
+// removeFinalizersAndDeleteClassifier removes all finalizers and deletes the Classifier, so it does not outlive the test
+func removeFinalizersAndDeleteClassifier(name string) {
+	classifier := &libsveltosv1beta1.Classifier{}
+	Expect(testEnv.Get(context.TODO(), types.NamespacedName{Name: name}, classifier)).To(Succeed())
+	classifier.Finalizers = nil
+	Expect(testEnv.Update(context.TODO(), classifier)).To(Succeed())
+	Expect(client.IgnoreNotFound(testEnv.Delete(context.TODO(), classifier))).To(Succeed())
+}
+
+// removedDeployer is a fake deployer which reports every cleanup request as completed
+type removedDeployer struct {
+	deployer.DeployerInterface
+}
+
+func (d *removedDeployer) GetResult(_ context.Context, _, _, _, _ string, _ libsveltosv1beta1.ClusterType,
+	_ bool) deployer.Result {
+
+	return deployer.Result{ResultStatus: deployer.Removed}
+}
+
+// createClassifier creates the Classifier and returns it as the controller reads it
+func createClassifier(classifier *libsveltosv1beta1.Classifier) *libsveltosv1beta1.Classifier {
+	Expect(testEnv.Create(context.TODO(), classifier)).To(Succeed())
+	Expect(waitForObject(context.TODO(), testEnv.Client, classifier)).To(Succeed())
+
+	currentClassifier := &libsveltosv1beta1.Classifier{}
+	Expect(testEnv.Get(context.TODO(), types.NamespacedName{Name: classifier.Name}, currentClassifier)).To(Succeed())
+	return currentClassifier
+}
+
+// createClassifierReport creates the ClassifierReport of the Classifier for the cluster, with the deployment
+// status given, and waits for it to be in the cache
+func createClassifierReport(classifier *libsveltosv1beta1.Classifier, cluster *clusterv1.Cluster,
+	deploymentStatus *libsveltosv1beta1.SveltosFeatureStatus) *libsveltosv1beta1.ClassifierReport {
+
+	clusterType := libsveltosv1beta1.ClusterTypeCapi
+	report := &libsveltosv1beta1.ClassifierReport{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: cluster.Namespace,
+			Name:      libsveltosv1beta1.GetClassifierReportName(classifier.Name, cluster.Name, &clusterType),
+			Labels:    libsveltosv1beta1.GetClassifierReportLabels(classifier.Name, cluster.Name, &clusterType),
+		},
+		Spec: libsveltosv1beta1.ClassifierReportSpec{
+			ClusterNamespace: cluster.Namespace,
+			ClusterName:      cluster.Name,
+			ClusterType:      clusterType,
+			ClassifierName:   classifier.Name,
+		},
+	}
+	Expect(testEnv.Create(context.TODO(), report)).To(Succeed())
+	Expect(waitForObject(context.TODO(), testEnv.Client, report)).To(Succeed())
+
+	if deploymentStatus != nil {
+		Expect(testEnv.Get(context.TODO(), client.ObjectKeyFromObject(report), report)).To(Succeed())
+		report.Status.DeploymentStatus = deploymentStatus
+		Expect(testEnv.Status().Update(context.TODO(), report)).To(Succeed())
+
+		// Eventual loop so testEnv Cache is synced
+		Eventually(func() bool {
+			currentReport := &libsveltosv1beta1.ClassifierReport{}
+			err := testEnv.Get(context.TODO(), client.ObjectKeyFromObject(report), currentReport)
+			return err == nil && currentReport.Status.DeploymentStatus != nil
+		}, timeout, pollingInterval).Should(BeTrue())
+	}
+
+	return report
+}
+
+// prepareAgentlessUndeploy returns a SveltosCluster (in pull mode if pullMode is true), a Classifier and a fake client
+// containing both, plus the ClassifierReport tying the Classifier to the cluster.
+func prepareAgentlessUndeploy(pullMode bool) (*libsveltosv1beta1.SveltosCluster, *libsveltosv1beta1.Classifier,
+	client.Client) {
+
+	sveltosCluster := &libsveltosv1beta1.SveltosCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: randomString(),
+			Name:      randomString(),
+		},
+		Spec: libsveltosv1beta1.SveltosClusterSpec{
+			PullMode: pullMode,
+		},
+	}
+
+	classifier := getClassifierInstance(randomString())
+
+	clusterType := libsveltosv1beta1.ClusterTypeSveltos
+	report := &libsveltosv1beta1.ClassifierReport{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: sveltosCluster.Namespace,
+			Name:      libsveltosv1beta1.GetClassifierReportName(classifier.Name, sveltosCluster.Name, &clusterType),
+			Labels:    libsveltosv1beta1.GetClassifierReportLabels(classifier.Name, sveltosCluster.Name, &clusterType),
+		},
+		Spec: libsveltosv1beta1.ClassifierReportSpec{
+			ClusterNamespace: sveltosCluster.Namespace,
+			ClusterName:      sveltosCluster.Name,
+			ClusterType:      clusterType,
+			ClassifierName:   classifier.Name,
+		},
+	}
+
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(sveltosCluster, classifier, report).
+		WithStatusSubresource(sveltosCluster, classifier, report).Build()
+
+	return sveltosCluster, classifier, c
+}

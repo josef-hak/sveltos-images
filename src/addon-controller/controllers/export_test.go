@@ -1,0 +1,567 @@
+/*
+Copyright 2022-24. projectsveltos.io. All rights reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package controllers
+
+import (
+	"context"
+	"strings"
+
+	"github.com/go-logr/logr"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/events"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/metrics"
+
+	configv1beta1 "github.com/projectsveltos/addon-controller/api/v1beta1"
+)
+
+// SetEventRecorder injects an EventRecorder into a ClusterSummaryReconciler for tests, since the
+// field is only otherwise set by SetupWithManager.
+func SetEventRecorder(r *ClusterSummaryReconciler, recorder events.EventRecorder) {
+	r.eventRecorder = recorder
+}
+
+const (
+	PausedClustersRequeueAfter = pausedClustersRequeueAfter
+	DeleteRequeueAfter         = deleteRequeueAfter
+	NormalRequeueAfter         = normalRequeueAfter
+)
+
+var (
+	ReconcileDeleteCommon                 = reconcileDeleteCommon
+	ClusterProfileReconcileDelete         = (*ClusterProfileReconciler).reconcileDelete
+	ProfileReconcileDelete                = (*ProfileReconciler).reconcileDelete
+	UpdateClusterSummaries                = updateClusterSummaries
+	CreateClusterSummary                  = createClusterSummary
+	UpdateClusterSummary                  = updateClusterSummary
+	UpdateClusterConfigurations           = updateClusterConfigurations
+	UpdateClusterConfigurationWithProfile = updateClusterConfigurationWithProfile
+	CleanClusterConfiguration             = cleanClusterConfiguration
+	CleanClusterConfigurations            = cleanClusterConfigurations
+	CleanClusterReports                   = cleanClusterReports
+	CleanClusterSummaries                 = cleanClusterSummaries
+	UpdateClusterSummarySyncMode          = updateClusterSummarySyncMode
+	UpdateClusterReports                  = updateClusterReports
+	GetMatchingClusters                   = getMatchingClusters
+	IsProfilePaused                       = isProfilePaused
+	GetMaxUpdate                          = getMaxUpdate
+	ReviseUpdatedAndUpdatingClusters      = reviseUpdatedAndUpdatingClusters
+	GetUpdatedAndUpdatingClusters         = getUpdatedAndUpdatingClusters
+	ReviseUpdatingClusterList             = reviseUpdatingClusterList
+	GrantsPullModeEligibility             = grantsPullModeEligibility
+)
+
+var (
+	RequeueClusterProfileForCluster = (*ClusterProfileReconciler).requeueClusterProfileForCluster
+	GetClustersFromClusterSets      = (*ClusterProfileReconciler).getClustersFromClusterSets
+)
+
+var (
+	RequeueProfileForCluster   = (*ProfileReconciler).requeueProfileForCluster
+	LimitReferencesToNamespace = (*ProfileReconciler).limitReferencesToNamespace
+	GetClustersFromSets        = (*ProfileReconciler).getClustersFromSets
+)
+
+var (
+	IsFeatureDeployed                    = (*ClusterSummaryReconciler).isFeatureDeployed
+	IsFeatureFailedWithNonRetriableError = (*ClusterSummaryReconciler).isFeatureFailedWithNonRetriableError
+	GetHash                              = (*ClusterSummaryReconciler).getHash
+	UpdateFeatureStatus                  = (*ClusterSummaryReconciler).updateFeatureStatus
+	UpdateStatusWithMissingLicenseError  = (*ClusterSummaryReconciler).updateStatusWithMissingLicenseError
+	DeployFeature                        = (*ClusterSummaryReconciler).deployFeature
+	UndeployFeature                      = (*ClusterSummaryReconciler).undeployFeature
+	GetCurrentReferences                 = (*ClusterSummaryReconciler).getCurrentReferences
+	IsPaused                             = (*ClusterSummaryReconciler).isPaused
+	IsReady                              = (*ClusterSummaryReconciler).isReady
+	ShouldReconcile                      = (*ClusterSummaryReconciler).shouldReconcile
+	UpdateChartMap                       = (*ClusterSummaryReconciler).updateChartMap
+	ShouldRedeploy                       = (*ClusterSummaryReconciler).shouldRedeploy
+	CanRemoveFinalizer                   = (*ClusterSummaryReconciler).canRemoveFinalizer
+	ReconcileDelete                      = (*ClusterSummaryReconciler).reconcileDelete
+	ReconcileNormal                      = (*ClusterSummaryReconciler).reconcileNormal
+	CleanupBeforeFinalizerRemoval        = (*ClusterSummaryReconciler).cleanupBeforeFinalizerRemoval
+	AreDependenciesDeployed              = (*ClusterSummaryReconciler).areDependenciesDeployed
+	AreDependentsRemoved                 = (*ClusterSummaryReconciler).areDependentsRemoved
+	AreSuccessorsProvisioned             = (*ClusterSummaryReconciler).areSuccessorsProvisioned
+	GetTransitionSuccessors              = (*ClusterSummaryReconciler).getTransitionSuccessors
+	IsChartTransitioningFrom             = isChartTransitioningFrom
+	SetFailureMessage                    = (*ClusterSummaryReconciler).setFailureMessage
+	ResetFeatureStatus                   = (*ClusterSummaryReconciler).resetFeatureStatus
+	PrepareForDeployment                 = (*ClusterSummaryReconciler).prepareForDeployment
+
+	ConvertResultStatus                 = (*ClusterSummaryReconciler).convertResultStatus
+	RequeueClusterSummaryForReference   = (*ClusterSummaryReconciler).requeueClusterSummaryForReference
+	RequeueClusterPromotionForReference = (*ClusterPromotionReconciler).requeueClusterPromotionForReference
+	SweepClusterPromotionCopies         = (*ClusterPromotionCopiesSweeper).sweep
+	ClusterPromotionUpdateMaps          = (*ClusterPromotionReconciler).updateMaps
+	ClusterPromotionCleanMaps           = (*ClusterPromotionReconciler).cleanMaps
+	RequeueClusterSummaryForCluster     = (*ClusterSummaryReconciler).requeueClusterSummaryForCluster
+	HandleDeployerError                 = (*ClusterSummaryReconciler).handleDeployerError
+	GetFeatureSummaryForFeatureID       = getFeatureSummaryForFeatureID
+
+	GetPatchesFrom = getPatchesFrom
+)
+
+var (
+	CleanClusterProfiles = (*ClusterPromotionReconciler).cleanClusterProfiles
+
+	GetMainDeploymentClusterProfileLabels = getMainDeploymentClusterProfileLabels
+
+	SetNextReconcileTime = (*ClusterSummaryReconciler).setNextReconcileTime
+)
+
+var (
+	CreatFeatureHandlerMaps = creatFeatureHandlerMaps
+	GetHandlersForFeature   = getHandlersForFeature
+	GenericDeploy           = genericDeploy
+	GenericUndeploy         = genericUndeploy
+	UndeployResources       = undeployResources
+
+	GetEntryKey                          = getEntryKey
+	DeployContentOfConfigMap             = deployContentOfConfigMap
+	DeployContentOfSecret                = deployContentOfSecret
+	DeployContent                        = deployContent
+	GetClusterSummaryAdmin               = getClusterSummaryAdmin
+	CollectContent                       = collectContent
+	CollectReferencedObjects             = collectReferencedObjects
+	PartitionCRDsFirst                   = partitionCRDsFirst
+	PrepareBundleSettersWithResourceInfo = prepareBundleSettersWithResourceInfo
+	PrepareBundleSettersWithHelmInfo     = prepareBundleSettersWithHelmInfo
+	UndeployStaleResources               = undeployStaleResources
+	GetDeployedGroupVersionKinds         = getDeployedGroupVersionKinds
+	GetSecret                            = getSecret
+	ReadFiles                            = readFiles
+	GetClusterSummaryAnnotationValue     = getClusterSummaryAnnotationValue
+	GetClusterAnnotationValue            = getClusterAnnotationValue
+	GetClusterScopingAnnotation          = getClusterScopingAnnotation
+	AddStaleResourceScopingAnnotations   = addStaleResourceScopingAnnotations
+
+	AddExtraLabels      = addExtraLabels
+	AddExtraAnnotations = addExtraAnnotations
+	AdjustNamespace     = adjustNamespace
+
+	ResourcesHash                 = resourcesHash
+	GetResourceRefs               = getResourceRefs
+	PersistResourceReportsOnError = persistResourceReportsOnError
+
+	UndeployKustomizeRefs             = undeployKustomizeRefs
+	KustomizationHash                 = kustomizationHash
+	GetKustomizeReferenceResourceHash = getKustomizeReferenceResourceHash
+	GetHashFromRemoteKustomizeURL     = getHashFromRemoteKustomizeURL
+	PrepareFileSystemWithRemoteURL    = prepareFileSystemWithRemoteURL
+	ExtractTarGz                      = extractTarGz
+	GetHelmChartHash                  = getHelmChartHash
+	//nolint: gocritic // getDataSectionHash is generic and needs instantiation
+	GetStringDataSectionHash = func(aMap map[string]string) string { return getDataSectionHash(aMap) }
+	//nolint: gocritic // getDataSectionHash is generic and needs instantiation
+	GetByteDataSectionHash                  = func(aMap map[string][]byte) string { return getDataSectionHash(aMap) }
+	InstantiateKustomizeSubstituteValues    = instantiateKustomizeSubstituteValues
+	GetKustomizeSubstituteValuesFrom        = getKustomizeSubstituteValuesFrom
+	GetKustomizeSubstituteValues            = getKustomizeSubstituteValues
+	InstantiateResourceWithSubstituteValues = instantiateResourceWithSubstituteValues
+
+	GetHelmActionInPullMode                  = getHelmActionInPullMode
+	RequeueLowerTierChallengers              = requeueLowerTierChallengers
+	HelmHash                                 = helmHash
+	ShouldInstall                            = shouldInstall
+	ShouldUninstall                          = shouldUninstall
+	ShouldUpgrade                            = shouldUpgrade
+	NeedsRedeployForDrift                    = needsRedeployForDrift
+	UpdateChartsInClusterConfiguration       = updateChartsInClusterConfiguration
+	UpdateStatusForReferencedHelmReleases    = updateStatusForReferencedHelmReleases
+	UpdateStatusForNonReferencedHelmReleases = updateStatusForNonReferencedHelmReleases
+	CreateReportForUnmanagedHelmRelease      = createReportForUnmanagedHelmRelease
+	UpdateClusterReportWithHelmReports       = updateClusterReportWithHelmReports
+	HandleCharts                             = handleCharts
+	GetHelmChartValuesHash                   = getHelmChartValuesHash
+	GetHelmChartPatchesHash                  = getHelmChartPatchesHash
+	GetHelmChartHashes                       = getHelmChartHashes
+	GetPatchesHash                           = getPatchesHash
+	UpdateValueHashOnHelmChartSummary        = updateValueHashOnHelmChartSummary
+	DesiredValuesAreSubset                   = desiredValuesAreSubset
+	GetCredentialsAndCAFiles                 = getCredentialsAndCAFiles
+	GetInstantiatedChartIdentity             = getInstantiatedChartIdentity
+	GetHelmChartValuesFrom                   = getHelmChartValuesFrom
+	GetHelmChartInstantiatedValues           = getHelmChartInstantiatedValues
+	LocateChartWithTimeout                   = locateChartWithTimeout
+
+	InstantiateTemplateValues = instantiateTemplateValues
+	FetchClusterObjects       = fetchClusterObjects
+
+	IsCluterSummaryProvisioned         = isCluterSummaryProvisioned
+	IsNamespaced                       = isNamespaced
+	RemoveStaleDriftDetectionResources = removeStaleDriftDetectionResources
+	StringifyMap                       = stringifyMap
+	ParseMapFromString                 = parseMapFromString
+
+	GetTemplateResourceRefHash = getTemplateResourceRefHash
+	ExtractWatchedFields       = extractWatchedFields
+
+	SelectorMatchesCluster       = selectorMatchesCluster
+	AllMatchingProfilesProcessed = allMatchingProfilesProcessed
+	IsProfileFullyProcessed      = isProfileFullyProcessed
+)
+
+var (
+	ProcessUndeployError = (*ClusterSummaryReconciler).processUndeployError
+)
+
+type (
+	ReleaseInfo       = releaseInfo
+	ReconcileCooldown = reconcileCooldown
+	HelmAction        = helmAction
+)
+
+const (
+	HelmActionInstall   = install
+	HelmActionUpgrade   = upgrade
+	HelmActionDowngrade = downgrade
+	HelmActionUninstall = uninstall
+
+	ClusterAnnotation        = clusterAnnotation
+	ClusterSummaryAnnotation = clusterSummaryAnnotation
+	DeploymentTypeAnnotation = deploymentTypeAnnotation
+)
+
+var (
+	GetClusterConfigurationName = getClusterConfigurationName
+)
+
+var (
+	DeployDebuggingConfigurationCRD                  = deployDebuggingConfigurationCRD
+	DeployResourceSummaryCRD                         = deployResourceSummaryCRD
+	DeployDriftDetectionManagerInCluster             = deployDriftDetectionManagerInCluster
+	DeployDriftDetectionManagerInManagedCluster      = deployDriftDetectionManagerInManagedCluster
+	UpdateDeployedGroupVersionKind                   = updateDeployedGroupVersionKind
+	DeployDriftDetectionManagerInManagementCluster   = deployDriftDetectionManagerInManagementCluster
+	GetDriftDetectionManagerLabels                   = getDriftDetectionManagerLabels
+	RemoveDriftDetectionManagerFromManagementCluster = removeDriftDetectionManagerFromManagementCluster
+	GetDriftDetectionNamespaceInMgmtCluster          = getDriftDetectionNamespaceInMgmtCluster
+	GetGlobalDriftDetectionManagerPatches            = getGlobalDriftDetectionManagerPatches
+	GetAgentWatchNamespaces                          = getAgentWatchNamespaces
+	PrepareDriftDetectionManagerYAML                 = prepareDriftDetectionManagerYAML
+)
+
+const (
+	AgentWatchNamespacesAnnotation = agentWatchNamespacesAnnotation
+)
+
+var (
+	CollectResourceSummariesFromCluster   = collectResourceSummariesFromCluster
+	CollectAndProcessAllResourceSummaries = collectAndProcessAllResourceSummaries
+	IsResourceSummaryInstalledCached      = isResourceSummaryInstalledCached
+	SkipCollecting                        = skipCollecting
+	ResetResourceSummaryInstalledCache    = func() {
+		resourceSummaryInstalledCacheMu.Lock()
+		resourceSummaryInstalledCache = make(map[corev1.ObjectReference]bool)
+		resourceSummaryInstalledCacheMu.Unlock()
+	}
+	ProcessResourceSummary = processResourceSummary
+	MarkDriftedHelmCharts  = markDriftedHelmCharts
+	NewDriftHistory        = newDriftHistory
+)
+
+var (
+	InitializeManager = initializeManager
+)
+
+var (
+	GetTemplateResourceName      = getTemplateResourceName
+	GetTemplateResourceNamespace = getTemplateResourceNamespace
+	CollectTemplateResourceRefs  = collectTemplateResourceRefs
+)
+
+var (
+	SelectClusters              = selectClusters
+	SelectMoreClusters          = selectMoreClusters
+	PruneConnectionDownClusters = pruneConnectionDownClusters
+)
+
+var (
+	DeplAssociatedClusterExist = deplAssociatedClusterExist
+	RemoveStaleResourceSummary = removeStaleResourceSummary
+	RemoveDuplicates           = removeDuplicates
+)
+
+var (
+	SkipUpgrading                            = skipUpgrading
+	IsDriftDetectionManagerDeployedInCluster = isDriftDetectionManagerDeployedInCluster
+)
+
+var (
+	GetSortedKeys = getSortedKeys
+)
+
+var (
+	TrackDrifts           = trackDrifts
+	TrackMatchingClusters = trackMatchingClusters
+)
+
+var (
+	NeedsCosignVerification     = needsCosignVerification
+	NeedsProvenanceVerification = needsProvenanceVerification
+	LoadCosignPublicKey         = loadCosignPublicKey
+	CreateFileWithKeyring       = createFileWithKeyring
+)
+
+var (
+	IsCRDEstablished      = isCRDEstablished
+	GetCRDObjects         = getCRDObjects
+	GetExistingCRDsPolicy = getExistingCRDsPolicy
+	InstallMissingCRDs    = installMissingCRDs
+	InstallChartCRDs      = installChartCRDs
+	WithRestConfig        = withRestConfig
+	GetHelmUpgradeClient  = getHelmUpgradeClient
+)
+
+type (
+	ReferencedObject      = referencedObject
+	RegistryClientOptions = registryClientOptions
+	RestConfigGetter      = restConfigGetter
+)
+
+func NewRestConfigGetter(cfg *rest.Config, namespace string) *RestConfigGetter {
+	return &restConfigGetter{config: cfg, namespace: namespace}
+}
+
+var (
+	UpdateClusterSummaryHelmHashes = updateClusterSummaryHelmHashes
+	SetHelmChartsPatchesHash       = setHelmChartsPatchesHash
+)
+
+// SetManagementClusterConfigForTest overrides the cached management cluster rest.Config,
+// leaving managementClusterClient untouched, and returns the previous value so a test can
+// restore it. Unlike SetManagementClusterAccess, this lets a test break only the config the
+// "local" (management cluster) undeploy pass builds its discovery/dynamic clients from,
+// without also breaking other code paths (e.g. kubeconfig Secret reads for the "remote" pass)
+// that go through managementClusterClient directly.
+func SetManagementClusterConfigForTest(config *rest.Config) *rest.Config {
+	old := managementClusterConfig
+	managementClusterConfig = config
+	return old
+}
+
+// SetManagementClusterClientForTest overrides the management cluster client, leaving the rest of the
+// management cluster access untouched, and returns the previous value so a test can restore it.
+func SetManagementClusterClientForTest(c client.Client) client.Client {
+	old := managementClusterClient
+	managementClusterClient = c
+	return old
+}
+
+// NewDeploymentContext constructs a deploymentContext for use in tests.
+func NewDeploymentContext(
+	clusterSummary *configv1beta1.ClusterSummary,
+	clusterObjects *currentClusterObjects,
+	mgmtResources map[string]*unstructured.Unstructured,
+) *deploymentContext {
+
+	return &deploymentContext{
+		clusterSummary: clusterSummary,
+		clusterObjects: clusterObjects,
+		mgmtResources:  mgmtResources,
+	}
+}
+
+var (
+	GetChartApplyHash        = getChartApplyHash
+	ShouldSkipApply          = shouldSkipApply
+	RecordHelmChartApply     = recordHelmChartApply
+	IsApplyTracked           = isApplyTracked
+	ConfirmAppliedHelmCharts = confirmAppliedHelmCharts
+)
+
+// NewReleaseInfoForApply returns what prepareChartForAgent records on the releaseInfo of a chart
+// staged for sveltos-applier.
+func NewReleaseInfoForApply(applyHash []byte, skipApply bool) *releaseInfo {
+	return &releaseInfo{applyHash: applyHash, skipApply: skipApply}
+}
+
+var (
+	GetHealthMonitoringName            = getHealthMonitoringName
+	GetMonitoringResourceSelectors     = getMonitoringResourceSelectors
+	BuildMonitoringHealthCheck         = buildMonitoringHealthCheck
+	BuildMonitoringClusterHealthCheck  = buildMonitoringClusterHealthCheck
+	QuoteLuaString                     = quoteLuaString
+	ReconcileHealthMonitoring          = (*ClusterSummaryReconciler).reconcileHealthMonitoring
+	RemoveHealthMonitoring             = (*ClusterSummaryReconciler).removeHealthMonitoring
+	DefaultHealthCheckLivenessName     = defaultHealthCheckLivenessName
+	HealthMonitoringFlappingEvaluation = healthMonitoringFlappingEvaluations
+)
+
+// NewHelmReleases returns helm releases for tests, from "<namespace>/<name>" strings
+func NewHelmReleases(namespaceAndNames ...string) []helmRelease {
+	releases := make([]helmRelease, 0, len(namespaceAndNames))
+	for _, namespaceAndName := range namespaceAndNames {
+		parts := strings.SplitN(namespaceAndName, "/", 2)
+		releases = append(releases, helmRelease{namespace: parts[0], name: parts[1]})
+	}
+	return releases
+}
+
+// RenderHealthMonitoringLua renders the health monitoring script for tests
+func RenderHealthMonitoringLua(ownerKind, ownerName string, releases []helmRelease) string {
+	return renderHealthMonitoringLua(&healthMonitoringLuaConfig{
+		ownerKind: ownerKind, ownerName: ownerName, helmReleases: releases,
+	})
+}
+
+// CollectedHelmChartKey identifies a chart the outdated Helm chart check fetches the versions of
+type CollectedHelmChartKey struct {
+	ChartName      string
+	RepositoryName string
+	RepositoryURL  string
+}
+
+// CollectHelmChartRefs returns, for each chart the ClusterSummaries reference, the names of the
+// ClusterSummaries referencing it
+func CollectHelmChartRefs(clusterSummaries ...*configv1beta1.ClusterSummary) map[CollectedHelmChartKey][]string {
+	refs := map[helmChartKey][]helmChartRef{}
+	for i := range clusterSummaries {
+		collectHelmChartRefs(clusterSummaries[i], refs, logr.Discard())
+	}
+
+	result := map[CollectedHelmChartKey][]string{}
+	for key, keyRefs := range refs {
+		collectedKey := CollectedHelmChartKey{
+			ChartName: key.chartName, RepositoryName: key.repositoryName, RepositoryURL: key.repositoryURL,
+		}
+		for i := range keyRefs {
+			result[collectedKey] = append(result[collectedKey], keyRefs[i].clusterSummaryName)
+		}
+	}
+
+	return result
+}
+
+// HelmChartVersionDiff returns the latest version and the latest patch version of the same minor, as
+// strings, empty when there is none
+func HelmChartVersionDiff(current string, available []string) (latest, latestPatch string, err error) {
+	latestVersion, latestPatchVersion, err := helmChartVersionDiff(current, available)
+	if err != nil {
+		return "", "", err
+	}
+
+	if latestVersion != nil {
+		latest = latestVersion.String()
+	}
+	if latestPatchVersion != nil {
+		latestPatch = latestPatchVersion.String()
+	}
+
+	return latest, latestPatch, nil
+}
+
+// SetResolvedHelmChartIdentity updates the HelmChartSummary of a release after a deployment of
+// deployedChartVersion
+func SetResolvedHelmChartIdentity(clusterSummary *configv1beta1.ClusterSummary, helmChartSummary *configv1beta1.HelmChartSummary,
+	requestedChart *configv1beta1.HelmChart, deployedChartVersion string) {
+
+	currentRelease := &releaseInfo{ChartVersion: deployedChartVersion}
+	setResolvedHelmChartIdentity(context.TODO(), nil, clusterSummary, helmChartSummary, requestedChart, currentRelease,
+		logr.Discard())
+}
+
+// OutdatedHelmChart identifies the outdated_helm_chart series of one Helm release
+type OutdatedHelmChart struct {
+	ProfileKind      string
+	ProfileNamespace string
+	ProfileName      string
+	ClusterType      string
+	ClusterNamespace string
+	ClusterName      string
+	ChartName        string
+	ReleaseNamespace string
+	ReleaseName      string
+}
+
+func (o *OutdatedHelmChart) metricKey() outdatedHelmChartMetricKey {
+	return outdatedHelmChartMetricKey{
+		profileKind: o.ProfileKind, profileNamespace: o.ProfileNamespace, profileName: o.ProfileName,
+		clusterType: o.ClusterType, clusterNamespace: o.ClusterNamespace, clusterName: o.ClusterName,
+		chartName: o.ChartName, releaseNamespace: o.ReleaseNamespace, releaseName: o.ReleaseName,
+	}
+}
+
+func (o *OutdatedHelmChart) clear() {
+	clearOutdatedHelmChart(o.ProfileKind, o.ProfileNamespace, o.ProfileName, o.ClusterType, o.ClusterNamespace,
+		o.ClusterName, o.ChartName, o.ReleaseNamespace, o.ReleaseName)
+}
+
+// SetOutdatedByPreviousPass leaves the outdated Helm chart check as a previous pass does when it found
+// the chart outdated. It returns the function restoring the check.
+func SetOutdatedByPreviousPass(chart *OutdatedHelmChart) (restore func()) {
+	saved := previouslyOutdatedHelmCharts
+
+	previouslyOutdatedHelmCharts = map[outdatedHelmChartMetricKey]struct{}{chart.metricKey(): {}}
+	trackOutdatedHelmChart(chart.ProfileKind, chart.ProfileNamespace, chart.ProfileName, chart.ClusterType,
+		chart.ClusterNamespace, chart.ClusterName, chart.ChartName, chart.ReleaseNamespace, chart.ReleaseName,
+		logr.Discard())
+
+	return func() {
+		previouslyOutdatedHelmCharts = saved
+		chart.clear()
+	}
+}
+
+// CheckOutdatedHelmCharts runs one pass of the outdated Helm chart check
+func CheckOutdatedHelmCharts(ctx context.Context, c client.Client) {
+	checkOutdatedHelmCharts(ctx, c, logr.Discard())
+}
+
+// IsOutdatedHelmChartTracked returns true if the outdated Helm chart check still tracks the chart as outdated
+func IsOutdatedHelmChartTracked(chart *OutdatedHelmChart) bool {
+	_, tracked := previouslyOutdatedHelmCharts[chart.metricKey()]
+	return tracked
+}
+
+// IsOutdatedHelmChartExposed returns true if the outdated_helm_chart series of the chart is still exposed
+func IsOutdatedHelmChartExposed(chart *OutdatedHelmChart) (bool, error) {
+	want := map[string]string{
+		metricProfileKindLabel: chart.ProfileKind, metricProfileNamespaceLabel: chart.ProfileNamespace,
+		metricProfileNameLabel: chart.ProfileName, metricClusterTypeLabel: chart.ClusterType,
+		metricClusterNamespaceLabel: chart.ClusterNamespace, metricClusterNameLabel: chart.ClusterName,
+		metricChartNameLabel: chart.ChartName, metricReleaseNamespaceLabel: chart.ReleaseNamespace,
+		metricReleaseNameLabel: chart.ReleaseName,
+	}
+
+	families, err := metrics.Registry.Gather()
+	if err != nil {
+		return false, err
+	}
+
+	for _, family := range families {
+		if family.GetName() != metricNamespace+"_outdated_helm_chart" {
+			continue
+		}
+		for _, metric := range family.GetMetric() {
+			matched := 0
+			for _, label := range metric.GetLabel() {
+				if value, ok := want[label.GetName()]; ok && value == label.GetValue() {
+					matched++
+				}
+			}
+			if matched == len(want) {
+				return true, nil
+			}
+		}
+	}
+
+	return false, nil
+}

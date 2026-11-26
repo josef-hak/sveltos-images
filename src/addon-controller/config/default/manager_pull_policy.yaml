@@ -1,0 +1,14 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: controller
+  namespace: projectsveltos
+spec:
+  template:
+    spec:
+      initContainers:
+      - name: initialization
+        imagePullPolicy: IfNotPresent
+      containers:
+      - name: controller
+        imagePullPolicy: IfNotPresent

@@ -1,0 +1,862 @@
+/*
+Copyright 2022-24. projectsveltos.io. All rights reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+	http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package controllers_test
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"reflect"
+
+	"github.com/gdexlab/go-render/render"
+	"github.com/go-logr/logr"
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/klog/v2/textlogger"
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	configv1beta1 "github.com/projectsveltos/addon-controller/api/v1beta1"
+	"github.com/projectsveltos/addon-controller/controllers"
+	"github.com/projectsveltos/addon-controller/lib/clusterops"
+	"github.com/projectsveltos/addon-controller/pkg/scope"
+	libsveltosv1beta1 "github.com/projectsveltos/libsveltos/api/v1beta1"
+	"github.com/projectsveltos/libsveltos/lib/deployer"
+	fakedeployer "github.com/projectsveltos/libsveltos/lib/deployer/fake"
+)
+
+var _ = Describe("ClustersummaryDeployer", func() {
+	var logger logr.Logger
+	var clusterProfile *configv1beta1.ClusterProfile
+	var clusterSummary *configv1beta1.ClusterSummary
+	var cluster *clusterv1.Cluster
+	var namespace string
+	var clusterName string
+
+	BeforeEach(func() {
+		namespace = randomString()
+
+		logger = textlogger.NewLogger(textlogger.NewConfig())
+
+		clusterProfile = &configv1beta1.ClusterProfile{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: clusterProfileNamePrefix + randomString(),
+			},
+			Spec: configv1beta1.Spec{
+				ClusterSelector: libsveltosv1beta1.Selector{
+					LabelSelector: metav1.LabelSelector{
+						MatchLabels: map[string]string{
+							randomString(): randomString(),
+						},
+					},
+				},
+			},
+		}
+
+		clusterName = randomString()
+		clusterSummaryName := clusterops.GetClusterSummaryName(configv1beta1.ClusterProfileKind,
+			clusterProfile.Name, clusterName, false)
+		clusterSummary = &configv1beta1.ClusterSummary{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      clusterSummaryName,
+				Namespace: namespace,
+			},
+			Spec: configv1beta1.ClusterSummarySpec{
+				ClusterNamespace: namespace,
+				ClusterName:      clusterName,
+				ClusterType:      libsveltosv1beta1.ClusterTypeCapi,
+			},
+		}
+		addLabelsToClusterSummary(clusterSummary, clusterProfile.Name, clusterName, libsveltosv1beta1.ClusterTypeCapi)
+
+		cluster = &clusterv1.Cluster{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: clusterSummary.Spec.ClusterNamespace,
+				Name:      clusterSummary.Spec.ClusterName,
+			},
+		}
+	})
+
+	It("isFeatureDeployed returns false when feature is not deployed", func() {
+		clusterSummary.Status.FeatureSummaries = []configv1beta1.FeatureSummary{
+			{
+				FeatureID: libsveltosv1beta1.FeatureHelm,
+				Status:    libsveltosv1beta1.FeatureStatusProvisioned,
+			},
+		}
+
+		initObjects := []client.Object{
+			clusterSummary,
+			clusterProfile,
+		}
+
+		c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(initObjects...).WithObjects(initObjects...).Build()
+
+		reconciler := getClusterSummaryReconciler(c, nil)
+
+		clusterSummaryScope := getClusterSummaryScope(c, logger, clusterProfile, clusterSummary)
+
+		Expect(controllers.IsFeatureDeployed(reconciler, clusterSummaryScope.ClusterSummary, libsveltosv1beta1.FeatureResources)).To(BeFalse())
+	})
+
+	It("isFeatureDeployed returns true when feature is deployed", func() {
+		clusterSummary.Status.FeatureSummaries = []configv1beta1.FeatureSummary{
+			{
+				FeatureID: libsveltosv1beta1.FeatureHelm,
+				Status:    libsveltosv1beta1.FeatureStatusProvisioned,
+			},
+		}
+
+		initObjects := []client.Object{
+			clusterSummary,
+			clusterProfile,
+		}
+
+		c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(initObjects...).WithObjects(initObjects...).Build()
+
+		reconciler := getClusterSummaryReconciler(c, nil)
+
+		clusterSummaryScope := getClusterSummaryScope(c, logger, clusterProfile, clusterSummary)
+
+		Expect(controllers.IsFeatureDeployed(reconciler, clusterSummaryScope.ClusterSummary, libsveltosv1beta1.FeatureHelm)).To(BeTrue())
+	})
+
+	It("IsFeatureFailedWithNonRetriableError returns false when feature has not failed", func() {
+		clusterSummary.Status.FeatureSummaries = []configv1beta1.FeatureSummary{
+			{
+				FeatureID: libsveltosv1beta1.FeatureResources,
+				Status:    libsveltosv1beta1.FeatureStatusProvisioned,
+			},
+		}
+
+		initObjects := []client.Object{
+			clusterSummary,
+			clusterProfile,
+		}
+
+		c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(initObjects...).WithObjects(initObjects...).Build()
+
+		reconciler := getClusterSummaryReconciler(c, nil)
+
+		clusterSummaryScope := getClusterSummaryScope(c, logger, clusterProfile, clusterSummary)
+
+		Expect(controllers.IsFeatureFailedWithNonRetriableError(reconciler, clusterSummaryScope.ClusterSummary,
+			libsveltosv1beta1.FeatureResources)).To(BeFalse())
+	})
+
+	It("IsFeatureFailedWithNonRetriableError returns true when feature has failed with non retriable error", func() {
+		clusterSummary.Status.FeatureSummaries = []configv1beta1.FeatureSummary{
+			{
+				FeatureID: libsveltosv1beta1.FeatureResources,
+				Status:    libsveltosv1beta1.FeatureStatusFailedNonRetriable,
+			},
+		}
+
+		initObjects := []client.Object{
+			clusterSummary,
+			clusterProfile,
+		}
+
+		c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(initObjects...).WithObjects(initObjects...).Build()
+
+		reconciler := getClusterSummaryReconciler(c, nil)
+
+		clusterSummaryScope := getClusterSummaryScope(c, logger, clusterProfile, clusterSummary)
+
+		Expect(controllers.IsFeatureFailedWithNonRetriableError(reconciler, clusterSummaryScope.ClusterSummary,
+			libsveltosv1beta1.FeatureResources)).To(BeTrue())
+	})
+
+	It("getHash returns nil when hash is not stored", func() {
+		hash := []byte(randomString())
+		clusterSummary.Status.FeatureSummaries = []configv1beta1.FeatureSummary{
+			{
+				FeatureID: libsveltosv1beta1.FeatureHelm,
+				Status:    libsveltosv1beta1.FeatureStatusProvisioned,
+				Hash:      hash,
+			},
+		}
+
+		initObjects := []client.Object{
+			clusterSummary,
+			clusterProfile,
+		}
+
+		c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(initObjects...).WithObjects(initObjects...).Build()
+
+		reconciler := getClusterSummaryReconciler(c, nil)
+
+		clusterSummaryScope := getClusterSummaryScope(c, logger, clusterProfile, clusterSummary)
+
+		currentHash := controllers.GetHash(reconciler, clusterSummaryScope, libsveltosv1beta1.FeatureResources)
+		Expect(currentHash).To(BeNil())
+	})
+
+	It("getHash returns stored hash", func() {
+		hash := []byte(randomString())
+		clusterSummary.Status.FeatureSummaries = []configv1beta1.FeatureSummary{
+			{
+				FeatureID: libsveltosv1beta1.FeatureResources,
+				Status:    libsveltosv1beta1.FeatureStatusProvisioned,
+				Hash:      hash,
+			},
+		}
+
+		initObjects := []client.Object{
+			clusterSummary,
+			clusterProfile,
+		}
+
+		c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(initObjects...).WithObjects(initObjects...).Build()
+
+		reconciler := getClusterSummaryReconciler(c, nil)
+
+		clusterSummaryScope := getClusterSummaryScope(c, logger, clusterProfile, clusterSummary)
+
+		currentHash := controllers.GetHash(reconciler, clusterSummaryScope, libsveltosv1beta1.FeatureResources)
+		Expect(reflect.DeepEqual(currentHash, hash)).To(BeTrue())
+	})
+
+	It("updateFeatureStatus updates ClusterSummary Status FeatureSummary", func() {
+		initObjects := []client.Object{
+			clusterSummary,
+			clusterProfile,
+		}
+
+		c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(initObjects...).WithObjects(initObjects...).Build()
+
+		reconciler := getClusterSummaryReconciler(c, nil)
+
+		clusterSummaryScope := getClusterSummaryScope(c, logger, clusterProfile, clusterSummary)
+
+		hash := []byte(randomString())
+		status := libsveltosv1beta1.FeatureStatusFailed
+		statusErr := fmt.Errorf("failed to deploy")
+		controllers.UpdateFeatureStatus(reconciler, clusterSummaryScope, libsveltosv1beta1.FeatureResources, &status,
+			hash, statusErr, textlogger.NewLogger(textlogger.NewConfig()))
+
+		Expect(len(clusterSummary.Status.FeatureSummaries)).To(Equal(1))
+		Expect(clusterSummary.Status.FeatureSummaries[0].FeatureID).To(Equal(libsveltosv1beta1.FeatureResources))
+		Expect(clusterSummary.Status.FeatureSummaries[0].Status).To(Equal(libsveltosv1beta1.FeatureStatusFailed))
+		Expect(clusterSummary.Status.FeatureSummaries[0].FailureMessage).ToNot(BeNil())
+		Expect(*clusterSummary.Status.FeatureSummaries[0].FailureMessage).To(Equal(statusErr.Error()))
+
+		status = libsveltosv1beta1.FeatureStatusProvisioned
+		controllers.UpdateFeatureStatus(reconciler, clusterSummaryScope, libsveltosv1beta1.FeatureResources, &status,
+			hash, nil, textlogger.NewLogger(textlogger.NewConfig()))
+		Expect(clusterSummary.Status.FeatureSummaries[0].FeatureID).To(Equal(libsveltosv1beta1.FeatureResources))
+		Expect(clusterSummary.Status.FeatureSummaries[0].Status).To(Equal(libsveltosv1beta1.FeatureStatusProvisioned))
+		Expect(clusterSummary.Status.FeatureSummaries[0].FailureMessage).To(BeNil())
+	})
+
+	It("deployFeature when feature is deployed and hash has not changed, does nothing", func() {
+		clusterRole := &rbacv1.ClusterRole{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: randomString(),
+			},
+			Rules: []rbacv1.PolicyRule{
+				{Verbs: []string{testCreateVerb, testGetVerb}, APIGroups: []string{testCertManagerGroup}, Resources: []string{testCertificateRequestsResource}},
+				{Verbs: []string{testCreateVerb, testDeleteVerb}, APIGroups: []string{""}, Resources: []string{testNamespacesResource, testDeploymentsResource}},
+			},
+		}
+		Expect(addTypeInformationToObject(scheme, clusterRole)).To(Succeed())
+
+		configMap := createConfigMapWithPolicy("default", randomString(), render.AsCode(clusterRole))
+		clusterSummary.Spec.ClusterProfileSpec.PolicyRefs = []configv1beta1.PolicyRef{
+			{
+				Namespace: configMap.Namespace,
+				Name:      configMap.Name,
+				Kind:      string(libsveltosv1beta1.ConfigMapReferencedResourceKind),
+			},
+		}
+
+		initObjects := []client.Object{
+			configMap,
+			clusterSummary,
+			clusterProfile,
+			cluster,
+		}
+
+		c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(initObjects...).WithObjects(initObjects...).Build()
+
+		clusterSummaryScope := getClusterSummaryScope(c, logger, clusterProfile, clusterSummary)
+
+		ResourcesHash, err := controllers.ResourcesHash(ctx, c, clusterSummary, textlogger.NewLogger(textlogger.NewConfig()))
+		Expect(err).To(BeNil())
+
+		clusterSummary.Status.FeatureSummaries = []configv1beta1.FeatureSummary{
+			{
+				FeatureID: libsveltosv1beta1.FeatureResources,
+				Hash:      ResourcesHash,
+				Status:    libsveltosv1beta1.FeatureStatusProvisioned,
+			},
+		}
+
+		Expect(c.Status().Update(context.TODO(), clusterSummary)).To(Succeed())
+
+		dep := fakedeployer.GetClient(context.TODO(), textlogger.NewLogger(textlogger.NewConfig()), c)
+
+		reconciler := getClusterSummaryReconciler(c, dep)
+
+		f := controllers.GetHandlersForFeature(libsveltosv1beta1.FeatureResources)
+
+		// ClusterSummary Status is reporting feature has deployed. Configuration that needs to be deployed has not
+		// changed (so hash in ClusterSummary Status matches hash of all referenced ResourceRefs).
+		// DeployeFeature is supposed to return before calling dep.Deploy (fake deployer Deploy once called simply
+		// adds key to InProgress).
+		// So run DeployFeature then validate key is not added to InProgress
+		err = controllers.DeployFeature(reconciler, context.TODO(), clusterSummaryScope, f, textlogger.NewLogger(textlogger.NewConfig()))
+		Expect(err).To(BeNil())
+
+		key := deployer.GetKey(clusterSummary.Spec.ClusterNamespace, clusterSummary.Spec.ClusterName,
+			clusterSummary.Name, string(libsveltosv1beta1.FeatureResources), libsveltosv1beta1.ClusterTypeCapi, false)
+		Expect(dep.IsKeyInProgress(key)).To(BeFalse())
+	})
+
+	It("deployFeature does not revisit a stale Helm Conflict once the feature is Provisioned", func() {
+		// Documents the latch the Helm-side fix exists to prevent. A ClusterSummary that ends a
+		// pass Provisioned while still holding a Conflict entry never runs the Helm handler
+		// again, so the entry is never recomputed and the profile reports a conflict forever.
+		// shouldRedeploy returns false for a deployed feature whose hash has not changed, and
+		// helmConflictResolved is only consulted on a deployer error, so neither path recovers.
+		releaseName := randomString()
+		releaseNamespace := randomString()
+		clusterSummary.Spec.ClusterProfileSpec.HelmCharts = []configv1beta1.HelmChart{
+			{
+				RepositoryURL:    randomString(),
+				RepositoryName:   randomString(),
+				ChartName:        randomString(),
+				ChartVersion:     randomString(),
+				ReleaseName:      releaseName,
+				ReleaseNamespace: releaseNamespace,
+			},
+		}
+
+		initObjects := []client.Object{
+			clusterSummary,
+			clusterProfile,
+			cluster,
+		}
+
+		c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(initObjects...).WithObjects(initObjects...).Build()
+
+		clusterSummaryScope := getClusterSummaryScope(c, logger, clusterProfile, clusterSummary)
+
+		// helmHash instantiates the chart values, and that resolves the Cluster through the
+		// management cluster client rather than the client passed in. So the Cluster has to
+		// exist there too, not only in the fake client driving the reconcile.
+		ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}}
+		Expect(testEnv.Create(ctx, ns)).To(Succeed())
+		Expect(waitForObject(ctx, testEnv.Client, ns)).To(Succeed())
+		mgmtCluster := &clusterv1.Cluster{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: clusterSummary.Spec.ClusterNamespace,
+				Name:      clusterSummary.Spec.ClusterName,
+			},
+		}
+		Expect(testEnv.Create(ctx, mgmtCluster)).To(Succeed())
+		Expect(waitForObject(ctx, testEnv.Client, mgmtCluster)).To(Succeed())
+
+		helmHash, err := controllers.HelmHash(ctx, c, clusterSummary, textlogger.NewLogger(textlogger.NewConfig()))
+		Expect(err).To(BeNil())
+
+		clusterSummary.Status.FeatureSummaries = []configv1beta1.FeatureSummary{
+			{
+				FeatureID: libsveltosv1beta1.FeatureHelm,
+				Hash:      helmHash,
+				Status:    libsveltosv1beta1.FeatureStatusProvisioned,
+			},
+		}
+		// The conflict is over. The ClusterSummary named here has been deleted, so this entry
+		// can only be corrected by running the Helm handler again.
+		clusterSummary.Status.HelmReleaseSummaries = []configv1beta1.HelmChartSummary{
+			{
+				ReleaseName:      releaseName,
+				ReleaseNamespace: releaseNamespace,
+				Status:           configv1beta1.HelmChartStatusConflict,
+				ConflictMessage:  fmt.Sprintf("ClusterSummary %s managing it", randomString()),
+			},
+		}
+
+		Expect(c.Status().Update(context.TODO(), clusterSummary)).To(Succeed())
+
+		dep := fakedeployer.GetClient(context.TODO(), textlogger.NewLogger(textlogger.NewConfig()), c)
+
+		reconciler := getClusterSummaryReconciler(c, dep)
+
+		f := controllers.GetHandlersForFeature(libsveltosv1beta1.FeatureHelm)
+
+		err = controllers.DeployFeature(reconciler, context.TODO(), clusterSummaryScope, f,
+			textlogger.NewLogger(textlogger.NewConfig()))
+		Expect(err).To(BeNil())
+
+		// No deploy is submitted, so nothing recomputes HelmReleaseSummaries and the Conflict
+		// entry survives untouched.
+		key := deployer.GetKey(clusterSummary.Spec.ClusterNamespace, clusterSummary.Spec.ClusterName,
+			clusterSummary.Name, string(libsveltosv1beta1.FeatureHelm), libsveltosv1beta1.ClusterTypeCapi, false)
+		Expect(dep.IsKeyInProgress(key)).To(BeFalse())
+
+		currentClusterSummary := &configv1beta1.ClusterSummary{}
+		Expect(c.Get(context.TODO(),
+			types.NamespacedName{Namespace: clusterSummary.Namespace, Name: clusterSummary.Name},
+			currentClusterSummary)).To(Succeed())
+		Expect(currentClusterSummary.Status.HelmReleaseSummaries).To(HaveLen(1))
+		Expect(currentClusterSummary.Status.HelmReleaseSummaries[0].Status).To(
+			Equal(configv1beta1.HelmChartStatusConflict))
+	})
+
+	It("deployFeature when feature is deployed and hash has changed, calls Deploy", func() {
+		clusterRoleName := randomString()
+		configMap := createConfigMapWithPolicy("default", randomString(), fmt.Sprintf(viewClusterRole, clusterRoleName))
+
+		clusterSummary.Spec.ClusterProfileSpec.PolicyRefs = []configv1beta1.PolicyRef{
+			{
+				Namespace: configMap.Namespace,
+				Name:      configMap.Name,
+				Kind:      string(libsveltosv1beta1.ConfigMapReferencedResourceKind),
+			},
+		}
+
+		ns := &corev1.Namespace{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: cluster.Namespace,
+			},
+		}
+		Expect(testEnv.Create(context.TODO(), ns)).To(Succeed())
+		Expect(waitForObject(context.TODO(), testEnv.Client, ns)).To(Succeed())
+
+		Expect(testEnv.Create(context.TODO(), configMap)).To(Succeed())
+		Expect(testEnv.Create(context.TODO(), cluster)).To(Succeed())
+		Expect(waitForObject(context.TODO(), testEnv.Client, cluster)).To(Succeed())
+
+		Expect(testEnv.Create(context.TODO(), clusterSummary)).To(Succeed())
+		Expect(testEnv.Create(context.TODO(), clusterProfile)).To(Succeed())
+		Expect(waitForObject(context.TODO(), testEnv.Client, clusterProfile)).To(Succeed())
+
+		clusterSummaryScope := getClusterSummaryScope(testEnv.Client, logger, clusterProfile, clusterSummary)
+
+		resourcesHash, err := controllers.ResourcesHash(ctx, testEnv.Client, clusterSummary, textlogger.NewLogger(textlogger.NewConfig()))
+		Expect(err).To(BeNil())
+		clusterSummary.Status.FeatureSummaries = []configv1beta1.FeatureSummary{
+			{
+				FeatureID: libsveltosv1beta1.FeatureResources,
+				Hash:      resourcesHash,
+				Status:    libsveltosv1beta1.FeatureStatusProvisioned,
+			},
+		}
+
+		Expect(testEnv.Status().Update(context.TODO(), clusterSummary)).To(Succeed())
+
+		// Change clusterRole so the configuration that now needs to be deployed does not match
+		// the hash in ClusterSummary Status anymore
+		updateConfigMapWithPolicy(configMap, fmt.Sprintf(modifyClusterRole, clusterRoleName))
+		Expect(testEnv.Update(context.TODO(), configMap)).To(Succeed())
+		Eventually(func() bool {
+			clusterConfigMap := &corev1.ConfigMap{}
+			err = testEnv.Get(context.TODO(),
+				types.NamespacedName{Namespace: configMap.Namespace, Name: configMap.Name}, clusterConfigMap)
+			if err != nil {
+				return false
+			}
+			return reflect.DeepEqual(configMap.Data, clusterConfigMap.Data)
+		}, timeout, pollingInterval).Should(BeTrue())
+
+		dep := fakedeployer.GetClient(context.TODO(), textlogger.NewLogger(textlogger.NewConfig()), testEnv.Client)
+
+		reconciler := getClusterSummaryReconciler(testEnv.Client, dep)
+
+		f := controllers.GetHandlersForFeature(libsveltosv1beta1.FeatureResources)
+
+		// Even though the feature is marked as deployed in ClusterSummary Status, the configuration has changed (ClusterSummary Status Hash
+		// does not match anymore the hash of all referenced ResourceRefs). In such situation, DeployFeature calls dep.Deploy.
+		// fake deployer Deploy simply adds key to InProgress.
+		// So run DeployFeature then validate key is added to InProgress
+		err = controllers.DeployFeature(reconciler, context.TODO(), clusterSummaryScope, f, textlogger.NewLogger(textlogger.NewConfig()))
+		Expect(err).ToNot(BeNil())
+		Expect(err.Error()).To(Equal("request is queued"))
+
+		key := deployer.GetKey(clusterSummary.Spec.ClusterNamespace, clusterSummary.Spec.ClusterName,
+			clusterSummary.Name, string(libsveltosv1beta1.FeatureResources), libsveltosv1beta1.ClusterTypeCapi, false)
+		Expect(dep.IsKeyInProgress(key)).To(BeTrue())
+	})
+
+	It("deployFeature when feature is not deployed, calls Deploy", func() {
+		configMap := createConfigMapWithPolicy(namespace, randomString(), fmt.Sprintf(viewClusterRole, randomString()))
+		Expect(addTypeInformationToObject(scheme, configMap)).To(Succeed())
+
+		clusterSummary.Spec.ClusterProfileSpec.PolicyRefs = []configv1beta1.PolicyRef{
+			{
+				Namespace: configMap.Namespace,
+				Name:      configMap.Name,
+				Kind:      string(libsveltosv1beta1.ConfigMapReferencedResourceKind),
+			},
+		}
+
+		ns := &corev1.Namespace{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: configMap.Namespace,
+			},
+		}
+		Expect(testEnv.Create(context.TODO(), ns)).To(Succeed())
+		Expect(waitForObject(context.TODO(), testEnv.Client, ns)).To(Succeed())
+
+		Expect(testEnv.Create(context.TODO(), configMap)).To(Succeed())
+		Expect(testEnv.Create(context.TODO(), cluster)).To(Succeed())
+		Expect(waitForObject(context.TODO(), testEnv.Client, cluster)).To(Succeed())
+
+		Expect(testEnv.Create(context.TODO(), clusterSummary)).To(Succeed())
+		Expect(testEnv.Create(context.TODO(), clusterProfile)).To(Succeed())
+		Expect(waitForObject(context.TODO(), testEnv.Client, clusterProfile)).To(Succeed())
+
+		clusterSummaryScope := getClusterSummaryScope(testEnv.Client, logger, clusterProfile, clusterSummary)
+
+		dep := fakedeployer.GetClient(context.TODO(), textlogger.NewLogger(textlogger.NewConfig()), testEnv.Client)
+
+		reconciler := getClusterSummaryReconciler(testEnv.Client, dep)
+
+		f := controllers.GetHandlersForFeature(libsveltosv1beta1.FeatureResources)
+
+		// The feature is not marked as deployed in ClusterSummary Status. In such situation, DeployFeature calls dep.Deploy.
+		// fake deployer Deploy simply adds key to InProgress.
+		// So run DeployFeature then validate key is added to InProgress
+		err := controllers.DeployFeature(reconciler, context.TODO(), clusterSummaryScope, f, textlogger.NewLogger(textlogger.NewConfig()))
+		Expect(err).ToNot(BeNil())
+		Expect(err.Error()).To(Equal("request is queued"))
+
+		key := deployer.GetKey(clusterSummary.Spec.ClusterNamespace, clusterSummary.Spec.ClusterName,
+			clusterSummary.Name, string(libsveltosv1beta1.FeatureResources), libsveltosv1beta1.ClusterTypeCapi, false)
+		Expect(dep.IsKeyInProgress(key)).To(BeTrue())
+	})
+
+	It("undeployFeature when feature is removed, does nothing", func() {
+		initObjects := []client.Object{
+			clusterSummary,
+			clusterProfile,
+			cluster,
+		}
+
+		c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(initObjects...).WithObjects(initObjects...).Build()
+
+		clusterSummaryScope := getClusterSummaryScope(c, logger, clusterProfile, clusterSummary)
+
+		clusterSummary.Status.FeatureSummaries = []configv1beta1.FeatureSummary{
+			{
+				FeatureID: libsveltosv1beta1.FeatureResources,
+				Status:    libsveltosv1beta1.FeatureStatusRemoved,
+			},
+		}
+
+		Expect(c.Status().Update(context.TODO(), clusterSummary)).To(Succeed())
+
+		dep := fakedeployer.GetClient(context.TODO(), textlogger.NewLogger(textlogger.NewConfig()), c)
+
+		reconciler := getClusterSummaryReconciler(c, dep)
+
+		f := controllers.GetHandlersForFeature(libsveltosv1beta1.FeatureResources)
+
+		// ClusterSummary Status is reporting feature has removed.
+		// UndeployFeature is supposed to return before calling dep.Deploy (fake deployer Deploy once called simply
+		// adds key to InProgress).
+		// So run UndeployFeature then validate key is not added to InProgress
+		err := controllers.UndeployFeature(reconciler, context.TODO(), clusterSummaryScope, f, textlogger.NewLogger(textlogger.NewConfig()))
+		Expect(err).To(BeNil())
+
+		key := deployer.GetKey(clusterSummary.Spec.ClusterNamespace, clusterSummary.Spec.ClusterName,
+			clusterSummary.Name, string(libsveltosv1beta1.FeatureResources), libsveltosv1beta1.ClusterTypeCapi, true)
+		Expect(dep.IsKeyInProgress(key)).To(BeFalse())
+	})
+
+	It("undeployFeature when feature is not removed, calls Deploy", func() {
+		clusterSummary.Spec.ClusterProfileSpec.PolicyRefs = []configv1beta1.PolicyRef{
+			{
+				Namespace: randomString(),
+				Name:      randomString(),
+				Kind:      string(libsveltosv1beta1.ConfigMapReferencedResourceKind),
+			},
+		}
+
+		initObjects := []client.Object{
+			clusterSummary,
+			clusterProfile,
+			cluster,
+		}
+
+		c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(initObjects...).WithObjects(initObjects...).Build()
+
+		clusterSummaryScope := getClusterSummaryScope(c, logger, clusterProfile, clusterSummary)
+
+		dep := fakedeployer.GetClient(context.TODO(), textlogger.NewLogger(textlogger.NewConfig()), c)
+
+		reconciler := getClusterSummaryReconciler(c, dep)
+
+		f := controllers.GetHandlersForFeature(libsveltosv1beta1.FeatureResources)
+
+		// The feature is not marked as removed in ClusterSummary Status. In such situation, UndeployFeature calls dep.Deploy.
+		// fake deployer Deploy simply adds key to InProgress.
+		// So run UndeployFeature then validate key is added to InProgress
+		err := controllers.UndeployFeature(reconciler, context.TODO(), clusterSummaryScope, f, textlogger.NewLogger(textlogger.NewConfig()))
+		Expect(err).ToNot(BeNil())
+		Expect(err.Error()).To(Equal("cleanup request is queued"))
+
+		key := deployer.GetKey(clusterSummary.Spec.ClusterNamespace, clusterSummary.Spec.ClusterName,
+			clusterSummary.Name, string(libsveltosv1beta1.FeatureResources), libsveltosv1beta1.ClusterTypeCapi, true)
+		Expect(dep.IsKeyInProgress(key)).To(BeTrue())
+	})
+
+	It("undeployFeature sets FailureMessage when undeploy fails with a Forbidden error", func() {
+		clusterSummary.Spec.ClusterProfileSpec.PolicyRefs = []configv1beta1.PolicyRef{
+			{
+				Namespace: randomString(),
+				Name:      randomString(),
+				Kind:      string(libsveltosv1beta1.ConfigMapReferencedResourceKind),
+			},
+		}
+		clusterSummary.Status.FeatureSummaries = []configv1beta1.FeatureSummary{
+			{FeatureID: libsveltosv1beta1.FeatureResources, Status: libsveltosv1beta1.FeatureStatusRemoving},
+		}
+
+		initObjects := []client.Object{
+			clusterSummary,
+			clusterProfile,
+			cluster,
+		}
+
+		c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(initObjects...).WithObjects(initObjects...).Build()
+
+		clusterSummaryScope := getClusterSummaryScope(c, logger, clusterProfile, clusterSummary)
+
+		// An admission webhook denying the delete request surfaces to the client as a Forbidden
+		// error, same as a genuine RBAC permission error. Verify the underlying message is not lost.
+		webhookDenialErr := apierrors.NewForbidden(schema.GroupResource{Group: "network.kmetal.io", Resource: "eipclaims"},
+			"external", fmt.Errorf("admission webhook \"veipclaim.kb.io\" denied the request: cannot delete EipClaim"))
+
+		dep := fakedeployer.GetClient(context.TODO(), textlogger.NewLogger(textlogger.NewConfig()), c)
+		dep.StoreResult(clusterSummary.Spec.ClusterNamespace, clusterSummary.Spec.ClusterName,
+			clusterSummary.Name, string(libsveltosv1beta1.FeatureResources), libsveltosv1beta1.ClusterTypeCapi, true,
+			webhookDenialErr)
+
+		reconciler := getClusterSummaryReconciler(c, dep)
+
+		f := controllers.GetHandlersForFeature(libsveltosv1beta1.FeatureResources)
+
+		err := controllers.UndeployFeature(reconciler, context.TODO(), clusterSummaryScope, f, textlogger.NewLogger(textlogger.NewConfig()))
+		Expect(err).To(BeNil())
+
+		var featureSummary *configv1beta1.FeatureSummary
+		for i := range clusterSummaryScope.ClusterSummary.Status.FeatureSummaries {
+			fs := &clusterSummaryScope.ClusterSummary.Status.FeatureSummaries[i]
+			if fs.FeatureID == libsveltosv1beta1.FeatureResources {
+				featureSummary = fs
+			}
+		}
+		Expect(featureSummary).ToNot(BeNil())
+		Expect(featureSummary.Status).To(Equal(libsveltosv1beta1.FeatureStatusRemoving))
+		Expect(featureSummary.FailureMessage).ToNot(BeNil())
+		Expect(*featureSummary.FailureMessage).To(Equal(webhookDenialErr.Error()))
+	})
+
+	//nolint: dupl // better readibility of test
+	It("deployFeature return an error if cleaning up is in progress", func() {
+		clusterSummary.Spec.ClusterProfileSpec.PolicyRefs = []configv1beta1.PolicyRef{
+			{
+				Namespace: randomString(), Name: randomString(),
+				Kind: string(libsveltosv1beta1.ConfigMapReferencedResourceKind),
+			},
+		}
+
+		initObjects := []client.Object{
+			clusterSummary,
+			clusterProfile,
+			cluster,
+		}
+
+		c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(initObjects...).WithObjects(initObjects...).Build()
+
+		clusterSummaryScope := getClusterSummaryScope(c, logger, clusterProfile, clusterSummary)
+
+		dep := fakedeployer.GetClient(context.TODO(), textlogger.NewLogger(textlogger.NewConfig()), c)
+		dep.StoreInProgress(clusterSummary.Spec.ClusterNamespace, clusterSummary.Spec.ClusterName,
+			clusterSummary.Name, string(libsveltosv1beta1.FeatureResources), libsveltosv1beta1.ClusterTypeCapi, true)
+		clusterSummary.Status.FeatureSummaries = []configv1beta1.FeatureSummary{
+			{FeatureID: libsveltosv1beta1.FeatureResources, Status: libsveltosv1beta1.FeatureStatusRemoving},
+		}
+
+		reconciler := getClusterSummaryReconciler(c, dep)
+
+		f := controllers.GetHandlersForFeature(libsveltosv1beta1.FeatureResources)
+
+		err := controllers.DeployFeature(reconciler, context.TODO(), clusterSummaryScope, f, textlogger.NewLogger(textlogger.NewConfig()))
+		Expect(err).ToNot(BeNil())
+		Expect(err.Error()).To(Equal("cleanup of Resources still in progress. Wait before redeploying"))
+	})
+
+	//nolint: dupl // better readibility of test
+	It("undeployFeatures returns an error if deploying is in progress", func() {
+		clusterSummary.Spec.ClusterProfileSpec.PolicyRefs = []configv1beta1.PolicyRef{
+			{
+				Namespace: randomString(), Name: randomString(),
+				Kind: string(libsveltosv1beta1.ConfigMapReferencedResourceKind),
+			},
+		}
+
+		initObjects := []client.Object{
+			clusterSummary,
+			clusterProfile,
+			cluster,
+		}
+
+		c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(initObjects...).WithObjects(initObjects...).Build()
+
+		clusterSummaryScope := getClusterSummaryScope(c, logger, clusterProfile, clusterSummary)
+
+		dep := fakedeployer.GetClient(context.TODO(), textlogger.NewLogger(textlogger.NewConfig()), c)
+		dep.StoreInProgress(clusterSummary.Spec.ClusterNamespace, clusterSummary.Spec.ClusterName,
+			clusterSummary.Name, string(libsveltosv1beta1.FeatureResources), libsveltosv1beta1.ClusterTypeCapi, false)
+		clusterSummary.Status.FeatureSummaries = []configv1beta1.FeatureSummary{
+			{FeatureID: libsveltosv1beta1.FeatureResources, Status: libsveltosv1beta1.FeatureStatusProvisioning},
+		}
+
+		reconciler := getClusterSummaryReconciler(c, dep)
+
+		f := controllers.GetHandlersForFeature(libsveltosv1beta1.FeatureResources)
+
+		err := controllers.UndeployFeature(reconciler, context.TODO(), clusterSummaryScope, f, textlogger.NewLogger(textlogger.NewConfig()))
+		Expect(err).ToNot(BeNil())
+		Expect(err.Error()).To(Equal("deploying Resources still in progress. Wait before cleanup"))
+	})
+
+	It("handleDeployerError keeps retrying a health check failure without double-counting it", func() {
+		// proceedDeployingFeature already records this failure as FeatureStatusFailed, with this
+		// same error, before calling handleDeployerError. Reproduce that here so the test catches
+		// handleDeployerError re-applying the same update and counting this one failure twice.
+		clusterSummary.Status.FeatureSummaries = []configv1beta1.FeatureSummary{
+			{
+				FeatureID:           libsveltosv1beta1.FeatureResources,
+				Status:              libsveltosv1beta1.FeatureStatusFailed,
+				ConsecutiveFailures: 1,
+			},
+		}
+
+		initObjects := []client.Object{clusterSummary, clusterProfile}
+		c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(initObjects...).WithObjects(initObjects...).Build()
+		clusterSummaryScope := getClusterSummaryScope(c, logger, clusterProfile, clusterSummary)
+		reconciler := getClusterSummaryReconciler(c, nil)
+		f := controllers.GetHandlersForFeature(libsveltosv1beta1.FeatureResources)
+
+		healthErr := &clusterops.HealthCheckError{
+			FeatureID: libsveltosv1beta1.FeatureResources,
+			CheckName: randomString(),
+		}
+
+		shouldReturn, err := controllers.HandleDeployerError(reconciler, healthErr, clusterSummaryScope, f, nil, logger)
+		Expect(shouldReturn).To(BeTrue())
+		var returnedHealthErr *clusterops.HealthCheckError
+		Expect(errors.As(err, &returnedHealthErr)).To(BeTrue())
+
+		fs := controllers.GetFeatureSummaryForFeatureID(clusterSummary, libsveltosv1beta1.FeatureResources)
+		Expect(fs).ToNot(BeNil())
+		Expect(fs.Status).To(Equal(libsveltosv1beta1.FeatureStatusFailed))
+		Expect(fs.ConsecutiveFailures).To(Equal(uint(1)))
+	})
+
+	It("handleDeployerError honors MaxConsecutiveFailures for a health check that keeps failing", func() {
+		maxConsecutiveFailures := uint(3)
+		clusterSummary.Spec.ClusterProfileSpec.MaxConsecutiveFailures = &maxConsecutiveFailures
+		clusterSummary.Status.FeatureSummaries = []configv1beta1.FeatureSummary{
+			{
+				FeatureID:           libsveltosv1beta1.FeatureResources,
+				Status:              libsveltosv1beta1.FeatureStatusFailed,
+				ConsecutiveFailures: maxConsecutiveFailures,
+			},
+		}
+
+		initObjects := []client.Object{clusterSummary, clusterProfile}
+		c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(initObjects...).WithObjects(initObjects...).Build()
+		clusterSummaryScope := getClusterSummaryScope(c, logger, clusterProfile, clusterSummary)
+		reconciler := getClusterSummaryReconciler(c, nil)
+		f := controllers.GetHandlersForFeature(libsveltosv1beta1.FeatureResources)
+
+		healthErr := &clusterops.HealthCheckError{
+			FeatureID: libsveltosv1beta1.FeatureResources,
+			CheckName: randomString(),
+		}
+
+		// Once MaxConsecutiveFailures is reached, a health check failure must stop being retried
+		// just like any other error type, instead of retrying forever.
+		shouldReturn, err := controllers.HandleDeployerError(reconciler, healthErr, clusterSummaryScope, f, nil, logger)
+		Expect(shouldReturn).To(BeTrue())
+		Expect(err).To(BeNil())
+
+		fs := controllers.GetFeatureSummaryForFeatureID(clusterSummary, libsveltosv1beta1.FeatureResources)
+		Expect(fs).ToNot(BeNil())
+		Expect(fs.Status).To(Equal(libsveltosv1beta1.FeatureStatusFailedNonRetriable))
+	})
+})
+
+var _ = Describe("Convert result", func() {
+	It("convertResultStatus correctly converts deployer.ResultStatus to FeatureStatus", func() {
+		reconciler := getClusterSummaryReconciler(nil, nil)
+
+		result := deployer.Result{
+			ResultStatus: deployer.InProgress,
+		}
+		featureStatus := controllers.ConvertResultStatus(reconciler, result)
+		Expect(featureStatus).ToNot(BeNil())
+		Expect(*featureStatus).To(Equal(libsveltosv1beta1.FeatureStatusProvisioning))
+
+		result.ResultStatus = deployer.Deployed
+		featureStatus = controllers.ConvertResultStatus(reconciler, result)
+		Expect(featureStatus).ToNot(BeNil())
+		Expect(*featureStatus).To(Equal(libsveltosv1beta1.FeatureStatusProvisioned))
+
+		result.ResultStatus = deployer.Failed
+		featureStatus = controllers.ConvertResultStatus(reconciler, result)
+		Expect(featureStatus).ToNot(BeNil())
+		Expect(*featureStatus).To(Equal(libsveltosv1beta1.FeatureStatusFailed))
+
+		result.ResultStatus = deployer.Removed
+		featureStatus = controllers.ConvertResultStatus(reconciler, result)
+		Expect(featureStatus).ToNot(BeNil())
+		Expect(*featureStatus).To(Equal(libsveltosv1beta1.FeatureStatusRemoved))
+
+		result.ResultStatus = deployer.Unavailable
+		featureStatus = controllers.ConvertResultStatus(reconciler, result)
+		Expect(featureStatus).To(BeNil())
+	})
+})
+
+func getClusterSummaryScope(c client.Client, logger logr.Logger,
+	clusterProfile *configv1beta1.ClusterProfile, clusterSummary *configv1beta1.ClusterSummary,
+) *scope.ClusterSummaryScope {
+
+	clusterSummaryScope, err := scope.NewClusterSummaryScope(&scope.ClusterSummaryScopeParams{
+		Client:         c,
+		Logger:         logger,
+		Profile:        clusterProfile,
+		ClusterSummary: clusterSummary,
+		ControllerName: testControllerNameSummary,
+	})
+	Expect(err).To(BeNil())
+	return clusterSummaryScope
+}

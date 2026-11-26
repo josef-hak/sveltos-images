@@ -1,0 +1,869 @@
+/*
+Copyright 2023. projectsveltos.io. All rights reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package controllers_test
+
+import (
+	"archive/tar"
+	"bytes"
+	"compress/gzip"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"reflect"
+
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+
+	sourcev1 "github.com/fluxcd/source-controller/api/v1"
+	"github.com/go-logr/logr"
+	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/klog/v2/textlogger"
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	configv1beta1 "github.com/projectsveltos/addon-controller/api/v1beta1"
+	"github.com/projectsveltos/addon-controller/controllers"
+	"github.com/projectsveltos/addon-controller/lib/clusterops"
+	libsveltosv1beta1 "github.com/projectsveltos/libsveltos/api/v1beta1"
+	"github.com/projectsveltos/libsveltos/lib/deployer"
+)
+
+var _ = Describe("KustomizeRefs", func() {
+	var clusterProfile *configv1beta1.ClusterProfile
+	var clusterSummary *configv1beta1.ClusterSummary
+	var cluster *clusterv1.Cluster
+	var namespace string
+
+	BeforeEach(func() {
+		namespace = randomString()
+
+		cluster = &clusterv1.Cluster{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      upstreamClusterNamePrefix + randomString(),
+				Namespace: namespace,
+				Labels: map[string]string{
+					testDCLabelKey: testEngValue,
+				},
+			},
+		}
+
+		clusterProfile = &configv1beta1.ClusterProfile{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: clusterProfileNamePrefix + randomString(),
+			},
+			Spec: configv1beta1.Spec{
+				ClusterSelector: libsveltosv1beta1.Selector{
+					LabelSelector: metav1.LabelSelector{
+						MatchLabels: map[string]string{
+							randomString(): randomString(),
+						},
+					},
+				},
+			},
+		}
+
+		clusterSummaryName := clusterops.GetClusterSummaryName(configv1beta1.ClusterProfileKind,
+			clusterProfile.Name, cluster.Name, false)
+		clusterSummary = &configv1beta1.ClusterSummary{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      clusterSummaryName,
+				Namespace: cluster.Namespace,
+			},
+			Spec: configv1beta1.ClusterSummarySpec{
+				ClusterNamespace: cluster.Namespace,
+				ClusterName:      cluster.Name,
+				ClusterType:      libsveltosv1beta1.ClusterTypeCapi,
+			},
+		}
+
+		prepareForDeployment(clusterProfile, clusterSummary, cluster)
+
+		// Get ClusterSummary so OwnerReference is set
+		Expect(testEnv.Get(context.TODO(),
+			types.NamespacedName{Namespace: clusterSummary.Namespace, Name: clusterSummary.Name}, clusterSummary)).To(Succeed())
+	})
+
+	AfterEach(func() {
+		deleteResources(namespace, clusterProfile, clusterSummary)
+	})
+
+	It("undeployKustomizeRefs removes all ClusterRole and Role created by a ClusterSummary", func() {
+		serviceAccount := &corev1.ServiceAccount{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: namespace,
+				Name:      randomString(),
+				Labels: map[string]string{
+					deployer.ReasonLabel: string(libsveltosv1beta1.FeatureKustomize),
+				},
+				Annotations: map[string]string{
+					deployer.ReferenceKindAnnotation:      string(libsveltosv1beta1.ConfigMapReferencedResourceKind),
+					deployer.ReferenceNameAnnotation:      randomString(),
+					deployer.ReferenceNamespaceAnnotation: randomString(),
+				},
+			},
+		}
+
+		configMap := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: namespace,
+				Name:      randomString(),
+			},
+		}
+
+		clusterRole := &rbacv1.ClusterRole{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: randomString(),
+				Labels: map[string]string{
+					deployer.ReasonLabel: string(libsveltosv1beta1.FeatureKustomize),
+				},
+				Annotations: map[string]string{
+					deployer.ReferenceKindAnnotation:      string(libsveltosv1beta1.ConfigMapReferencedResourceKind),
+					deployer.ReferenceNameAnnotation:      randomString(),
+					deployer.ReferenceNamespaceAnnotation: randomString(),
+				},
+			},
+		}
+
+		Expect(addTypeInformationToObject(testEnv.Scheme(), clusterSummary)).To(Succeed())
+
+		Expect(testEnv.Create(context.TODO(), serviceAccount)).To(Succeed())
+		Expect(testEnv.Create(context.TODO(), configMap)).To(Succeed())
+		Expect(testEnv.Create(context.TODO(), clusterRole)).To(Succeed())
+		Expect(waitForObject(context.TODO(), testEnv.Client, clusterRole)).To(Succeed())
+		addOwnerReference(ctx, testEnv.Client, serviceAccount, clusterProfile)
+		addOwnerReference(ctx, testEnv.Client, clusterRole, clusterProfile)
+
+		currentClusterSummary := &configv1beta1.ClusterSummary{}
+		Expect(testEnv.Get(context.TODO(),
+			types.NamespacedName{Namespace: clusterSummary.Namespace, Name: clusterSummary.Name},
+			currentClusterSummary)).To(Succeed())
+		currentClusterSummary.Status.FeatureSummaries = []configv1beta1.FeatureSummary{
+			{
+				FeatureID: libsveltosv1beta1.FeatureKustomize,
+				Status:    libsveltosv1beta1.FeatureStatusProvisioned,
+			},
+		}
+		currentClusterSummary.Status.DeployedGVKs = []libsveltosv1beta1.FeatureDeploymentInfo{
+			{
+				FeatureID: libsveltosv1beta1.FeatureKustomize,
+				DeployedGroupVersionKind: []string{
+					"ServiceAccount.v1.",
+					"ConfigMaps.v1.",
+					testClusterRoleKindV1,
+				},
+			},
+		}
+		Expect(testEnv.Status().Update(context.TODO(), currentClusterSummary)).To(Succeed())
+
+		// Wait for cache to be updated
+		Eventually(func() bool {
+			err := testEnv.Get(context.TODO(),
+				types.NamespacedName{Namespace: clusterSummary.Namespace, Name: clusterSummary.Name},
+				currentClusterSummary)
+			return err == nil &&
+				currentClusterSummary.Status.FeatureSummaries != nil
+		}, timeout, pollingInterval).Should(BeTrue())
+
+		Expect(controllers.GenericUndeploy(ctx, testEnv.Client, cluster.Namespace, cluster.Name, clusterSummary.Name,
+			string(libsveltosv1beta1.FeatureKustomize), libsveltosv1beta1.ClusterTypeCapi, deployer.Options{},
+			textlogger.NewLogger(textlogger.NewConfig()))).To(Succeed())
+
+		// undeployKustomizeRefs finds all policies deployed because of a clusterSummary and deletes those.
+		// Expect ServiceAccount and ClusterRole to be deleted. ConfigMap should remain as Labels are not set on it
+
+		currentServiceAccount := &corev1.ServiceAccount{}
+		Eventually(func() bool {
+			err := testEnv.Get(context.TODO(),
+				types.NamespacedName{Namespace: serviceAccount.Namespace, Name: serviceAccount.Name}, currentServiceAccount)
+			return err != nil &&
+				apierrors.IsNotFound(err)
+		}, timeout, pollingInterval).Should(BeTrue())
+
+		currentClusterRole := &rbacv1.ClusterRole{}
+		Eventually(func() bool {
+			err := testEnv.Get(context.TODO(),
+				types.NamespacedName{Name: clusterRole.Name}, currentClusterRole)
+			return err != nil &&
+				apierrors.IsNotFound(err)
+		}, timeout, pollingInterval).Should(BeTrue())
+
+		currentConfigMap := &corev1.ConfigMap{}
+		Eventually(func() bool {
+			err := testEnv.Get(context.TODO(),
+				types.NamespacedName{Namespace: configMap.Namespace, Name: configMap.Name}, currentConfigMap)
+			return err == nil
+		}, timeout, pollingInterval).Should(BeTrue())
+	})
+
+	It("extractTarGz extracts tar.gz", func() {
+		defer os.RemoveAll("testdata")
+		createTarGz("testdata/test.tar.gz")
+
+		// Create a temporary directory to use as the destination for the extracted files
+		dest, err := os.MkdirTemp("", "test")
+		Expect(err).To(BeNil())
+		defer os.RemoveAll(dest)
+
+		// Extract the test tarball to the destination
+		err = controllers.ExtractTarGz("testdata/test.tar.gz", dest)
+		Expect(err).To(BeNil())
+
+		// Check that the extracted files match the expected contents
+		expectedContents := map[string]string{
+			"test.txt":         "This is a test file.",
+			"testdir/test.txt": "This is another test file.",
+		}
+		for path, expectedContents := range expectedContents {
+			filePath := filepath.Join(dest, path)
+			var contents []byte
+			contents, err = os.ReadFile(filePath)
+			Expect(err).To(BeNil())
+			Expect(string(contents)).To(Equal(expectedContents))
+		}
+
+		// Check that no additional files were extracted
+		extraFilePath := filepath.Join(dest, "testdir", "extra.txt")
+		_, err = os.Stat(extraFilePath)
+		Expect(os.IsNotExist(err)).To(BeTrue())
+	})
+
+	It("extractTarGz extracts an uncompressed tar archive", func() {
+		srcDir, err := os.MkdirTemp("", "test")
+		Expect(err).To(BeNil())
+		defer os.RemoveAll(srcDir)
+
+		src := filepath.Join(srcDir, "plain.tar")
+		writeTarArchive(src, false, map[string]string{
+			"overlay.yaml": "namePrefix: uncompressed-\n",
+		})
+
+		dest, err := os.MkdirTemp("", "extract")
+		Expect(err).To(BeNil())
+		defer os.RemoveAll(dest)
+
+		Expect(controllers.ExtractTarGz(src, dest)).To(Succeed())
+
+		contents, err := os.ReadFile(filepath.Join(dest, "overlay.yaml"))
+		Expect(err).To(BeNil())
+		Expect(string(contents)).To(ContainSubstring("namePrefix"))
+	})
+
+	It("extractTarGz skips AppleDouble and PAX header entries", func() {
+		srcDir, err := os.MkdirTemp("", "test")
+		Expect(err).To(BeNil())
+		defer os.RemoveAll(srcDir)
+
+		src := filepath.Join(srcDir, "with-junk.tar.gz")
+		writeTarArchive(src, true, map[string]string{
+			"kustomization.yaml":    "resources:\n- deploy.yaml\n",
+			"._kustomization.yaml":  "\x00\x05\x16\x07AppleDouble binary junk",
+			"PaxHeader/deploy.yaml": "not a real manifest",
+		})
+
+		dest, err := os.MkdirTemp("", "extract")
+		Expect(err).To(BeNil())
+		defer os.RemoveAll(dest)
+
+		Expect(controllers.ExtractTarGz(src, dest)).To(Succeed())
+
+		_, err = os.ReadFile(filepath.Join(dest, "kustomization.yaml"))
+		Expect(err).To(BeNil())
+
+		_, err = os.Stat(filepath.Join(dest, "._kustomization.yaml"))
+		Expect(os.IsNotExist(err)).To(BeTrue())
+
+		_, err = os.Stat(filepath.Join(dest, "PaxHeader", "deploy.yaml"))
+		Expect(os.IsNotExist(err)).To(BeTrue())
+	})
+})
+
+var _ = Describe("Hash methods", func() {
+	It(`getKustomizeReferenceResourceHash returns consistent hash considering all referenced
+	ConfigMap/Secret in the ValueFrom section`, func() {
+		namespace := &corev1.Namespace{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: randomString(),
+			},
+		}
+		Expect(testEnv.Create(context.TODO(), namespace)).To(Succeed())
+		Expect(waitForObject(context.TODO(), testEnv, namespace)).To(Succeed())
+
+		configMap := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: namespace.Name,
+				Name:      randomString(),
+			},
+			Data: map[string]string{
+				testClusterNameKey: "{{ .Cluster.metadata.namespace }}-{{ .Cluster.metadata.name }}",
+				testRegionKey:      "west",
+			},
+		}
+		Expect(testEnv.Create(context.TODO(), configMap)).To(Succeed())
+		Expect(waitForObject(context.TODO(), testEnv, configMap)).To(Succeed())
+
+		secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace.Name,
+			Name:      randomString(),
+		},
+			Data: map[string][]byte{
+				"tag":          []byte("a-tag"),
+				testVersionKey: []byte("a-version"),
+			},
+			Type: libsveltosv1beta1.ClusterProfileSecretType,
+		}
+		Expect(testEnv.Create(context.TODO(), secret)).To(Succeed())
+		Expect(waitForObject(context.TODO(), testEnv, secret)).To(Succeed())
+
+		kustomizationRef := configv1beta1.KustomizationRef{
+			Namespace: defaultNamespace,
+			Name:      "kustomization",
+			Kind:      sourcev1.GitRepositoryKind,
+			ValuesFrom: []configv1beta1.ValueFrom{
+				{
+					Kind:      string(libsveltosv1beta1.ConfigMapReferencedResourceKind),
+					Namespace: namespace.Name,
+					Name:      configMap.Name,
+				},
+				{
+					Kind:      string(libsveltosv1beta1.SecretReferencedResourceKind),
+					Namespace: namespace.Name,
+					Name:      secret.Name,
+				},
+			},
+		}
+
+		clusterSummary := &configv1beta1.ClusterSummary{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      randomString(),
+				Namespace: namespace.Name,
+			},
+			Spec: configv1beta1.ClusterSummarySpec{
+				ClusterNamespace: namespace.Name,
+				ClusterName:      randomString(),
+				ClusterType:      libsveltosv1beta1.ClusterTypeSveltos,
+				ClusterProfileSpec: configv1beta1.Spec{
+					KustomizationRefs: []configv1beta1.KustomizationRef{
+						kustomizationRef,
+					},
+				},
+			},
+		}
+		Expect(testEnv.Create(context.TODO(), clusterSummary)).To(Succeed())
+		Expect(waitForObject(context.TODO(), testEnv, clusterSummary)).To(Succeed())
+
+		cluster := &libsveltosv1beta1.SveltosCluster{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      clusterSummary.Spec.ClusterName,
+				Namespace: clusterSummary.Spec.ClusterNamespace,
+			},
+		}
+		Expect(testEnv.Create(context.TODO(), cluster)).To(Succeed())
+		Expect(waitForObject(context.TODO(), testEnv, cluster)).To(Succeed())
+
+		clusterObjects, err := controllers.FetchClusterObjects(context.TODO(), testEnv.Config, testEnv.Client,
+			clusterSummary.Spec.ClusterNamespace, clusterSummary.Spec.ClusterName, libsveltosv1beta1.ClusterTypeSveltos,
+			textlogger.NewLogger(textlogger.NewConfig()))
+		Expect(err).To(BeNil())
+
+		expectedHash, err := controllers.GetKustomizeReferenceResourceHash(context.TODO(), testEnv, clusterSummary,
+			&kustomizationRef, clusterObjects, textlogger.NewLogger(textlogger.NewConfig()))
+		Expect(err).To(BeNil())
+		// Must be consistent
+		for range 10 {
+			hash, err := controllers.GetKustomizeReferenceResourceHash(context.TODO(), testEnv, clusterSummary,
+				&kustomizationRef, clusterObjects, textlogger.NewLogger(textlogger.NewConfig()))
+			Expect(err).To(BeNil())
+			Expect(reflect.DeepEqual(hash, expectedHash)).To(BeTrue())
+		}
+	})
+
+	It("instantiateKustomizeSubstituteValues instantiates substitute values", func() {
+		namespace := randomString()
+		clusterSummary := &configv1beta1.ClusterSummary{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      randomString(),
+				Namespace: namespace,
+			},
+			Spec: configv1beta1.ClusterSummarySpec{
+				ClusterNamespace: namespace,
+				ClusterName:      randomString(),
+				ClusterType:      libsveltosv1beta1.ClusterTypeCapi,
+			},
+		}
+
+		ns := &corev1.Namespace{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: namespace,
+			},
+		}
+
+		Expect(testEnv.Create(context.TODO(), ns)).To(Succeed())
+		Expect(waitForObject(context.TODO(), testEnv.Client, ns)).To(Succeed())
+
+		region := "us-west1"
+		k8sVersion := "v1.29.0"
+		cidrBlock := "192.168.10.0/24"
+		cluster := &clusterv1.Cluster{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: clusterSummary.Spec.ClusterNamespace,
+				Name:      clusterSummary.Spec.ClusterName,
+				Labels: map[string]string{
+					testRegionKey: region,
+				},
+			},
+			Spec: clusterv1.ClusterSpec{
+				Topology: clusterv1.Topology{
+					Version: k8sVersion,
+				},
+				ClusterNetwork: clusterv1.ClusterNetwork{
+					Pods: clusterv1.NetworkRanges{
+						CIDRBlocks: []string{cidrBlock},
+					},
+				},
+			},
+		}
+
+		Expect(testEnv.Create(context.TODO(), cluster)).To(Succeed())
+		Expect(waitForObject(context.TODO(), testEnv.Client, cluster)).To(Succeed())
+
+		content, err := runtime.DefaultUnstructuredConverter.ToUnstructured(cluster)
+		Expect(err).To(BeNil())
+
+		var uCluster unstructured.Unstructured
+		uCluster.SetUnstructuredContent(content)
+
+		mgmtResources := map[string]*unstructured.Unstructured{
+			clusterKind: &uCluster,
+		}
+
+		values := map[string]string{
+			testRegionKey:  testRegionLabelTemplate,
+			testVersionKey: `{{ .Cluster.spec.topology.version }}`,
+			`cidrs`: `{{ range $cidr := .Cluster.spec.clusterNetwork.pods.cidrBlocks }}
+            - cidr: {{ $cidr }}
+              encapsulation: VXLAN
+          {{ end }}`,
+		}
+
+		clusterObjects, err := controllers.FetchClusterObjects(context.TODO(), testEnv.Config, testEnv.Client,
+			clusterSummary.Spec.ClusterNamespace, clusterSummary.Spec.ClusterName, libsveltosv1beta1.ClusterTypeCapi,
+			textlogger.NewLogger(textlogger.NewConfig()))
+		Expect(err).To(BeNil())
+
+		result, err := controllers.InstantiateKustomizeSubstituteValues(context.TODO(),
+			controllers.NewDeploymentContext(clusterSummary, clusterObjects, mgmtResources),
+			values, textlogger.NewLogger(textlogger.NewConfig()))
+		Expect(err).To(BeNil())
+		v, ok := result[testRegionKey]
+		Expect(ok).To(BeTrue())
+		Expect(v).To(Equal(region))
+
+		v, ok = result[testVersionKey]
+		Expect(ok).To(BeTrue())
+		Expect(v).To(Equal(k8sVersion))
+
+		v, ok = result["cidrs"]
+		Expect(ok).To(BeTrue())
+		Expect(v).To(ContainSubstring(cidrBlock))
+	})
+
+	It("getKustomizeSubstituteValuesFrom collects substitute values from referenced ConfigMap/Secrets", func() {
+		namespace := randomString()
+		configMap := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: namespace,
+				Name:      randomString(),
+			},
+			Data: map[string]string{
+				randomString(): randomString(),
+				randomString(): randomString(),
+			},
+		}
+
+		secret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: namespace,
+				Name:      randomString(),
+			},
+			Data: map[string][]byte{
+				randomString(): []byte(randomString()),
+				randomString(): []byte(randomString()),
+			},
+			Type: libsveltosv1beta1.ClusterProfileSecretType,
+		}
+
+		kustomizationRef := &configv1beta1.KustomizationRef{
+			ValuesFrom: []configv1beta1.ValueFrom{
+				{
+					Namespace: configMap.Namespace,
+					Name:      configMap.Name,
+					Kind:      string(libsveltosv1beta1.ConfigMapReferencedResourceKind),
+				},
+				{
+					Namespace: secret.Namespace,
+					Name:      secret.Name,
+					Kind:      string(libsveltosv1beta1.SecretReferencedResourceKind),
+				},
+			},
+			Values: map[string]string{
+				randomString(): randomString(),
+			},
+		}
+
+		clusterSummary := &configv1beta1.ClusterSummary{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      randomString(),
+				Namespace: namespace,
+			},
+			Spec: configv1beta1.ClusterSummarySpec{
+				ClusterNamespace: namespace,
+				ClusterName:      randomString(),
+				ClusterType:      libsveltosv1beta1.ClusterTypeCapi,
+				ClusterProfileSpec: configv1beta1.Spec{
+					KustomizationRefs: []configv1beta1.KustomizationRef{
+						*kustomizationRef,
+					},
+				},
+			},
+		}
+
+		cluster := &clusterv1.Cluster{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      clusterSummary.Spec.ClusterName,
+				Namespace: clusterSummary.Spec.ClusterNamespace,
+			},
+		}
+
+		initObjects := []client.Object{
+			configMap,
+			secret,
+			cluster,
+		}
+
+		c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(initObjects...).Build()
+
+		// This will get alll substitute values considering only ValuesFrom
+		templatedValues, nonTemplatedValues, err := controllers.GetKustomizeSubstituteValuesFrom(context.TODO(), c, clusterSummary, kustomizationRef,
+			textlogger.NewLogger(textlogger.NewConfig()))
+		Expect(err).To(BeNil())
+
+		for k := range configMap.Data {
+			v, ok := templatedValues[k]
+			if !ok {
+				v, ok = nonTemplatedValues[k]
+			}
+			Expect(ok).To(BeTrue())
+			Expect(v).To(Equal(configMap.Data[k]))
+		}
+
+		for k := range secret.Data {
+			v, ok := templatedValues[k]
+			if !ok {
+				v, ok = nonTemplatedValues[k]
+			}
+			Expect(ok).To(BeTrue())
+			Expect(v).To(Equal(string(secret.Data[k])))
+		}
+
+		// This will get alll substitute values considering both Values and ValuesFrom
+		templatedValues, nonTemplatedValues, err = controllers.GetKustomizeSubstituteValues(context.TODO(), c, clusterSummary, kustomizationRef,
+			textlogger.NewLogger(textlogger.NewConfig()))
+		Expect(err).To(BeNil())
+
+		for k := range configMap.Data {
+			v, ok := templatedValues[k]
+			if !ok {
+				v, ok = nonTemplatedValues[k]
+			}
+			Expect(ok).To(BeTrue())
+			Expect(v).To(Equal(configMap.Data[k]))
+		}
+
+		for k := range secret.Data {
+			v, ok := templatedValues[k]
+			if !ok {
+				v, ok = nonTemplatedValues[k]
+			}
+			Expect(ok).To(BeTrue())
+			Expect(v).To(Equal(string(secret.Data[k])))
+		}
+
+		for k := range kustomizationRef.Values {
+			v, ok := templatedValues[k]
+			if !ok {
+				v, ok = nonTemplatedValues[k]
+			}
+			Expect(ok).To(BeTrue())
+			Expect(v).To(Equal(kustomizationRef.Values[k]))
+		}
+	})
+
+	It("instantiateResourceWithSubstituteValues instantiates a Kubernetes resorces with substitte values", func() {
+		deployment := `apiVersion: apps/v1
+		kind: Deployment
+		metadata:
+		  name: nginx-deployment
+		  namespace: {{ .ClusterNamespace }}
+		  labels:
+		    region: {{ default "west" .Region }}
+		spec:
+		  replicas: 2
+		  selector:
+			matchLabels:
+			  app: nginx-{{ .Version }}
+		  template:
+			metadata:
+			  labels:
+			  app: nginx-{{ .Version }}
+			spec:
+			  containers:
+			  - name: nginx
+				image: nginx:{{ .Version }}
+				ports:
+				- containerPort: 80`
+
+		clusterNamespace := randomString()
+		version := "v1.2.0"
+		substituteValues := map[string]string{
+			"ClusterNamespace": clusterNamespace,
+			"Version":          version,
+			"Region":           "",
+		}
+		data, err := controllers.InstantiateResourceWithSubstituteValues(randomString(), []byte(deployment), substituteValues,
+			false, textlogger.NewLogger(textlogger.NewConfig()))
+		Expect(err).To(BeNil())
+
+		Expect(string(data)).To(ContainSubstring(fmt.Sprintf("namespace: %s", clusterNamespace)))
+		Expect(string(data)).To(ContainSubstring(fmt.Sprintf("app: nginx-%s", version)))
+		Expect(string(data)).To(ContainSubstring("region: west"))
+	})
+})
+
+var _ = Describe("RemoteKustomizeURL templating", func() {
+	const (
+		kustomizationFileName = "kustomization.yaml"
+		kustomizationContent  = "resources:\n- deployment.yaml\n"
+		missingFieldURL       = "https://example.com/{{ .Cluster.metadata.labels.region }}.tar.gz"
+	)
+
+	var cluster *clusterv1.Cluster
+	var clusterSummary *configv1beta1.ClusterSummary
+	var logger logr.Logger
+
+	BeforeEach(func() {
+		logger = textlogger.NewLogger(textlogger.NewConfig())
+
+		ns := &corev1.Namespace{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: randomString(),
+			},
+		}
+		Expect(testEnv.Create(context.TODO(), ns)).To(Succeed())
+		Expect(waitForObject(context.TODO(), testEnv.Client, ns)).To(Succeed())
+
+		cluster = &clusterv1.Cluster{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: ns.Name,
+				Name:      upstreamClusterNamePrefix + randomString(),
+				Labels:    map[string]string{"env": "test"},
+			},
+		}
+		Expect(testEnv.Create(context.TODO(), cluster)).To(Succeed())
+		Expect(waitForObject(context.TODO(), testEnv.Client, cluster)).To(Succeed())
+
+		clusterSummary = &configv1beta1.ClusterSummary{
+			Spec: configv1beta1.ClusterSummarySpec{
+				ClusterNamespace: cluster.Namespace,
+				ClusterName:      cluster.Name,
+				ClusterType:      libsveltosv1beta1.ClusterTypeCapi,
+			},
+		}
+	})
+
+	// serveTarGz starts an httptest server returning a gzip-compressed tar built from
+	// entries (name -> content) for every request, and returns its URL and the served
+	// archive bytes, alongside a cleanup func.
+	serveTarGz := func(entries map[string]string) (string, []byte, func()) {
+		tmpFile, err := os.CreateTemp("", "kustomize-remote-*.tar.gz")
+		Expect(err).To(BeNil())
+		Expect(tmpFile.Close()).To(Succeed())
+		defer os.Remove(tmpFile.Name())
+
+		writeTarArchive(tmpFile.Name(), true, entries)
+		archive, err := os.ReadFile(tmpFile.Name())
+		Expect(err).To(BeNil())
+
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, writeErr := w.Write(archive)
+			Expect(writeErr).ToNot(HaveOccurred())
+		}))
+		return server.URL, archive, server.Close
+	}
+
+	It("prepareFileSystemWithRemoteURL instantiates the URL for the target cluster before fetching", func() {
+		url, _, cleanup := serveTarGz(map[string]string{kustomizationFileName: kustomizationContent})
+		defer cleanup()
+
+		kustomizationRef := &configv1beta1.KustomizationRef{
+			RemoteURL: &configv1beta1.RemoteKustomizeURL{
+				URL: url + `/{{ .Cluster.metadata.name }}.tar.gz`,
+			},
+		}
+
+		tmpDir, err := controllers.PrepareFileSystemWithRemoteURL(context.TODO(), kustomizationRef, clusterSummary, logger)
+		Expect(err).To(BeNil())
+		defer os.RemoveAll(tmpDir)
+
+		data, err := os.ReadFile(filepath.Join(tmpDir, kustomizationFileName))
+		Expect(err).To(BeNil())
+		Expect(string(data)).To(Equal(kustomizationContent))
+	})
+
+	It("getHashFromRemoteKustomizeURL instantiates the URL for the target cluster before hashing", func() {
+		url, archive, cleanup := serveTarGz(map[string]string{kustomizationFileName: kustomizationContent})
+		defer cleanup()
+
+		remoteURL := &configv1beta1.RemoteKustomizeURL{
+			URL: url + `/{{ .Cluster.metadata.name }}.tar.gz`,
+		}
+
+		hash, err := controllers.GetHashFromRemoteKustomizeURL(context.TODO(), remoteURL, clusterSummary, logger)
+		Expect(err).To(BeNil())
+
+		expectedHash := sha256.Sum256(archive)
+		Expect(string(hash)).To(Equal(hex.EncodeToString(expectedHash[:])))
+	})
+
+	It("prepareFileSystemWithRemoteURL reports a template instantiation error when the URL references a missing cluster field", func() {
+		kustomizationRef := &configv1beta1.KustomizationRef{
+			RemoteURL: &configv1beta1.RemoteKustomizeURL{
+				URL: missingFieldURL,
+			},
+		}
+
+		_, err := controllers.PrepareFileSystemWithRemoteURL(context.TODO(), kustomizationRef, clusterSummary, logger)
+		Expect(err).To(HaveOccurred())
+		var templateError *configv1beta1.TemplateInstantiationError
+		Expect(errors.As(err, &templateError)).To(BeTrue())
+	})
+
+	It("getHashFromRemoteKustomizeURL ignores a template instantiation error", func() {
+		remoteURL := &configv1beta1.RemoteKustomizeURL{
+			URL: missingFieldURL,
+		}
+
+		hash, err := controllers.GetHashFromRemoteKustomizeURL(context.TODO(), remoteURL, clusterSummary, logger)
+		Expect(err).To(BeNil())
+		Expect(hash).To(BeNil())
+	})
+})
+
+// writeTarArchive builds a tar archive from entries (name -> content) and writes it to
+// dest. When gz is true the archive is gzip-compressed first.
+func writeTarArchive(dest string, gz bool, entries map[string]string) {
+	var tarBuf bytes.Buffer
+	tw := tar.NewWriter(&tarBuf)
+	for name, content := range entries {
+		hdr := &tar.Header{
+			Name:     name,
+			Typeflag: tar.TypeReg,
+			Mode:     0600,
+			Size:     int64(len(content)),
+		}
+		Expect(tw.WriteHeader(hdr)).To(Succeed())
+		_, err := tw.Write([]byte(content))
+		Expect(err).To(BeNil())
+	}
+	Expect(tw.Close()).To(Succeed())
+
+	raw := tarBuf.Bytes()
+	if gz {
+		var gzBuf bytes.Buffer
+		gw := gzip.NewWriter(&gzBuf)
+		_, err := gw.Write(raw)
+		Expect(err).To(BeNil())
+		Expect(gw.Close()).To(Succeed())
+		raw = gzBuf.Bytes()
+	}
+
+	Expect(os.WriteFile(dest, raw, 0600)).To(Succeed())
+}
+
+func createTarGz(dest string) {
+	// Create the test directory and some test files.
+	err := os.MkdirAll("testdata/testdir", 0755)
+	Expect(err).To(BeNil())
+	err = os.WriteFile("testdata/test.txt", []byte("This is a test file."), 0600)
+	Expect(err).To(BeNil())
+	err = os.WriteFile("testdata/testdir/test.txt", []byte("This is another test file."), 0600)
+	Expect(err).To(BeNil())
+
+	// Create the testdata/test.tar.gz file.
+	file, err := os.Create(dest)
+	Expect(err).To(BeNil())
+	defer file.Close()
+
+	gzWriter := gzip.NewWriter(file)
+	defer gzWriter.Close()
+
+	tarWriter := tar.NewWriter(gzWriter)
+	defer tarWriter.Close()
+
+	root, err := os.OpenRoot("testdata")
+	Expect(err).To(BeNil())
+	defer root.Close()
+
+	err = filepath.Walk("testdata/", func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		header, err := tar.FileInfoHeader(info, "")
+		if err != nil {
+			return err
+		}
+		header.Name = path[len("testdata")+1:]
+		err = tarWriter.WriteHeader(header)
+		if err != nil {
+			return err
+		}
+		if !info.Mode().IsRegular() {
+			return nil
+		}
+		f, err := root.Open(path[len("testdata")+1:])
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		_, err = io.Copy(tarWriter, f)
+		return err
+	})
+	Expect(err).To(BeNil())
+}

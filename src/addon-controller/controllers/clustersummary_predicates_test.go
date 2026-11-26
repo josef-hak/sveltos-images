@@ -1,0 +1,465 @@
+/*
+Copyright 2022. projectsveltos.io. All rights reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package controllers_test
+
+import (
+	"encoding/base64"
+	"fmt"
+
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+
+	"github.com/fluxcd/pkg/apis/meta"
+	sourcev1 "github.com/fluxcd/source-controller/api/v1"
+	"github.com/go-logr/logr"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/klog/v2/textlogger"
+	"sigs.k8s.io/controller-runtime/pkg/event"
+
+	configv1beta1 "github.com/projectsveltos/addon-controller/api/v1beta1"
+	"github.com/projectsveltos/addon-controller/controllers"
+	libsveltosv1beta1 "github.com/projectsveltos/libsveltos/api/v1beta1"
+)
+
+var _ = Describe("Clustersummary Predicates: ConfigMapPredicates", func() {
+	var logger logr.Logger
+	var configMap *corev1.ConfigMap
+
+	BeforeEach(func() {
+		logger = textlogger.NewLogger(textlogger.NewConfig())
+		configMap = &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: randomString(),
+			},
+		}
+	})
+
+	It("Create returns true", func() {
+		configMapPredicate := controllers.ConfigMapPredicates(logger)
+
+		e := event.CreateEvent{
+			Object: configMap,
+		}
+
+		result := configMapPredicate.Create(e)
+		Expect(result).To(BeTrue())
+	})
+
+	It("Delete returns true", func() {
+		configMapPredicate := controllers.ConfigMapPredicates(logger)
+
+		e := event.DeleteEvent{
+			Object: configMap,
+		}
+
+		result := configMapPredicate.Delete(e)
+		Expect(result).To(BeTrue())
+	})
+
+	It("Update returns true when data has changed", func() {
+		configMapPredicate := controllers.ConfigMapPredicates(logger)
+		configMap.Data = map[string]string{testChangeKey: "now"}
+
+		oldConfigMap := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: configMap.Name,
+			},
+		}
+
+		e := event.UpdateEvent{
+			ObjectNew: configMap,
+			ObjectOld: oldConfigMap,
+		}
+
+		result := configMapPredicate.Update(e)
+		Expect(result).To(BeTrue())
+	})
+
+	It("Update returns false when Data has not changed", func() {
+		configMapPredicate := controllers.ConfigMapPredicates(logger)
+		configMap = createConfigMapWithPolicy("default", configMap.Name, fmt.Sprintf(viewClusterRole, randomString()))
+
+		oldConfigMap := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:   configMap.Name,
+				Labels: map[string]string{testEnvLabelKey: testTestingValue},
+			},
+			Data: configMap.Data,
+		}
+
+		e := event.UpdateEvent{
+			ObjectNew: configMap,
+			ObjectOld: oldConfigMap,
+		}
+
+		result := configMapPredicate.Update(e)
+		Expect(result).To(BeFalse())
+	})
+
+	It("Update returns true when binaryData has changed", func() {
+		configMapPredicate := controllers.ConfigMapPredicates(logger)
+		configMap.BinaryData = map[string][]byte{randomString(): []byte(randomString())}
+
+		oldConfigMap := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: configMap.Name,
+			},
+		}
+
+		e := event.UpdateEvent{
+			ObjectNew: configMap,
+			ObjectOld: oldConfigMap,
+		}
+
+		result := configMapPredicate.Update(e)
+		Expect(result).To(BeTrue())
+	})
+
+	It("Update returns false when binaryData has not changed", func() {
+		configMapPredicate := controllers.ConfigMapPredicates(logger)
+		configMap.BinaryData = map[string][]byte{randomString(): []byte(randomString())}
+
+		oldConfigMap := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:   configMap.Name,
+				Labels: map[string]string{testEnvLabelKey: testTestingValue},
+			},
+			BinaryData: configMap.BinaryData,
+		}
+
+		e := event.UpdateEvent{
+			ObjectNew: configMap,
+			ObjectOld: oldConfigMap,
+		}
+
+		result := configMapPredicate.Update(e)
+		Expect(result).To(BeFalse())
+	})
+
+	It("Update returns true when annotations changed", func() {
+		configMapPredicate := controllers.ConfigMapPredicates(logger)
+		configMap.Annotations = map[string]string{
+			libsveltosv1beta1.PolicyTemplateAnnotation: testTrueValue,
+		}
+
+		oldConfigMap := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: configMap.Name,
+			},
+		}
+
+		e := event.UpdateEvent{
+			ObjectNew: configMap,
+			ObjectOld: oldConfigMap,
+		}
+
+		result := configMapPredicate.Update(e)
+		Expect(result).To(BeTrue())
+	})
+})
+
+var _ = Describe("Clustersummary Predicates: SecretPredicates", func() {
+	var logger logr.Logger
+	var secret *corev1.Secret
+
+	BeforeEach(func() {
+		logger = textlogger.NewLogger(textlogger.NewConfig())
+		secret = &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: randomString(),
+			},
+		}
+	})
+
+	It("Create returns true", func() {
+		secretPredicate := controllers.SecretPredicates(logger)
+
+		e := event.CreateEvent{
+			Object: secret,
+		}
+
+		result := secretPredicate.Create(e)
+		Expect(result).To(BeTrue())
+	})
+
+	It("Delete returns true", func() {
+		secretPredicate := controllers.SecretPredicates(logger)
+
+		e := event.DeleteEvent{
+			Object: secret,
+		}
+
+		result := secretPredicate.Delete(e)
+		Expect(result).To(BeTrue())
+	})
+
+	It("Update returns true when data has changed", func() {
+		secretPredicate := controllers.SecretPredicates(logger)
+		str := base64.StdEncoding.EncodeToString([]byte("password"))
+		secret.Data = map[string][]byte{testChangeKey: []byte(str)}
+
+		oldSecret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: secret.Name,
+			},
+		}
+
+		e := event.UpdateEvent{
+			ObjectNew: secret,
+			ObjectOld: oldSecret,
+		}
+
+		result := secretPredicate.Update(e)
+		Expect(result).To(BeTrue())
+	})
+
+	It("Update returns false when Data has not changed", func() {
+		secretPredicate := controllers.SecretPredicates(logger)
+
+		oldSecret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:   secret.Name,
+				Labels: map[string]string{testEnvLabelKey: testTestingValue},
+			},
+		}
+
+		e := event.UpdateEvent{
+			ObjectNew: secret,
+			ObjectOld: oldSecret,
+		}
+
+		result := secretPredicate.Update(e)
+		Expect(result).To(BeFalse())
+	})
+
+	It("Update returns true when annotations changed", func() {
+		secretPredicate := controllers.SecretPredicates(logger)
+		secret.Annotations = map[string]string{
+			libsveltosv1beta1.PolicyTemplateAnnotation: testTrueValue,
+		}
+
+		oldSecret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: secret.Name,
+			},
+		}
+
+		e := event.UpdateEvent{
+			ObjectNew: secret,
+			ObjectOld: oldSecret,
+		}
+
+		result := secretPredicate.Update(e)
+		Expect(result).To(BeTrue())
+	})
+})
+
+var _ = Describe("ClusterProfile Predicates: FluxSourcePredicates", func() {
+	var logger logr.Logger
+	var gitRepository *sourcev1.GitRepository
+
+	BeforeEach(func() {
+		logger = textlogger.NewLogger(textlogger.NewConfig())
+		gitRepository = &sourcev1.GitRepository{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      upstreamClusterNamePrefix + randomString(),
+				Namespace: "predicates" + randomString(),
+			},
+		}
+
+		Expect(addTypeInformationToObject(scheme, gitRepository)).To(Succeed())
+	})
+
+	It("Create reprocesses", func() {
+		sourcePredicate := controllers.FluxGitRepositoryPredicate{Logger: logger}
+
+		result := sourcePredicate.Create(event.TypedCreateEvent[*sourcev1.GitRepository]{Object: gitRepository})
+		Expect(result).To(BeTrue())
+	})
+	It("Delete does reprocess", func() {
+		sourcePredicate := controllers.FluxGitRepositoryPredicate{Logger: logger}
+
+		result := sourcePredicate.Delete(event.TypedDeleteEvent[*sourcev1.GitRepository]{Object: gitRepository})
+		Expect(result).To(BeTrue())
+	})
+	It("Update reprocesses when artifact has changed", func() {
+		sourcePredicate := controllers.FluxGitRepositoryPredicate{Logger: logger}
+
+		gitRepository.Status.Artifact = &meta.Artifact{
+			Revision: randomString(),
+		}
+
+		oldGitRepository := &sourcev1.GitRepository{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      gitRepository.Name,
+				Namespace: gitRepository.Namespace,
+			},
+		}
+
+		Expect(addTypeInformationToObject(scheme, oldGitRepository)).To(Succeed())
+
+		result := sourcePredicate.Update(event.TypedUpdateEvent[*sourcev1.GitRepository]{
+			ObjectNew: gitRepository, ObjectOld: oldGitRepository})
+		Expect(result).To(BeTrue())
+	})
+	It("Update does not reprocess when artifact has not changed", func() {
+		sourcePredicate := controllers.FluxGitRepositoryPredicate{Logger: logger}
+
+		gitRepository.Status.Artifact = &meta.Artifact{
+			Revision: randomString(),
+		}
+
+		oldGitRepository := &sourcev1.GitRepository{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      gitRepository.Name,
+				Namespace: gitRepository.Namespace,
+			},
+		}
+		oldGitRepository.Status.Artifact = gitRepository.GetArtifact()
+
+		Expect(addTypeInformationToObject(scheme, oldGitRepository)).To(Succeed())
+
+		result := sourcePredicate.Update(event.TypedUpdateEvent[*sourcev1.GitRepository]{
+			ObjectNew: gitRepository, ObjectOld: oldGitRepository})
+		Expect(result).To(BeFalse())
+	})
+})
+
+var _ = Describe("Clustersummary Predicates: ClusterSummaryPredicate", func() {
+	var logger logr.Logger
+	var clusterSummary *configv1beta1.ClusterSummary
+
+	BeforeEach(func() {
+		logger = textlogger.NewLogger(textlogger.NewConfig())
+		clusterSummary = &configv1beta1.ClusterSummary{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: randomString(),
+			},
+			Status: configv1beta1.ClusterSummaryStatus{
+				HelmReleaseSummaries: []configv1beta1.HelmChartSummary{
+					{
+						ReleaseName:      randomString(),
+						ReleaseNamespace: randomString(),
+						Status:           configv1beta1.HelmChartStatusManaging,
+						ChartName:        randomString(),
+						RepositoryName:   randomString(),
+						RepoURL:          testRepoURLBitnami,
+						ChartVersion:     testChartVersion100,
+					},
+				},
+			},
+		}
+	})
+
+	It("Update returns false when only LatestVersion/LatestPatchVersion/LastCheckedTime change", func() {
+		clusterSummaryPredicate := controllers.ClusterSummaryPredicate{Logger: logger}
+
+		oldClusterSummary := clusterSummary.DeepCopy()
+
+		newLatest := "1.1.0"
+		lastChecked := metav1.Now()
+		clusterSummary.Status.HelmReleaseSummaries[0].LatestVersion = &newLatest
+		clusterSummary.Status.HelmReleaseSummaries[0].LastCheckedTime = &lastChecked
+
+		e := event.UpdateEvent{
+			ObjectNew: clusterSummary,
+			ObjectOld: oldClusterSummary,
+		}
+
+		result := clusterSummaryPredicate.Update(e)
+		Expect(result).To(BeFalse())
+	})
+
+	It("Update returns true when FeatureSummaries change", func() {
+		clusterSummaryPredicate := controllers.ClusterSummaryPredicate{Logger: logger}
+
+		oldClusterSummary := clusterSummary.DeepCopy()
+
+		clusterSummary.Status.FeatureSummaries = []configv1beta1.FeatureSummary{
+			{FeatureID: libsveltosv1beta1.FeatureHelm, Status: libsveltosv1beta1.FeatureStatusProvisioned},
+		}
+
+		e := event.UpdateEvent{
+			ObjectNew: clusterSummary,
+			ObjectOld: oldClusterSummary,
+		}
+
+		result := clusterSummaryPredicate.Update(e)
+		Expect(result).To(BeTrue())
+	})
+
+	It("Update returns true when retrigger annotation changes", func() {
+		clusterSummaryPredicate := controllers.ClusterSummaryPredicate{Logger: logger}
+
+		oldClusterSummary := clusterSummary.DeepCopy()
+
+		clusterSummary.Annotations = map[string]string{"projectsveltos.io/retrigger": randomString()}
+
+		e := event.UpdateEvent{
+			ObjectNew: clusterSummary,
+			ObjectOld: oldClusterSummary,
+		}
+
+		result := clusterSummaryPredicate.Update(e)
+		Expect(result).To(BeTrue())
+	})
+
+	It("Update returns true when redeploy annotation is added or its value changes", func() {
+		clusterSummaryPredicate := controllers.ClusterSummaryPredicate{Logger: logger}
+
+		oldClusterSummary := clusterSummary.DeepCopy()
+
+		clusterSummary.Annotations = map[string]string{configv1beta1.ProfileRedeployAnnotation: randomString()}
+
+		e := event.UpdateEvent{
+			ObjectNew: clusterSummary,
+			ObjectOld: oldClusterSummary,
+		}
+
+		result := clusterSummaryPredicate.Update(e)
+		Expect(result).To(BeTrue())
+
+		oldClusterSummary = clusterSummary.DeepCopy()
+		clusterSummary.Annotations[configv1beta1.ProfileRedeployAnnotation] = randomString()
+
+		e = event.UpdateEvent{
+			ObjectNew: clusterSummary,
+			ObjectOld: oldClusterSummary,
+		}
+
+		result = clusterSummaryPredicate.Update(e)
+		Expect(result).To(BeTrue())
+	})
+
+	It("Update returns false when only an unrelated annotation changes", func() {
+		clusterSummaryPredicate := controllers.ClusterSummaryPredicate{Logger: logger}
+
+		clusterSummary.Annotations = map[string]string{configv1beta1.ProfileRedeployAnnotation: "1"}
+		oldClusterSummary := clusterSummary.DeepCopy()
+
+		clusterSummary.Annotations[randomString()] = randomString()
+
+		e := event.UpdateEvent{
+			ObjectNew: clusterSummary,
+			ObjectOld: oldClusterSummary,
+		}
+
+		result := clusterSummaryPredicate.Update(e)
+		Expect(result).To(BeFalse())
+	})
+})

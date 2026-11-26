@@ -1,0 +1,4 @@
+upstream: https://github.com/projectsveltos/sveltoscluster-manager
+tag: v1.17.0
+commit: 03c8add23f26b2ee8c0fb04ae00068039cce47db
+vendored: 2026-11-26T11:48:37Z

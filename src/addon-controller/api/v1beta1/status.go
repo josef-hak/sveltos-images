@@ -1,0 +1,75 @@
+/*
+Copyright 2024. projectsveltos.io. All rights reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package v1beta1
+
+import (
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+)
+
+// FailedCluster describes an error encountered while trying to
+// manage resources for a specific matching cluster.
+type FailedCluster struct {
+	// ClusterRef is a reference to the cluster where the failure occurred.
+	ClusterRef corev1.ObjectReference `json:"clusterRef"`
+
+	// FailureMessage is a human-readable explanation of why the
+	// ClusterSummary creation/update failed.
+	FailureMessage string `json:"failureMessage"`
+
+	// LastFailureTime is the time the error occurred.
+	// +optional
+	LastFailureTime *metav1.Time `json:"lastFailureTime,omitempty"`
+}
+
+// Status defines the observed state of ClusterProfile/Profile
+type Status struct {
+	// MatchingClusterRefs reference all the clusters currently matching
+	// ClusterProfile ClusterSelector
+	// +optional
+	MatchingClusterRefs []corev1.ObjectReference `json:"matchingClusters,omitempty"`
+
+	// UpdatingClusters reference all the cluster currently matching
+	// ClusterProfile ClusterSelector and being updated
+	// +optional
+	UpdatingClusters Clusters `json:"updatingClusters,omitempty"`
+
+	// UpdatedClusters contains information all the cluster currently matching
+	// ClusterProfile ClusterSelector and already updated to latest ClusterProfile
+	// Spec
+	// +optional
+	UpdatedClusters Clusters `json:"updatedClusters,omitempty"`
+
+	// FailedClusters contains information about clusters for which
+	// a ClusterSummary could not be created or updated.
+	// +optional
+	FailedClusters []FailedCluster `json:"failedClusters,omitempty"`
+
+	// DependenciesHash is a hash representing the set of clusters where this ClusterProfile
+	// must be deployed, based on the combined configuration of its dependencies.
+	DependenciesHash []byte `json:"dependenciesHash,omitempty"`
+
+	// ReconciliationSuspended indicates whether the reconciliation loop for this
+	// ClusterSummary is currently paused due to an external action (e.g., a user annotation).
+	// When true, the status will not be updated unless the pause is lifted.
+	// +optional
+	ReconciliationSuspended bool `json:"reconciliationSuspended,omitempty"`
+
+	// SuspensionReason provides a brief explanation of why the reconciliation is suspended.
+	// +optional
+	SuspensionReason *string `json:"suspensionReason,omitempty"`
+}

@@ -1,0 +1,5 @@
+upstream: https://github.com/projectsveltos/shard-controller
+tag: v1.17.0
+commit: 0fdf06caa0ce1d7d9af7ca7c2cedf5199243e2c6
+vendored: 2026-11-26T11:50:38Z
+pruned: .git doc/

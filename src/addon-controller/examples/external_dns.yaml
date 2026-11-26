@@ -1,0 +1,17 @@
+apiVersion: config.projectsveltos.io/v1beta1
+kind: ClusterProfile
+metadata:
+  name: external-dns
+spec:
+  clusterSelector:
+    matchLabels:
+      env: fv
+  syncMode: Continuous
+  helmCharts:
+  - repositoryURL:    https://kubernetes-sigs.github.io/external-dns/
+    repositoryName:   external-dns
+    chartName:        external-dns/external-dns
+    chartVersion:     1.23.0
+    releaseName:      external-dns
+    releaseNamespace: external-dns
+    helmChartAction:  Install

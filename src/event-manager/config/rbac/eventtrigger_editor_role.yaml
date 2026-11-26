@@ -1,0 +1,24 @@
+# permissions for end users to edit eventtriggers.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: eventtrigger-editor-role
+rules:
+- apiGroups:
+  - lib.projectsveltos.io
+  resources:
+  - eventtriggers
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - lib.projectsveltos.io
+  resources:
+  - eventtriggers/status
+  verbs:
+  - get

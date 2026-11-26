@@ -1,0 +1,17 @@
+apiVersion: config.projectsveltos.io/v1beta1
+kind: ClusterProfile
+metadata:
+  name: vault
+spec:
+  clusterSelector:
+    matchLabels:
+      env: fv
+  syncMode: Continuous
+  helmCharts:
+  - repositoryURL:    oci://registry-1.docker.io/bitnamicharts
+    repositoryName:   oci-vault
+    chartName:        vault
+    chartVersion:     1.9.0
+    releaseName:      vault
+    releaseNamespace: vault
+    helmChartAction:  Install

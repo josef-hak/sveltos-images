@@ -1,0 +1,4 @@
+upstream: https://github.com/projectsveltos/classifier
+tag: v1.17.0
+commit: af2f480771c55b29c642eb64dd968c0153c28a0a
+vendored: 2026-11-26T11:48:35Z

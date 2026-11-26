@@ -1,0 +1,6 @@
+apiVersion: lib.projectsveltos.io/v1alpha1
+kind: EventTrigger
+metadata:
+  name: eventTrigger-sample
+spec:
+  # TODO(user): Add fields here

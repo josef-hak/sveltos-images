@@ -1,0 +1,300 @@
+/*
+Copyright 2023. projectsveltos.io. All rights reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package controllers
+
+import (
+	"context"
+	"fmt"
+
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+
+	configv1beta1 "github.com/projectsveltos/addon-controller/api/v1beta1"
+	libsveltosv1beta1 "github.com/projectsveltos/libsveltos/api/v1beta1"
+	"github.com/projectsveltos/libsveltos/lib/clustercache"
+	logs "github.com/projectsveltos/libsveltos/lib/logsettings"
+)
+
+// requeueClusterHealthCheckForSecret reacts to a Secret change solely to evict clustercache:
+// a managed cluster's kubeconfig Secret can change endpoint/credentials with no auth error and
+// no cluster deletion, which are clustercache's only other eviction paths (see #1954). It does
+// not requeue any ClusterHealthCheck - unlike EventTrigger/ClusterProfile, ClusterHealthCheck's
+// NotificationRef Secrets are not tracked by a reference map yet, so a notification credential
+// rotation is not picked up until the next unrelated reconcile. That gap is pre-existing and
+// separate from this fix.
+func (r *ClusterHealthCheckReconciler) requeueClusterHealthCheckForSecret(
+	ctx context.Context, o client.Object,
+) []reconcile.Request {
+
+	secret := o.(*corev1.Secret)
+	key := corev1.ObjectReference{
+		APIVersion: corev1.SchemeGroupVersion.String(),
+		Kind:       string(libsveltosv1beta1.SecretReferencedResourceKind),
+		Namespace:  secret.Namespace,
+		Name:       secret.Name,
+	}
+	clustercache.GetManager().RemoveSecret(&key)
+
+	return nil
+}
+
+func (r *ClusterHealthCheckReconciler) requeueClusterHealthCheckForHealthCheckReport(
+	ctx context.Context, o client.Object,
+) []reconcile.Request {
+
+	healthCheckReport := o.(*libsveltosv1beta1.HealthCheckReport)
+	logger := r.Logger.WithValues(
+		"healthCheckReport", fmt.Sprintf("%s/%s", healthCheckReport.GetNamespace(), healthCheckReport.GetName()))
+
+	logger.V(logs.LogDebug).Info("reacting to healthCheckReport change")
+
+	r.Mux.Lock()
+	defer r.Mux.Unlock()
+
+	// Use the HealthCheck this HealthCheckReport is about. Spec.HealthCheckName is not reliably
+	// populated (it comes from the managed cluster's HealthCheckReport as-is); the
+	// HealthCheckNameLabel is what every other correlation in this codebase relies on
+	// (see healthcheckreport_collection.go, evaluateLivenessCheckHealthCheck's use of
+	// GetHealthCheckReportLabels), so use that here too.
+	healthCheckInfo := corev1.ObjectReference{APIVersion: libsveltosv1beta1.GroupVersion.String(),
+		Kind: libsveltosv1beta1.HealthCheckKind, Name: healthCheckReport.Labels[libsveltosv1beta1.HealthCheckNameLabel]}
+
+	// Get all ClusterHealthChecks referencing this HealthCheck
+	requests := make([]ctrl.Request, r.getReferenceMapForEntry(&healthCheckInfo).Len())
+	consumers := r.getReferenceMapForEntry(&healthCheckInfo).Items()
+
+	for i := range consumers {
+		l := logger.WithValues("clusterHealthCheck", consumers[i].Name)
+		l.V(logs.LogDebug).Info("queuing ClusterHealthCheck")
+		requests[i] = ctrl.Request{
+			NamespacedName: client.ObjectKey{
+				Name: consumers[i].Name,
+			},
+		}
+	}
+
+	return requests
+}
+
+func (r *ClusterHealthCheckReconciler) requeueClusterHealthCheckForHealthCheck(
+	ctx context.Context, o client.Object,
+) []reconcile.Request {
+
+	healthCheck := o.(*libsveltosv1beta1.HealthCheck)
+	logger := r.Logger.WithValues(
+		"healthCheck", healthCheck.GetName())
+
+	logger.V(logs.LogDebug).Info("reacting to healthCheck change")
+
+	r.Mux.Lock()
+	defer r.Mux.Unlock()
+
+	healthCheckInfo := corev1.ObjectReference{APIVersion: libsveltosv1beta1.GroupVersion.String(),
+		Kind: libsveltosv1beta1.HealthCheckKind, Name: healthCheck.Name}
+
+	// Get all ClusterHealthChecks referencing this HealthCheck
+	requests := make([]ctrl.Request, r.getReferenceMapForEntry(&healthCheckInfo).Len())
+	consumers := r.getReferenceMapForEntry(&healthCheckInfo).Items()
+
+	for i := range consumers {
+		l := logger.WithValues("clusterHealthCheck", consumers[i].Name)
+		l.V(logs.LogDebug).Info("queuing ClusterHealthCheck")
+		requests[i] = ctrl.Request{
+			NamespacedName: client.ObjectKey{
+				Name: consumers[i].Name,
+			},
+		}
+	}
+
+	return requests
+}
+
+func (r *ClusterHealthCheckReconciler) requeueClusterHealthCheckForSveltosCluster(
+	ctx context.Context, o client.Object,
+) []reconcile.Request {
+
+	return r.requeueClusterHealthCheckForACluster(o)
+}
+
+func (r *ClusterHealthCheckReconciler) requeueClusterHealthCheckForCluster(
+	ctx context.Context, cluster *clusterv1.Cluster,
+) []reconcile.Request {
+
+	return r.requeueClusterHealthCheckForACluster(cluster)
+}
+
+func (r *ClusterHealthCheckReconciler) requeueClusterHealthCheckForACluster(
+	cluster client.Object,
+) []reconcile.Request {
+
+	logger := r.Logger.WithValues(
+		"cluster", fmt.Sprintf("%s/%s", cluster.GetNamespace(), cluster.GetName()))
+
+	logger.V(logs.LogDebug).Info("reacting to Cluster change")
+
+	r.Mux.Lock()
+	defer r.Mux.Unlock()
+
+	addTypeInformationToObject(r.Scheme, cluster)
+
+	apiVersion, kind := cluster.GetObjectKind().GroupVersionKind().ToAPIVersionAndKind()
+
+	clusterInfo := corev1.ObjectReference{APIVersion: apiVersion, Kind: kind,
+		Namespace: cluster.GetNamespace(), Name: cluster.GetName()}
+
+	r.ClusterLabels[clusterInfo] = cluster.GetLabels()
+
+	// Get all ClusterHealthChecks previously matching this cluster and reconcile those
+	requests := make([]ctrl.Request, r.getClusterMapForEntry(&clusterInfo).Len())
+	consumers := r.getClusterMapForEntry(&clusterInfo).Items()
+
+	for i := range consumers {
+		l := logger.WithValues("clusterHealthCheck", consumers[i].Name)
+		l.V(logs.LogDebug).Info("queuing ClusterHealthCheck")
+		requests[i] = ctrl.Request{
+			NamespacedName: client.ObjectKey{
+				Name: consumers[i].Name,
+			},
+		}
+	}
+
+	// Iterate over all current ClusterHealthCheck and reconcile the ClusterHealthCheck now
+	// matching the Cluster
+	for k := range r.ClusterHealthChecks {
+		clusterHealthCheckSelector := r.ClusterHealthChecks[k]
+		clusterSelector, err := metav1.LabelSelectorAsSelector(&clusterHealthCheckSelector.LabelSelector)
+		if err != nil {
+			// When clusterSelector is fixed, this ClusterHealthCheck instance
+			// will be reconciled
+			logger.V(logs.LogInfo).Error(err, "failed to convert selector")
+			continue
+		}
+
+		if clusterSelector.Matches(labels.Set(cluster.GetLabels())) {
+			l := logger.WithValues("clusterHealthCheck", k.Name)
+			l.V(logs.LogDebug).Info("queuing ClusterHealthCheck")
+			requests = append(requests, ctrl.Request{
+				NamespacedName: client.ObjectKey{
+					Name: k.Name,
+				},
+			})
+		}
+	}
+
+	return requests
+}
+
+func (r *ClusterHealthCheckReconciler) requeueClusterHealthCheckForClusterSummary(
+	ctx context.Context, o client.Object,
+) []reconcile.Request {
+
+	clusterSummary := o
+	logger := r.Logger.WithValues(
+		"clusterSummary", fmt.Sprintf("%s/%s", clusterSummary.GetNamespace(), clusterSummary.GetName()))
+
+	logger.V(logs.LogDebug).Info("reacting to clusterSummary change")
+
+	r.Mux.Lock()
+	defer r.Mux.Unlock()
+
+	addTypeInformationToObject(r.Scheme, clusterSummary)
+
+	csLabels := clusterSummary.GetLabels()
+	if csLabels == nil {
+		logger.V(logs.LogInfo).Info("clustersummary has no label. Cannot reconcile.")
+		return nil
+	}
+
+	clusterName, ok := csLabels[configv1beta1.ClusterNameLabel]
+	if !ok {
+		logger.V(logs.LogInfo).Info("clustersummary has no label with cluster name. Cannot reconcile.")
+		return nil
+	}
+
+	clusterType, ok := csLabels[configv1beta1.ClusterTypeLabel]
+	if !ok {
+		logger.V(logs.LogInfo).Info("clustersummary has no label with cluster type. Cannot reconcile.")
+		return nil
+	}
+
+	kind := libsveltosv1beta1.SveltosClusterKind
+	apiVersion := libsveltosv1beta1.GroupVersion.String()
+
+	if clusterType == string(libsveltosv1beta1.ClusterTypeCapi) {
+		kind = "Cluster"
+		apiVersion = clusterv1.GroupVersion.String()
+	}
+
+	clusterInfo := corev1.ObjectReference{APIVersion: apiVersion, Kind: kind,
+		Namespace: clusterSummary.GetNamespace(), Name: clusterName}
+
+	logger = logger.WithValues("clustersummary", fmt.Sprintf("%s:%s/%s",
+		kind, clusterSummary.GetNamespace(), clusterName))
+	logger.V(logs.LogDebug).Info("get clusterhealthchecks for cluster")
+
+	r.ClusterLabels[clusterInfo] = o.GetLabels()
+
+	// Get all ClusterHealthChecks previously matching this cluster and reconcile those
+	requests := make([]ctrl.Request, r.getClusterMapForEntry(&clusterInfo).Len())
+	consumers := r.getClusterMapForEntry(&clusterInfo).Items()
+
+	for i := range consumers {
+		l := logger.WithValues("clusterHealthCheck", consumers[i].Name)
+		if !r.hasAddonLivenessCheck(&consumers[i]) {
+			continue
+		}
+
+		l.V(logs.LogDebug).Info("queuing ClusterHealthCheck")
+		requests[i] = ctrl.Request{
+			NamespacedName: client.ObjectKey{
+				Name: consumers[i].Name,
+			},
+		}
+	}
+
+	// Get Cluster labels
+	if clusterLabels, ok := r.ClusterLabels[clusterInfo]; ok {
+		// Iterate over all current ClusterHealthCheck and reconcile the ClusterHealthCheck now
+		// matching the Cluster
+		for k := range r.ClusterHealthChecks {
+			clusterHealthCheckSelector := r.ClusterHealthChecks[k]
+			clusterSelector, err := metav1.LabelSelectorAsSelector(&clusterHealthCheckSelector.LabelSelector)
+			if err != nil {
+				// When clusterSelector is fixed, this ClusterHealthCheck instance
+				// will be reconciled
+				logger.V(logs.LogInfo).Error(err, "failed to convert selector")
+				continue
+			}
+			if clusterSelector.Matches(labels.Set(clusterLabels)) {
+				l := logger.WithValues("clusterHealthCheck", k.Name)
+				l.V(logs.LogDebug).Info("queuing ClusterHealthCheck")
+				requests = append(requests, ctrl.Request{
+					NamespacedName: client.ObjectKey{
+						Name: k.Name,
+					},
+				})
+			}
+		}
+	}
+
+	return requests
+}

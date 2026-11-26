@@ -1,0 +1,157 @@
+/*
+Copyright 2023. projectsveltos.io. All rights reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package controllers
+
+import "time"
+
+var (
+	RequeueClusterHealthCheckForCluster           = (*ClusterHealthCheckReconciler).requeueClusterHealthCheckForCluster
+	RequeueClusterHealthCheckForHealthCheckReport = (*ClusterHealthCheckReconciler).requeueClusterHealthCheckForHealthCheckReport
+	RequeueClusterHealthCheckForSecret            = (*ClusterHealthCheckReconciler).requeueClusterHealthCheckForSecret
+
+	CleanMaps               = (*ClusterHealthCheckReconciler).cleanMaps
+	UpdateMaps              = (*ClusterHealthCheckReconciler).updateMaps
+	GetReferenceMapForEntry = (*ClusterHealthCheckReconciler).getReferenceMapForEntry
+	GetClusterMapForEntry   = (*ClusterHealthCheckReconciler).getClusterMapForEntry
+
+	ProcessClusterHealthCheck            = (*ClusterHealthCheckReconciler).processClusterHealthCheck
+	RemoveClusterHealthCheck             = (*ClusterHealthCheckReconciler).removeClusterHealthCheck
+	UpdateClusterConditions              = (*ClusterHealthCheckReconciler).updateClusterConditions
+	EvaluateAndNotifyProvisionedClusters = (*ClusterHealthCheckReconciler).evaluateAndNotifyProvisionedClusters
+
+	ProcessCluster = processCluster
+
+	IsWaiting   = isWaiting
+	KeepFailure = keepFailure
+)
+
+var (
+	UpdateEnvs                 = (*ReloaderReportReconciler).updateEnvs
+	FetchAndPrepareDeployment  = (*ReloaderReportReconciler).fetchAndPrepareDeployment
+	FetchAndPrepareStatefulSet = (*ReloaderReportReconciler).fetchAndPrepareStatefulSet
+	FetchAndPrepareDaemonSet   = (*ReloaderReportReconciler).fetchAndPrepareDaemonSet
+	TriggerRollingUpgrade      = (*ReloaderReportReconciler).triggerRollingUpgrade
+	ProcessReloaderReport      = (*ReloaderReportReconciler).processReloaderReport
+)
+
+const (
+	SveltosEnv = sveltosEnv
+)
+
+var (
+	GetKeyFromObject      = getKeyFromObject
+	GetHandlersForFeature = getHandlersForFeature
+
+	AddClusterRefs         = addClusterRefs
+	ClusterHealthCheckHash = clusterHealthCheckHash
+
+	GetConditionStatus           = getConditionStatus
+	GetConditionType             = getConditionType
+	AreAddonsDeployed            = areAddonsDeployed
+	FetchClusterSummaries        = fetchClusterSummaries
+	HasLivenessCheckStatusChange = hasLivenessCheckStatusChange
+	EvaluateLivenessCheckAddOns  = evaluateLivenessCheckAddOns
+	EvaluateLivenessCheck        = evaluateLivenessCheck
+
+	DoSendNotification         = doSendNotification
+	BuildNotificationStatusMap = buildNotificationStatusMap
+	RecordClusterInfoFailure   = recordClusterInfoFailure
+	RecordNotificationFailure  = recordNotificationFailure
+
+	IsClusterConditionForCluster          = isClusterConditionForCluster
+	EvaluateClusterHealthCheckForCluster  = evaluateClusterHealthCheckForCluster
+	DeployHealthChecks                    = deployHealthChecks
+	RemoveStaleHealthChecks               = removeStaleHealthChecks
+	RemoveStaleHealthCheckReports         = removeStaleHealthCheckReports
+	RemoveReportsOfReferencedHealthChecks = removeReportsOfReferencedHealthChecks
+	UndeployClusterHealthCheckInPullMode  = undeployClusterHealthCheckInPullMode
+	GetReferencedHealthChecks             = getReferencedHealthChecks
+)
+
+var (
+	RemoveHealthCheckReports                       = removeHealthCheckReports
+	RemoveHealthCheckReportsFromCluster            = removeHealthCheckReportsFromCluster
+	CollectAndProcessHealthCheckReportsFromCluster = collectAndProcessHealthCheckReportsFromCluster
+	CollectAndProcessAllHealthCheckReports         = collectAndProcessAllHealthCheckReports
+	AddHealthCheckToConfigMap                      = addHealthCheckToConfigMap
+	BuildClustersWithHealthCheck                   = buildClustersWithHealthCheck
+	BuildWantedReports                             = buildWantedReports
+	IsReportWanted                                 = wantedReports.isWanted
+	IsAgentHeartbeatCurrent                        = isAgentHeartbeatCurrent
+)
+
+var (
+	CollectAndProcessReloaderReportsFromCluster = collectAndProcessReloaderReportsFromCluster
+	CollectAndProcessAllReloaderReports         = collectAndProcessAllReloaderReports
+	BuildClustersWithReloader                   = buildClustersWithReloader
+)
+
+var (
+	GetSlackInfo = getSlackInfo
+	GetWebexInfo = getWebexInfo
+
+	ComposeDiscordMessage  = composeDiscordMessage
+	ComposeSlackMessage    = composeSlackMessage
+	GetNotificationMessage = getNotificationMessage
+)
+
+func GetWebexRoom(info *webexInfo) string {
+	return info.room
+}
+func GetWebexToken(info *webexInfo) string {
+	return info.token
+}
+
+func GetSlackChannelID(info *slackInfo) string {
+	return info.channelID
+}
+func GetSlackToken(info *slackInfo) string {
+	return info.token
+}
+
+var (
+	NewClusterHealthCheckHistogram = newClusterHealthCheckHistogram
+	ProgramDuration                = programDuration
+)
+
+type ClusterState = clusterState
+
+func NewClusterState(failing bool, messageHash string, failingSince time.Time) ClusterState {
+	return clusterState{failing: failing, messageHash: messageHash, failingSince: failingSince}
+}
+
+func (s ClusterState) Failing() bool {
+	return s.failing
+}
+
+func (s ClusterState) MessageHash() string {
+	return s.messageHash
+}
+
+func (s ClusterState) FailingSince() time.Time {
+	return s.failingSince
+}
+
+var (
+	EvaluateNotificationPolicy = evaluateNotificationPolicy
+	GetClusterState            = getClusterState
+	HasNotificationPolicy      = hasNotificationPolicy
+	NotificationRequeueAfter   = notificationRequeueAfter
+	SendNotifications          = sendNotifications
+	GetPreviousCondition       = getPreviousCondition
+	IsStatusHealthy            = isStatusHealthy
+)

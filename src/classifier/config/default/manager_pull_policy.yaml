@@ -1,0 +1,14 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: manager
+  namespace: projectsveltos
+spec:
+  template:
+    spec:
+      initContainers:
+      - name: migrate
+        imagePullPolicy: IfNotPresent
+      containers:
+      - name: manager
+        imagePullPolicy: IfNotPresent

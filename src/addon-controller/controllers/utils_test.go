@@ -1,0 +1,786 @@
+/*
+Copyright 2022-23. projectsveltos.io. All rights reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package controllers_test
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"time"
+
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+
+	sourcev1 "github.com/fluxcd/source-controller/api/v1"
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/klog/v2/textlogger"
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	configv1beta1 "github.com/projectsveltos/addon-controller/api/v1beta1"
+	"github.com/projectsveltos/addon-controller/controllers"
+	"github.com/projectsveltos/addon-controller/lib/clusterops"
+	libsveltosv1beta1 "github.com/projectsveltos/libsveltos/api/v1beta1"
+	"github.com/projectsveltos/libsveltos/lib/clustercache"
+	"github.com/projectsveltos/libsveltos/lib/k8s_utils"
+	"github.com/projectsveltos/libsveltos/lib/sveltos_upgrade"
+)
+
+const (
+	timeout         = 40 * time.Second
+	pollingInterval = 2 * time.Second
+	version         = "v0.31.0"
+)
+
+const (
+	upstreamClusterNamePrefix = "upstream-cluster"
+	clusterProfileNamePrefix  = "cluster-profile"
+)
+
+const (
+	viewClusterRole = `apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: %s
+rules:
+- apiGroups: [""] # "" indicates the core API group
+  resources: ["pods"]
+  verbs: ["get", "watch", "list"]`
+
+	modifyClusterRole = `apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: %s
+rules:
+- apiGroups: [""] # "" indicates the core API group
+  resources: ["pods"]
+  verbs: ["get", "watch", "list", "create", "delete", "update"]`
+
+	editClusterRole = `apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: %s
+rules:
+- apiGroups:
+  - config.projectsveltos.io
+  resources:
+  - clustersummaries
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - config.projectsveltos.io
+  resources:
+  - clustersummaries/status
+  verbs:
+  - get
+`
+)
+
+var (
+	cacheSyncBackoff = wait.Backoff{
+		Duration: 100 * time.Millisecond,
+		Factor:   1.5,
+		Steps:    8,
+		Jitter:   0.4,
+	}
+)
+
+func setupScheme() (*runtime.Scheme, error) {
+	s := runtime.NewScheme()
+	if err := configv1beta1.AddToScheme(s); err != nil {
+		return nil, err
+	}
+	if err := clusterv1.AddToScheme(s); err != nil {
+		return nil, err
+	}
+	if err := clientgoscheme.AddToScheme(s); err != nil {
+		return nil, err
+	}
+	if err := apiextensionsv1.AddToScheme(s); err != nil {
+		return nil, err
+	}
+	if err := libsveltosv1beta1.AddToScheme(s); err != nil {
+		return nil, err
+	}
+	if err := sourcev1.AddToScheme(s); err != nil {
+		return nil, err
+	}
+
+	return s, nil
+}
+
+var _ = Describe("getClusterProfileOwner ", func() {
+	var clusterProfile *configv1beta1.ClusterProfile
+	var clusterSummary *configv1beta1.ClusterSummary
+	var cluster *clusterv1.Cluster
+	var namespace string
+	var scheme *runtime.Scheme
+
+	BeforeEach(func() {
+		var err error
+		scheme, err = setupScheme()
+		Expect(err).ToNot(HaveOccurred())
+
+		namespace = randomString()
+
+		cluster = &clusterv1.Cluster{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      upstreamClusterNamePrefix + randomString(),
+				Namespace: namespace,
+				Labels: map[string]string{
+					randomString(): randomString(),
+				},
+			},
+		}
+
+		clusterProfile = &configv1beta1.ClusterProfile{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: clusterProfileNamePrefix + randomString(),
+			},
+			Spec: configv1beta1.Spec{
+				ClusterSelector: libsveltosv1beta1.Selector{
+					LabelSelector: metav1.LabelSelector{
+						MatchLabels: map[string]string{
+							randomString(): randomString(),
+						},
+					},
+				},
+			},
+		}
+
+		clusterSummaryName := clusterops.GetClusterSummaryName(configv1beta1.ClusterProfileKind,
+			clusterProfile.Name, cluster.Name, false)
+		clusterSummary = &configv1beta1.ClusterSummary{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      clusterSummaryName,
+				Namespace: cluster.Namespace,
+			},
+			Spec: configv1beta1.ClusterSummarySpec{
+				ClusterNamespace: cluster.Namespace,
+				ClusterName:      cluster.Name,
+				ClusterType:      libsveltosv1beta1.ClusterTypeCapi,
+			},
+		}
+		addLabelsToClusterSummary(clusterSummary, clusterProfile.Name, cluster.Name, libsveltosv1beta1.ClusterTypeCapi)
+	})
+
+	It("getClusterProfileOwner returns ClusterProfile owner", func() {
+		Expect(addTypeInformationToObject(testEnv.Scheme(), clusterProfile)).To(Succeed())
+
+		clusterName := randomString()
+		clusterSummary.OwnerReferences = []metav1.OwnerReference{
+			{
+				Kind:       clusterProfile.Kind,
+				Name:       clusterProfile.Name,
+				APIVersion: clusterProfile.APIVersion,
+			},
+		}
+
+		clusterSummary.Spec = configv1beta1.ClusterSummarySpec{
+			ClusterNamespace:   namespace,
+			ClusterName:        clusterName,
+			ClusterProfileSpec: clusterProfile.Spec,
+		}
+
+		initObjects := []client.Object{
+			clusterProfile,
+			clusterSummary,
+		}
+
+		c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(initObjects...).WithObjects(initObjects...).Build()
+
+		owner, _, err := configv1beta1.GetProfileOwnerAndTier(context.TODO(), c, clusterSummary)
+		Expect(err).To(BeNil())
+		Expect(owner).ToNot(BeNil())
+		Expect(owner.GetName()).To(Equal(clusterProfile.Name))
+	})
+
+	It("removeDuplicates removes duplicates from a slice", func() {
+		ref1 := corev1.ObjectReference{
+			Namespace:  randomString(),
+			Name:       randomString(),
+			Kind:       randomString(),
+			APIVersion: randomString(),
+		}
+
+		ref2 := corev1.ObjectReference{
+			Namespace:  randomString(),
+			Name:       randomString(),
+			Kind:       randomString(),
+			APIVersion: randomString(),
+		}
+
+		ref3 := corev1.ObjectReference{
+			Namespace:  randomString(),
+			Name:       randomString(),
+			Kind:       randomString(),
+			APIVersion: randomString(),
+		}
+
+		original := []corev1.ObjectReference{ref1, ref2, ref1, ref3, ref2, ref3}
+		result := controllers.RemoveDuplicates(original)
+		Expect(len(result)).To(Equal(3))
+		Expect(result).To(ContainElement(ref1))
+		Expect(result).To(ContainElement(ref2))
+		Expect(result).To(ContainElement(ref3))
+	})
+
+	It("getClusterProfileOwner returns nil when ClusterProfile does not exist", func() {
+		Expect(addTypeInformationToObject(testEnv.Scheme(), clusterProfile)).To(Succeed())
+
+		clusterName := randomString()
+		clusterSummary.OwnerReferences = []metav1.OwnerReference{
+			{
+				Kind:       clusterProfile.Kind,
+				Name:       clusterProfile.Name,
+				APIVersion: clusterProfile.APIVersion,
+			},
+		}
+
+		clusterSummary.Spec = configv1beta1.ClusterSummarySpec{
+			ClusterNamespace:   namespace,
+			ClusterName:        clusterName,
+			ClusterProfileSpec: clusterProfile.Spec,
+		}
+
+		initObjects := []client.Object{
+			clusterSummary,
+		}
+
+		c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(initObjects...).WithObjects(initObjects...).Build()
+
+		owner, _, err := configv1beta1.GetProfileOwnerAndTier(context.TODO(), c, clusterSummary)
+		Expect(err).To(BeNil())
+		Expect(owner).To(BeNil())
+	})
+
+	It("isNamespaced returns true for namespaced resources", func() {
+		logger := textlogger.NewLogger(textlogger.NewConfig())
+		clusterNamespace := defaultNamespace
+		clusterName := randomString()
+
+		cluster := &clusterv1.Cluster{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: clusterNamespace,
+				Name:      clusterName,
+			},
+		}
+		Expect(testEnv.Create(context.TODO(), cluster)).To(Succeed())
+		Expect(waitForObject(context.TODO(), testEnv, cluster)).To(Succeed())
+
+		secret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: clusterNamespace,
+				Name:      clusterName + kubeconfigPostfix,
+			},
+			Data: map[string][]byte{
+				testValueKey: testEnv.Kubeconfig,
+			},
+		}
+		Expect(testEnv.Create(context.TODO(), secret)).To(Succeed())
+		Expect(waitForObject(context.TODO(), testEnv, secret)).To(Succeed())
+
+		cacheMgr := clustercache.GetManager()
+		_, err := cacheMgr.GetKubernetesRestConfig(context.TODO(), testEnv, clusterNamespace,
+			clusterName, "", "", libsveltosv1beta1.ClusterTypeCapi, logger)
+		Expect(err).To(BeNil())
+
+		clusterRole, err := k8s_utils.GetUnstructured([]byte(fmt.Sprintf(viewClusterRole, randomString())))
+		Expect(err).To(BeNil())
+		isNamespaced, err := controllers.IsNamespaced(context.TODO(), clusterRole, clusterNamespace, clusterName,
+			libsveltosv1beta1.ClusterTypeCapi, false, logger)
+		Expect(err).To(BeNil())
+		Expect(isNamespaced).To(BeFalse())
+
+		deployment, err := k8s_utils.GetUnstructured([]byte(fmt.Sprintf(deplTemplate, randomString())))
+		Expect(err).To(BeNil())
+		isNamespaced, err = controllers.IsNamespaced(context.TODO(), deployment, clusterNamespace, clusterName,
+			libsveltosv1beta1.ClusterTypeCapi, false, logger)
+		Expect(err).To(BeNil())
+		Expect(isNamespaced).To(BeTrue())
+	})
+
+	It("isClusterProvisioned returns true when all Features are marked Provisioned", func() {
+		clusterSummary := &configv1beta1.ClusterSummary{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:   clusterProfileNamePrefix + randomString(),
+				Labels: map[string]string{clusterops.ClusterProfileLabelName: clusterProfile.Name},
+			},
+			Spec: configv1beta1.ClusterSummarySpec{
+				ClusterType: libsveltosv1beta1.ClusterTypeCapi,
+				ClusterProfileSpec: configv1beta1.Spec{
+					HelmCharts: []configv1beta1.HelmChart{
+						{
+							RepositoryURL:    randomString(),
+							RepositoryName:   randomString(),
+							ChartName:        randomString(),
+							ChartVersion:     randomString(),
+							ReleaseName:      randomString(),
+							ReleaseNamespace: randomString(),
+						},
+					},
+					PolicyRefs: []configv1beta1.PolicyRef{
+						{
+							Namespace: randomString(),
+							Name:      randomString(),
+							Kind:      string(libsveltosv1beta1.SecretReferencedResourceKind),
+						},
+					},
+					KustomizationRefs: []configv1beta1.KustomizationRef{
+						{
+							Namespace: randomString(),
+							Name:      randomString(),
+							Kind:      string(libsveltosv1beta1.SecretReferencedResourceKind),
+						},
+					},
+				},
+			},
+		}
+
+		// Not all Features are marked as provisioned
+		Expect(controllers.IsCluterSummaryProvisioned(clusterSummary)).To(BeFalse())
+
+		clusterSummary.Status.FeatureSummaries = []configv1beta1.FeatureSummary{
+			{
+				FeatureID: libsveltosv1beta1.FeatureHelm,
+				Status:    libsveltosv1beta1.FeatureStatusProvisioned,
+			},
+			{
+				FeatureID: libsveltosv1beta1.FeatureResources,
+				Status:    libsveltosv1beta1.FeatureStatusProvisioning,
+			},
+		}
+		// Not all Features are marked as provisioned
+		Expect(controllers.IsCluterSummaryProvisioned(clusterSummary)).To(BeFalse())
+
+		clusterSummary.Status.FeatureSummaries = []configv1beta1.FeatureSummary{
+			{
+				FeatureID: libsveltosv1beta1.FeatureHelm,
+				Status:    libsveltosv1beta1.FeatureStatusProvisioned,
+			},
+			{
+				FeatureID: libsveltosv1beta1.FeatureResources,
+				Status:    libsveltosv1beta1.FeatureStatusProvisioned,
+			},
+		}
+		// Not all Features are marked as provisioned
+		Expect(controllers.IsCluterSummaryProvisioned(clusterSummary)).To(BeFalse())
+
+		clusterSummary.Status.FeatureSummaries = []configv1beta1.FeatureSummary{
+			{
+				FeatureID: libsveltosv1beta1.FeatureHelm,
+				Status:    libsveltosv1beta1.FeatureStatusProvisioned,
+			},
+			{
+				FeatureID: libsveltosv1beta1.FeatureResources,
+				Status:    libsveltosv1beta1.FeatureStatusProvisioned,
+			},
+			{
+				FeatureID: libsveltosv1beta1.FeatureKustomize,
+				Status:    libsveltosv1beta1.FeatureStatusProvisioned,
+			},
+		}
+		// all Features are marked as provisioned
+		Expect(controllers.IsCluterSummaryProvisioned(clusterSummary)).To(BeTrue())
+	})
+
+	It("stringifyMap and parseMapFromString convert a map[string]string to string and back", func() {
+		myMap := map[string]string{
+			randomString(): randomString(),
+			randomString(): fmt.Sprintf("{{ %s }}", randomString()),
+			randomString(): `{{ .Cluster.spec.clusterNetwork.pods.cidrBlocks }}`,
+			randomString(): `{{ (index .MgmtResources "AutoscalerSecret").data.token }}`,
+			randomString(): testRegionLabelTemplate,
+			randomString(): `{{ .Cluster.metadata.spec.topology.version }}`,
+			randomString(): randomString() + randomString(),
+		}
+
+		stringfiedMap, err := controllers.StringifyMap(myMap)
+		Expect(err).To(BeNil())
+
+		result, err := controllers.ParseMapFromString(stringfiedMap)
+		Expect(err).To(BeNil())
+
+		for k := range myMap {
+			v, ok := result[k]
+			Expect(ok).To(BeTrue())
+			Expect(v).To(Equal(myMap[k]))
+		}
+	})
+
+	It("deplAssociatedClusterExist returns false when associated cluster does not exist",
+		func() {
+			clusterNamespace := randomString()
+			clusterName := randomString()
+			clusterType := libsveltosv1beta1.ClusterTypeSveltos
+
+			logger := textlogger.NewLogger(textlogger.NewConfig())
+
+			depl := fmt.Sprintf(`apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    cluster-namespace: %s
+    cluster-name: %s
+    cluster-type: %s
+    control-plane: drift-detection-9cfuselt9ltff9mkcg18
+    feature: drift-detection
+  name: drift-detection-manager
+  namespace: projectsveltos
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      control-plane: drift-detection-manager
+  template:
+    metadata:
+      annotations:
+        kubectl.kubernetes.io/default-container: manager
+      labels:
+        control-plane: drift-detection-manager
+    spec:
+      containers:
+      - command:
+        - /manager
+        image: docker.io/projectsveltos/drift-detection-manager@sha256:82525fa56bd985fb9842407262b5afce6720c4d78214a8ff69d44fa549395f4e
+        `, clusterNamespace, clusterName, clusterType)
+
+			u, err := k8s_utils.GetUnstructured([]byte(depl))
+			Expect(err).To(BeNil())
+			c := fake.NewClientBuilder().WithScheme(scheme).Build()
+			Expect(c.Create(context.TODO(), u)).To(Succeed())
+
+			currentDepl := &appsv1.Deployment{}
+			Expect(c.Get(context.TODO(),
+				types.NamespacedName{Namespace: u.GetNamespace(), Name: u.GetName()}, currentDepl)).To(Succeed())
+
+			exist, _, _, _ := controllers.DeplAssociatedClusterExist(context.TODO(), c, currentDepl, logger)
+			Expect(exist).To(BeFalse())
+
+			sveltosCluster := libsveltosv1beta1.SveltosCluster{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: clusterNamespace,
+					Name:      clusterName,
+				},
+			}
+			Expect(c.Create(context.TODO(), &sveltosCluster)).To(Succeed())
+			exist, _, _, _ = controllers.DeplAssociatedClusterExist(context.TODO(), c, currentDepl, logger)
+			Expect(exist).To(BeTrue())
+		})
+
+	It("removeStaleResourceSummary removes stales resourceSummary instances",
+		func() {
+			clusterNamespace := randomString()
+			clusterName := randomString()
+			clusterType := libsveltosv1beta1.ClusterTypeSveltos
+
+			logger := textlogger.NewLogger(textlogger.NewConfig())
+
+			ns := &corev1.Namespace{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: clusterNamespace,
+				},
+			}
+
+			Expect(testEnv.Create(context.TODO(), ns)).To(Succeed())
+			Expect(waitForObject(context.TODO(), testEnv.Client, ns)).To(Succeed())
+
+			rs := fmt.Sprintf(`apiVersion: lib.projectsveltos.io/v1beta1
+kind: ResourceSummary
+metadata:
+  labels:
+    projectsveltos.io/cluster-summary-namespace: %s
+    version.projectsveltos.io/clustername: %s
+    version.projectsveltos.io/clustertype: %s
+  name: deploy-cert-manager-sveltos-cluster1
+  namespace: %s
+`, clusterNamespace, clusterName, strings.ToLower(string(clusterType)), clusterNamespace)
+
+			u, err := k8s_utils.GetUnstructured([]byte(rs))
+			Expect(err).To(BeNil())
+
+			Expect(testEnv.Create(context.TODO(), u)).To(Succeed())
+			Expect(waitForObject(context.TODO(), testEnv.Client, u)).To(Succeed())
+
+			currentRS := &libsveltosv1beta1.ResourceSummary{}
+
+			err = controllers.RemoveStaleResourceSummary(context.TODO(), clusterNamespace, clusterName,
+				clusterType, logger)
+			Expect(err).ToNot(BeNil())
+			Expect(err.Error()).To(ContainSubstring("resourceSummary instances still present"))
+
+			Eventually(func() bool {
+				err = testEnv.Get(context.TODO(),
+					types.NamespacedName{Namespace: u.GetNamespace(), Name: u.GetName()}, currentRS)
+				if err == nil {
+					return !currentRS.DeletionTimestamp.IsZero()
+				}
+				return apierrors.IsNotFound(err)
+			}, timeout, pollingInterval).Should(BeTrue())
+		})
+
+	It("removeStaleResourceSummary is not blocked by another cluster's ResourceSummary sharing the same name",
+		func() {
+			// Two clusters registered under the same name/type but different namespaces -
+			// a normal setup, e.g. "prod" registered in multiple tenant namespaces. The
+			// ClusterNameLabel/ClusterTypeLabel selector used to List ResourceSummary
+			// instances cannot distinguish between them, so both come back in one List.
+			clusterName := randomString()
+			clusterType := libsveltosv1beta1.ClusterTypeSveltos
+
+			targetNamespace := randomString()
+			otherNamespace := randomString()
+
+			logger := textlogger.NewLogger(textlogger.NewConfig())
+
+			for _, ns := range []string{targetNamespace, otherNamespace} {
+				n := &corev1.Namespace{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: ns,
+					},
+				}
+				Expect(testEnv.Create(context.TODO(), n)).To(Succeed())
+				Expect(waitForObject(context.TODO(), testEnv.Client, n)).To(Succeed())
+			}
+
+			targetRS := fmt.Sprintf(`apiVersion: lib.projectsveltos.io/v1beta1
+kind: ResourceSummary
+metadata:
+  labels:
+    projectsveltos.io/cluster-summary-namespace: %s
+    version.projectsveltos.io/clustername: %s
+    version.projectsveltos.io/clustertype: %s
+  name: deploy-cert-manager-sveltos-cluster1
+  namespace: %s
+`, targetNamespace, clusterName, strings.ToLower(string(clusterType)), targetNamespace)
+
+			// otherRS belongs to a different cluster (different namespace) that just
+			// happens to share the same clusterName/clusterType. It must survive the
+			// call below untouched: it is not what removeStaleResourceSummary(targetNamespace, ...)
+			// was asked to clean up, and its mere existence must not block that cleanup either.
+			otherRS := fmt.Sprintf(`apiVersion: lib.projectsveltos.io/v1beta1
+kind: ResourceSummary
+metadata:
+  labels:
+    projectsveltos.io/cluster-summary-namespace: %s
+    version.projectsveltos.io/clustername: %s
+    version.projectsveltos.io/clustertype: %s
+  name: deploy-cert-manager-sveltos-cluster1
+  namespace: %s
+`, otherNamespace, clusterName, strings.ToLower(string(clusterType)), otherNamespace)
+
+			target, err := k8s_utils.GetUnstructured([]byte(targetRS))
+			Expect(err).To(BeNil())
+			Expect(testEnv.Create(context.TODO(), target)).To(Succeed())
+			Expect(waitForObject(context.TODO(), testEnv.Client, target)).To(Succeed())
+
+			other, err := k8s_utils.GetUnstructured([]byte(otherRS))
+			Expect(err).To(BeNil())
+			Expect(testEnv.Create(context.TODO(), other)).To(Succeed())
+			Expect(waitForObject(context.TODO(), testEnv.Client, other)).To(Succeed())
+
+			// First call finds and deletes targetNamespace's own ResourceSummary, so - same as
+			// the sibling test above - it reports "still present" to give that deletion a
+			// chance to actually complete before the caller (e.g. drift-detection-manager
+			// removal) proceeds. That's expected here too; it is not what this test is about.
+			err = controllers.RemoveStaleResourceSummary(context.TODO(), targetNamespace, clusterName,
+				clusterType, logger)
+			Expect(err).ToNot(BeNil())
+			Expect(err.Error()).To(ContainSubstring("resourceSummary instances still present"))
+
+			// targetNamespace's ResourceSummary had no finalizer, so it should be fully gone.
+			currentRS := &libsveltosv1beta1.ResourceSummary{}
+			Eventually(func() bool {
+				err = testEnv.Get(context.TODO(),
+					types.NamespacedName{Namespace: target.GetNamespace(), Name: target.GetName()}, currentRS)
+				return apierrors.IsNotFound(err)
+			}, timeout, pollingInterval).Should(BeTrue())
+
+			// otherNamespace's ResourceSummary belongs to a different cluster and must be untouched.
+			Expect(testEnv.Get(context.TODO(),
+				types.NamespacedName{Namespace: other.GetNamespace(), Name: other.GetName()}, currentRS)).To(Succeed())
+
+			// Now targetNamespace has nothing left of its own. This is the actual regression
+			// this test guards: otherNamespace's still-existing ResourceSummary shares
+			// clusterName/clusterType and would previously have kept this call reporting "still
+			// present" forever, even though nothing belonging to targetNamespace remains.
+			err = controllers.RemoveStaleResourceSummary(context.TODO(), targetNamespace, clusterName,
+				clusterType, logger)
+			Expect(err).To(BeNil())
+		})
+
+	It("removeStaleDriftDetectionResources deletes drift-detection-manager after all ResourceSummaries are gone",
+		func(ctx SpecContext) {
+			namespace := randomString()
+			clusterName := randomString()
+
+			ns := &corev1.Namespace{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: namespace,
+				},
+			}
+			Expect(testEnv.Create(context.TODO(), ns)).To(Succeed())
+			Expect(waitForObject(context.TODO(), testEnv, ns)).To(Succeed())
+
+			resourceSummary := &libsveltosv1beta1.ResourceSummary{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      randomString(),
+					Namespace: namespace,
+					Labels: map[string]string{
+						sveltos_upgrade.ClusterNameLabel: clusterName,
+						sveltos_upgrade.ClusterTypeLabel: strings.ToLower(string(libsveltosv1beta1.ClusterTypeSveltos)),
+					},
+				},
+			}
+
+			Expect(testEnv.Create(context.TODO(), resourceSummary)).To(Succeed())
+			Expect(waitForObject(context.TODO(), testEnv, resourceSummary)).To(Succeed())
+
+			lbls := map[string]string{
+				"cluster-namespace": namespace,
+				testClusterNameKey:  clusterName,
+				"cluster-type":      strings.ToLower(string(libsveltosv1beta1.ClusterTypeSveltos)),
+				"feature":           "drift-detection",
+			}
+
+			var replicas int32 = 1
+			driftDetectionManager := &appsv1.Deployment{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      randomString(),
+					Namespace: sveltosNamespace,
+					Labels:    lbls,
+				},
+				Spec: appsv1.DeploymentSpec{
+					Selector: &metav1.LabelSelector{
+						MatchLabels: lbls,
+					},
+					Replicas: &replicas,
+					Template: corev1.PodTemplateSpec{
+						ObjectMeta: metav1.ObjectMeta{
+							Labels: lbls,
+						},
+						Spec: corev1.PodSpec{
+							Containers: []corev1.Container{
+								{
+									Name:            randomString(),
+									Image:           randomString(),
+									ImagePullPolicy: corev1.PullAlways,
+								},
+							},
+							ServiceAccountName: randomString(),
+						},
+					},
+				},
+			}
+			Expect(testEnv.Create(context.TODO(), driftDetectionManager)).To(Succeed())
+			Expect(waitForObject(context.TODO(), testEnv, driftDetectionManager)).To(Succeed())
+
+			logger := textlogger.NewLogger(textlogger.NewConfig())
+
+			Expect(sveltos_upgrade.StoreDriftDetectionVersion(context.TODO(), testEnv.Client, sveltosNamespace, "v1.0.0",
+				namespace, clusterName, libsveltosv1beta1.ClusterTypeSveltos, true, logger)).To(Succeed())
+
+			var versionConfigMap corev1.ConfigMap
+			Eventually(func() bool {
+				versionConfigMaps := &corev1.ConfigMapList{}
+				err := testEnv.List(context.TODO(), versionConfigMaps, client.InNamespace(namespace), client.MatchingLabels{
+					sveltos_upgrade.ClusterNameLabel: clusterName,
+					sveltos_upgrade.ClusterTypeLabel: strings.ToLower(string(libsveltosv1beta1.ClusterTypeSveltos)),
+				})
+				if err != nil || len(versionConfigMaps.Items) != 1 {
+					return false
+				}
+				versionConfigMap = versionConfigMaps.Items[0]
+				return true
+			}, timeout, pollingInterval).Should(BeTrue())
+
+			go controllers.RemoveStaleDriftDetectionResources(ctx, logger)
+
+			// RemoveStaleDriftDetectionResources sleeps for a minute
+			time.Sleep(time.Minute)
+
+			// Because ResourceSummary exists, deployment is not deleted
+			Consistently(func() bool {
+				currentDeployment := &appsv1.Deployment{}
+				err := testEnv.Get(context.TODO(),
+					types.NamespacedName{Namespace: driftDetectionManager.GetNamespace(), Name: driftDetectionManager.GetName()},
+					currentDeployment)
+				return err == nil
+			}, timeout, pollingInterval).Should(BeTrue())
+
+			currentResourceSummary := &libsveltosv1beta1.ResourceSummary{}
+			Expect(testEnv.Get(context.TODO(), types.NamespacedName{Namespace: resourceSummary.Namespace, Name: resourceSummary.Name},
+				currentResourceSummary)).To(Succeed())
+			currentResourceSummary.Finalizers = nil
+			Expect(testEnv.Delete(context.TODO(), currentResourceSummary)).To(Succeed())
+
+			Eventually(func() bool {
+				err := testEnv.Get(context.TODO(),
+					types.NamespacedName{Namespace: resourceSummary.Namespace, Name: resourceSummary.Name},
+					currentResourceSummary)
+				return err != nil &&
+					apierrors.IsNotFound(err)
+			}, timeout, pollingInterval).Should(BeTrue())
+
+			// RemoveStaleDriftDetectionResources sleeps for a minute
+			time.Sleep(time.Minute)
+
+			// Because ResourceSummary is gone, deployment is deleted
+			Eventually(func() bool {
+				currentDeployment := &appsv1.Deployment{}
+				err := testEnv.Get(context.TODO(),
+					types.NamespacedName{Namespace: driftDetectionManager.GetNamespace(), Name: driftDetectionManager.GetName()},
+					currentDeployment)
+				if err == nil {
+					return !currentDeployment.DeletionTimestamp.IsZero()
+				}
+				return apierrors.IsNotFound(err)
+			}, timeout, pollingInterval).Should(BeTrue())
+
+			Eventually(func() bool {
+				err := testEnv.Get(context.TODO(),
+					types.NamespacedName{Namespace: versionConfigMap.Namespace, Name: versionConfigMap.Name},
+					&corev1.ConfigMap{})
+				return apierrors.IsNotFound(err)
+			}, timeout, pollingInterval).Should(BeTrue())
+		})
+})
+
+func getClusterRef(cluster client.Object) *corev1.ObjectReference {
+	apiVersion, kind := cluster.GetObjectKind().GroupVersionKind().ToAPIVersionAndKind()
+	return &corev1.ObjectReference{
+		Namespace:  cluster.GetNamespace(),
+		Name:       cluster.GetName(),
+		APIVersion: apiVersion,
+		Kind:       kind,
+	}
+}

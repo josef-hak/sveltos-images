@@ -1,0 +1,954 @@
+/*
+Copyright 2022-23. projectsveltos.io. All rights reserved.
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package controllers
+
+import (
+	"context"
+	"fmt"
+	"strings"
+
+	"github.com/go-logr/logr"
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/yaml"
+
+	configv1beta1 "github.com/projectsveltos/addon-controller/api/v1beta1"
+	"github.com/projectsveltos/addon-controller/lib/clusterops"
+	driftdetection "github.com/projectsveltos/addon-controller/pkg/drift-detection"
+	libsveltosv1beta1 "github.com/projectsveltos/libsveltos/api/v1beta1"
+	"github.com/projectsveltos/libsveltos/lib/clustercache"
+	"github.com/projectsveltos/libsveltos/lib/clusterproxy"
+	"github.com/projectsveltos/libsveltos/lib/crd"
+	"github.com/projectsveltos/libsveltos/lib/deployer"
+	"github.com/projectsveltos/libsveltos/lib/k8s_utils"
+	logs "github.com/projectsveltos/libsveltos/lib/logsettings"
+	"github.com/projectsveltos/libsveltos/lib/patcher"
+	pullmode "github.com/projectsveltos/libsveltos/lib/pullmode"
+	"github.com/projectsveltos/libsveltos/lib/randutils"
+	"github.com/projectsveltos/libsveltos/lib/sveltos_upgrade"
+)
+
+const (
+	deploymentKind         = "Deployment"
+	namespaceKind          = "Namespace"
+	clusterRoleBindingKind = "ClusterRoleBinding"
+
+	driftDetectionClusterNamespaceLabel = "cluster-namespace"
+	driftDetectionClusterNameLabel      = "cluster-name"
+	driftDetectionClusterTypeLabel      = "cluster-type"
+	driftDetectionFeatureLabelKey       = "feature"
+	driftDetectionFeatureLabelValue     = "drift-detection"
+)
+
+const (
+	// This optional annotation enables **per-cluster configuration overrides** for Sveltos drift-detection-manager,
+	// addressing the limitation of the global configuration.
+	// The value must be a reference to a ConfigMap and supports the following formats:
+	// <namespace>/<name>: Explicitly specifies the ConfigMap namespace and name.
+	// <name> (or /<name>): Assumes the ConfigMap is in the same namespace as the Cluster instance being annotated.
+	//
+	// The referenced ConfigMap contains the configuration data which Sveltos will use to override
+	// the default or globally set configuration parameters (e.g., environment variables, settings)
+	// for components deployed within this managed cluster (such as the drift-detection-manager).
+	//
+	// **The configuration data within the ConfigMap must be a patch of one of the following types:**
+	// * **Strategic Merge Patch**
+	// * **JSON Patch (RFC6902)**
+	driftDetectionOverrideAnnotation = "driftdetection.projectsveltos.io/config-override-ref"
+
+	// This optional annotation restricts namespaced-resource access to the listed namespaces: a
+	// comma-separated list, e.g. "ns-a,ns-b,ns-c". Named under agent.projectsveltos.io, not
+	// driftdetection.projectsveltos.io, since it has more than one consumer, each with its own
+	// rule for when it applies:
+	//
+	//   - drift-detection-manager (and sveltos-agent, wired up the same way) honors it in
+	//     agentless (management-cluster) mode and in pull mode. In agentless mode it checks
+	//     directly against the sveltos-license Secret for a valid Sveltos Enterprise license
+	//     granting NamespaceScopedAgents, falling back to watching everything, cluster-wide, if
+	//     the license is missing or invalid: the paid differentiator there, since continuous
+	//     deployment under restricted RBAC works either way (see below), but continuous drift
+	//     detection under restricted RBAC requires a license. In pull mode no separate check is
+	//     done: using pull mode at all already requires its own Sveltos license. Plain push mode
+	//     has no connectivity to verify a license at all, so the flag is a no-op there regardless
+	//     of what addon-controller passes.
+	//   - addon-controller's own search for stale resources to remove (processDeployedGVKs)
+	//     honors it unconditionally: no license check, agentless or not. Unlike watching for
+	//     drift, this isn't a premium capability — without it, a genuinely RBAC-restricted
+	//     credential just can't deploy at all, license or no license.
+	//
+	// Cluster-scoped resources are unaffected in both cases, since they have no namespace for
+	// this restriction to apply to.
+	agentWatchNamespacesAnnotation = "agent.projectsveltos.io/watch-namespaces"
+)
+
+func getDriftDetectionNamespaceInMgmtCluster(sveltosNamespace string) string {
+	return sveltosNamespace
+}
+
+func deployDriftDetectionManagerInCluster(ctx context.Context, c client.Client,
+	clusterNamespace, clusterName, applicant, featureID string,
+	clusterType libsveltosv1beta1.ClusterType, isPullMode, startInMgmtCluster bool,
+	logger logr.Logger) error {
+
+	logger = logger.WithValues("clustersummary", applicant)
+	logger = logger.WithValues("cluster", fmt.Sprintf("%s:%s/%s", clusterType, clusterNamespace, clusterName))
+	logger.V(logs.LogDebug).Info("deploy drift detection manager: do not send updates mode")
+
+	// Attempt to retrieve configuration overrides specific to this cluster.
+	// If no cluster-specific overrides are found (patches == nil), fall back
+	// to checking for globally configured overrides.
+	patches, err := getPerClusterDriftDetectionManagerPatches(ctx, c, clusterNamespace, clusterName,
+		clusterType, logger)
+	if err != nil {
+		return err
+	} else if patches == nil {
+		patches, err = getGlobalDriftDetectionManagerPatches(ctx, c, logger)
+		if err != nil {
+			return err
+		}
+	}
+
+	watchNamespaces, err := getAgentWatchNamespaces(ctx, c, clusterNamespace, clusterName,
+		clusterType, logger)
+	if err != nil {
+		return err
+	}
+
+	err = deployDriftDetectionCRDs(ctx, clusterNamespace, clusterName, applicant, featureID, clusterType,
+		isPullMode, startInMgmtCluster, logger)
+	if err != nil {
+		return err
+	}
+
+	logger.V(logs.LogDebug).Info("Deploying drift-detection-manager")
+	// Deploy DriftDetectionManager
+	if startInMgmtCluster && !isPullMode {
+		restConfig := getManagementClusterConfig()
+		return deployDriftDetectionManagerInManagementCluster(ctx, restConfig, clusterNamespace, clusterName,
+			"do-not-send-updates", clusterType, patches, watchNamespaces, logger)
+	}
+
+	if !isPullMode && len(watchNamespaces) > 0 {
+		logger.V(logs.LogInfo).Info(fmt.Sprintf(
+			"%s is only supported for agentless (management-cluster) or pull-mode deploys, ignoring it for this push-mode cluster",
+			agentWatchNamespacesAnnotation))
+	}
+
+	return deployDriftDetectionManagerInManagedCluster(ctx, clusterNamespace, clusterName,
+		applicant, featureID, "do-not-send-updates", clusterType, patches, watchNamespaces, logger)
+}
+
+// getAgentWatchNamespaces reads agentWatchNamespacesAnnotation off the Cluster/SveltosCluster
+// instance, the same way getPerClusterDriftDetectionManagerPatches reads its own annotation.
+// Returns nil, not an error, when the Cluster instance, the annotation, or its value is missing:
+// all of which mean "no restriction configured", the same as an empty --watch-namespaces on
+// drift-detection-manager itself. See agentWatchNamespacesAnnotation's doc comment for how its
+// two callers (this file, and processDeployedGVKs) differ in when they apply it.
+func getAgentWatchNamespaces(ctx context.Context, c client.Client,
+	clusterNamespace, clusterName string, clusterType libsveltosv1beta1.ClusterType,
+	logger logr.Logger) ([]string, error) {
+
+	cluster, err := clusterproxy.GetCluster(ctx, c, clusterNamespace, clusterName, clusterType)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	annotations := cluster.GetAnnotations()
+	if annotations == nil {
+		return nil, nil
+	}
+
+	value, ok := annotations[agentWatchNamespacesAnnotation]
+	if !ok || value == "" {
+		return nil, nil
+	}
+
+	namespaces := make([]string, 0)
+	for _, ns := range strings.Split(value, ",") {
+		ns = strings.TrimSpace(ns)
+		if ns != "" {
+			namespaces = append(namespaces, ns)
+		}
+	}
+
+	logger.V(logs.LogDebug).Info(fmt.Sprintf("drift-detection-manager watch namespaces: %v", namespaces),
+		"annotation", agentWatchNamespacesAnnotation)
+
+	return namespaces, nil
+}
+
+func deployDriftDetectionCRDs(ctx context.Context, clusterNamespace, clusterName, applicant, featureID string,
+	clusterType libsveltosv1beta1.ClusterType, isPullMode, startInMgmtCluster bool, logger logr.Logger) error {
+
+	// CRDs must be deployed alongside the agent. Since the management cluster already contains these CRDs,
+	// this operation is a no-op if the agent is deployed there.
+	if startInMgmtCluster && !isPullMode {
+		return nil
+	}
+
+	var err error
+	cacheMgr := clustercache.GetManager()
+	remoteConfig, err := cacheMgr.GetKubernetesRestConfig(ctx, getManagementClusterClient(), clusterNamespace,
+		clusterName, "", "", clusterType, logger)
+	if err != nil {
+		logger.V(logs.LogInfo).Error(err, "failed to get cluster rest config")
+		return err
+	}
+
+	logger.V(logs.LogDebug).Info("deploy debuggingConfiguration CRD")
+
+	// Deploy DebuggingConfiguration CRD
+	err = deployDebuggingConfigurationCRD(ctx, remoteConfig, clusterNamespace, clusterName, applicant,
+		featureID, isPullMode, logger)
+	if err != nil {
+		return err
+	}
+
+	logger.V(logs.LogDebug).Info("deploy resourceSummary CRD")
+	// Deploy ResourceSummary CRD
+	err = deployResourceSummaryCRD(ctx, remoteConfig, clusterNamespace, clusterName, applicant,
+		featureID, isPullMode, logger)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// deployDebuggingConfigurationCRD deploys DebuggingConfiguration CRD in remote cluster
+func deployDebuggingConfigurationCRD(ctx context.Context, remoteRestConfig *rest.Config,
+	clusterNamespace, clusterName, applicant, featureID string, isPullMode bool, logger logr.Logger) error {
+
+	u, err := k8s_utils.GetUnstructured(crd.GetDebuggingConfigurationCRDYAML())
+	if err != nil {
+		logger.V(logs.LogInfo).Info(
+			fmt.Sprintf("failed to get DebuggingConfiguration CRD unstructured: %v", err))
+		return err
+	}
+
+	if isPullMode {
+		resources := map[string][]unstructured.Unstructured{}
+		resources["debugging-configuration-crd"] = []unstructured.Unstructured{*u}
+
+		err = pullmode.StageResourcesForDeployment(ctx, getManagementClusterClient(), clusterNamespace, clusterName,
+			configv1beta1.ClusterSummaryKind, applicant, featureID, resources, true, logger)
+		if err != nil {
+			logger.V(logs.LogInfo).Info(
+				fmt.Sprintf("failed to stage DebuggingConfiguration CRD: %v", err))
+			return err
+		}
+		return nil
+	}
+
+	return deployUnstructuredResources(ctx, remoteRestConfig, []*unstructured.Unstructured{u}, logger)
+}
+
+// deployResourceSummaryCRD deploys ResourceSummary CRD in remote cluster
+func deployResourceSummaryCRD(ctx context.Context, remoteRestConfig *rest.Config,
+	clusterNamespace, clusterName, applicant, featureID string, isPullMode bool, logger logr.Logger) error {
+
+	rsCRD, err := k8s_utils.GetUnstructured(crd.GetResourceSummaryCRDYAML())
+	if err != nil {
+		logger.V(logs.LogInfo).Info(
+			fmt.Sprintf("failed to get ResourceSummary CRD unstructured: %v", err))
+		return err
+	}
+
+	if isPullMode {
+		resources := map[string][]unstructured.Unstructured{}
+		resources["resource-summary-crd"] = []unstructured.Unstructured{*rsCRD}
+		err = pullmode.StageResourcesForDeployment(ctx, getManagementClusterClient(), clusterNamespace, clusterName,
+			configv1beta1.ClusterSummaryKind, applicant, featureID, resources, true, logger)
+		if err != nil {
+			logger.V(logs.LogInfo).Info(
+				fmt.Sprintf("failed to stage DebuggingConfiguration CRD: %v", err))
+			return err
+		}
+		return nil
+	}
+
+	return deployUnstructuredResources(ctx, remoteRestConfig, []*unstructured.Unstructured{rsCRD}, logger)
+}
+
+func prepareDriftDetectionManagerYAML(driftDetectionManagerYAML, clusterNamespace, clusterName, mode string,
+	clusterType libsveltosv1beta1.ClusterType, watchNamespaces []string) string {
+
+	if mode != "do-not-send-updates" {
+		driftDetectionManagerYAML = strings.ReplaceAll(driftDetectionManagerYAML, "do-not-send-updates", "send-updates")
+	}
+
+	driftDetectionManagerYAML =
+		strings.ReplaceAll(driftDetectionManagerYAML, "cluster-namespace=", fmt.Sprintf("cluster-namespace=%s", clusterNamespace))
+	driftDetectionManagerYAML =
+		strings.ReplaceAll(driftDetectionManagerYAML, "cluster-name=", fmt.Sprintf("cluster-name=%s", clusterName))
+	driftDetectionManagerYAML =
+		strings.ReplaceAll(driftDetectionManagerYAML, "cluster-type=", fmt.Sprintf("cluster-type=%s", clusterType))
+	driftDetectionManagerYAML =
+		strings.ReplaceAll(driftDetectionManagerYAML, "v=5", "v=0")
+
+	// Unlike cluster-namespace/cluster-name/cluster-type above, this substitution is a no-op
+	// (empty in, empty out) when watchNamespaces is empty, keeping today's cluster-wide default.
+	if len(watchNamespaces) > 0 {
+		driftDetectionManagerYAML = strings.ReplaceAll(driftDetectionManagerYAML, "watch-namespaces=",
+			fmt.Sprintf("watch-namespaces=%s", strings.Join(watchNamespaces, ",")))
+	}
+
+	registry := getDriftDetectionRegistry()
+	if registry != "" {
+		driftDetectionManagerYAML = replaceRegistry(driftDetectionManagerYAML, registry)
+	}
+
+	return driftDetectionManagerYAML
+}
+
+func replaceRegistry(agentYAML, registry string) string {
+	oldRegistry := "docker.io"
+	return strings.Replace(agentYAML, oldRegistry, registry, 1)
+}
+
+// deployDriftDetectionManagerInManagedCluster deploys the drift-detection-manager component within the managed cluster.
+func deployDriftDetectionManagerInManagedCluster(ctx context.Context,
+	clusterNamespace, clusterName, applicant, featureID, mode string,
+	clusterType libsveltosv1beta1.ClusterType, patches []libsveltosv1beta1.Patch, watchNamespaces []string,
+	logger logr.Logger) error {
+
+	// Sveltos resources are deployed using cluster-admin role.
+	cacheMgr := clustercache.GetManager()
+	remoteRestConfig, err := cacheMgr.GetKubernetesRestConfig(ctx, getManagementClusterClient(),
+		clusterNamespace, clusterName, "", "", clusterType, logger)
+	if err != nil {
+		logger.V(logs.LogInfo).Error(err, "failed to get cluster rest config")
+		return err
+	}
+
+	logger.V(logs.LogDebug).Info("deploy drift-detection-manager in managed cluster")
+	driftDetectionManagerYAML := string(driftdetection.GetDriftDetectionManagerYAML())
+
+	driftDetectionManagerYAML = prepareDriftDetectionManagerYAML(driftDetectionManagerYAML, clusterNamespace,
+		clusterName, mode, clusterType, watchNamespaces)
+
+	return deployDriftDetectionManagerResources(ctx, remoteRestConfig, clusterNamespace, clusterName,
+		applicant, featureID, driftDetectionManagerYAML, nil, patches, logger)
+}
+
+// deployDriftDetectionManagerInManagementCluster deploys drift-detection-manager in the management cluster
+// When deploying drift-detection-manager in the management cluster, there is one Deployment instance
+// of drift-detection-manager per cluster.
+// Those instances are all running in the namespace where projectsveltos is deployed
+func deployDriftDetectionManagerInManagementCluster(ctx context.Context, restConfig *rest.Config,
+	clusterNamespace, clusterName, mode string, clusterType libsveltosv1beta1.ClusterType,
+	patches []libsveltosv1beta1.Patch, watchNamespaces []string, logger logr.Logger) error {
+
+	logger.V(logs.LogDebug).Info("deploy drift-detection-manager in management cluster")
+	driftDetectionManagerYAML := string(driftdetection.GetDriftDetectionManagerInMgmtClusterYAML())
+
+	driftDetectionManagerYAML = prepareDriftDetectionManagerYAML(driftDetectionManagerYAML, clusterNamespace,
+		clusterName, mode, clusterType, watchNamespaces)
+
+	// Following labels are added on the objects representing the drift-detection-manager
+	// for this cluster.
+	lbls := getDriftDetectionManagerLabels(clusterNamespace, clusterName, clusterType)
+
+	name, err := getDriftDetectionManagerDeploymentName(ctx, restConfig, lbls)
+	if err != nil {
+		logger.V(logs.LogInfo).Info(
+			fmt.Sprintf("failed to get name for drift-detection-manager deployment: %v", err))
+		return err
+	}
+
+	driftDetectionManagerYAML = strings.ReplaceAll(driftDetectionManagerYAML, "$NAME", name)
+	return deployDriftDetectionManagerResources(ctx, restConfig, clusterNamespace, clusterName, "", "",
+		driftDetectionManagerYAML, lbls, patches, logger)
+}
+
+// deployDriftDetectionManagerResources handles drift-detection-component deployment.
+// The restConfig parameter indicates whether to deploy to the management or managed cluster.
+func deployDriftDetectionManagerResources(ctx context.Context, restConfig *rest.Config,
+	clusterNamespace, clusterName, applicant, featureID, driftDetectionManagerYAML string,
+	lbls map[string]string, patches []libsveltosv1beta1.Patch, logger logr.Logger) error {
+
+	resources := make(map[string][]unstructured.Unstructured)
+	index := driftDetectionManagerDeploymentName
+	resources[index] = []unstructured.Unstructured{}
+
+	elements, err := deployer.CustomSplit(driftDetectionManagerYAML)
+	if err != nil {
+		return err
+	}
+	for i := range elements {
+		policy, err := k8s_utils.GetUnstructured([]byte(elements[i]))
+		if err != nil {
+			logger.V(logs.LogInfo).Info(fmt.Sprintf("failed to parse drift detection manager yaml: %v", err))
+			return err
+		}
+
+		if lbls != nil {
+			// Add extra labels
+			currentLabels := policy.GetLabels()
+			if currentLabels == nil {
+				currentLabels = make(map[string]string)
+			}
+			for k := range lbls {
+				currentLabels[k] = lbls[k]
+			}
+			policy.SetLabels(currentLabels)
+
+			if policy.GetKind() == deploymentKind {
+				policy, err = addTemplateSpecLabels(policy, lbls)
+				if err != nil {
+					logger.V(logs.LogInfo).Info(fmt.Sprintf("failed to set deployment spec.template.labels: %v", err))
+					return err
+				}
+			}
+		}
+
+		if err := updateResourceNamespace(policy, getSveltosNamespace()); err != nil {
+			logger.V(logs.LogInfo).Error(err, "failed to update resource namespace")
+			return err
+		}
+
+		var referencedUnstructured []*unstructured.Unstructured
+		if len(patches) > 0 {
+			p := &patcher.CustomPatchPostRenderer{Patches: patches}
+			referencedUnstructured, err = p.RunUnstructured(
+				[]*unstructured.Unstructured{policy},
+			)
+			if err != nil {
+				logger.V(logs.LogInfo).Info(fmt.Sprintf("failed to patch drift-detection-manager: %v", err))
+				return err
+			}
+		} else {
+			referencedUnstructured = append(referencedUnstructured, policy)
+		}
+
+		// This means SveltosCluster is in pull mode
+		if restConfig == nil {
+			resources[index] = append(resources[index], convertPointerSliceToValueSlice(referencedUnstructured)...)
+		} else {
+			err = deployUnstructuredResources(ctx, restConfig, referencedUnstructured, logger)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	// This means SveltosCluster is in pull mode
+	if restConfig == nil {
+		err = pullmode.StageResourcesForDeployment(ctx, getManagementClusterClient(), clusterNamespace, clusterName,
+			configv1beta1.ClusterSummaryKind, applicant, featureID, resources, true, logger)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func deployUnstructuredResources(ctx context.Context, restConfig *rest.Config,
+	referencedUnstructured []*unstructured.Unstructured, logger logr.Logger) error {
+
+	for i := range referencedUnstructured {
+		policy := referencedUnstructured[i]
+
+		dr, err := k8s_utils.GetDynamicResourceInterface(restConfig, policy.GroupVersionKind(), policy.GetNamespace())
+		if err != nil {
+			logger.V(logs.LogInfo).Info(fmt.Sprintf("failed to get dynamic client: %v", err))
+			return err
+		}
+
+		options := metav1.ApplyOptions{
+			FieldManager: applyPatchFieldManager,
+			Force:        true,
+		}
+
+		_, err = dr.Apply(ctx, policy.GetName(), policy, options)
+		if err != nil {
+			logger.V(logs.LogInfo).Info(fmt.Sprintf("failed to apply policy Kind: %s Name: %s: %v",
+				policy.GetKind(), policy.GetName(), err))
+			return err
+		}
+	}
+
+	return nil
+}
+
+func unDeployResourceSummaryInstance(ctx context.Context, clusterNamespace, clusterName, applicant string,
+	clusterType libsveltosv1beta1.ClusterType, logger logr.Logger) error {
+
+	// ResourceSummaries reside in the same cluster as the drift detection component.
+	// This function dynamically selects the appropriate Kubernetes client:
+	// - Management cluster's client if drift detection is deployed there.
+	// - A managed cluster's client (obtained via clusterproxy) if drift detection is in a managed cluster.
+
+	clusterClient, err := getResourceSummaryClient(ctx, clusterNamespace, clusterName, clusterType, logger)
+	if err != nil {
+		return err
+	}
+
+	// This is no op for SveltosCluster in pull mode. Agent takes care of managing ResourceSummaries
+	if clusterClient == nil {
+		return nil
+	}
+
+	resourceSummaryCRD := &apiextensionsv1.CustomResourceDefinition{}
+	err = clusterClient.Get(ctx,
+		types.NamespacedName{Name: resourceSummaryCRDName}, resourceSummaryCRD)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			logger.V(logs.LogVerbose).Info("resourceSummary CRD not present.")
+			return nil
+		}
+		return err
+	}
+
+	logger.V(logs.LogDebug).Info("unDeploy resourceSummary instance")
+
+	resourceSummaryNameInfo := getResourceSummaryNameInfo(clusterNamespace, applicant)
+	currentResourceSummary := &libsveltosv1beta1.ResourceSummary{}
+	err = clusterClient.Get(ctx, resourceSummaryNameInfo, currentResourceSummary)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			logger.V(logs.LogDebug).Info("resourceSummary instance not present.")
+			return nil
+		}
+
+		logger.V(logs.LogInfo).Info(fmt.Sprintf("failed to get resourceSummary. Err %s", err.Error()))
+		return err
+	}
+
+	return clusterClient.Delete(ctx, currentResourceSummary)
+}
+
+// Generate unique name for drift-detection-manager
+
+// getDriftDetectionManagerDeploymentName returns the name for a given drift-detection-manager deployment
+// started in the management cluster for a given cluster.
+func getDriftDetectionManagerDeploymentName(ctx context.Context, restConfig *rest.Config,
+	lbls map[string]string,
+) (name string, err error) {
+
+	labelSelector := metav1.LabelSelector{
+		MatchLabels: lbls,
+	}
+
+	// Create a new ListOptions object.
+	listOptions := metav1.ListOptions{
+		LabelSelector: labels.Set(labelSelector.MatchLabels).String(),
+	}
+
+	// Create a new ClientSet using the RESTConfig.
+	clientset, err := kubernetes.NewForConfig(restConfig)
+	if err != nil {
+		return "", err
+	}
+
+	// using client and a List would require permission at cluster level. So using clientset instead
+	deployments, err := clientset.AppsV1().Deployments(getDriftDetectionNamespaceInMgmtCluster(getSveltosNamespace())).
+		List(ctx, listOptions)
+	if err != nil {
+		return "", err
+	}
+
+	if len(deployments.Items) > 1 {
+		// while rare this can happen. Multiple ClusterProfiles matching same cluster may concurrently query for
+		// the same drift-detection-manager deployment, leading to redundant creation attempts if the deployment
+		// doesn't exist.
+		for i := range deployments.Items {
+			// Ignore eventual error, since we are returning an error anyway
+			_ = clientset.AppsV1().Deployments(getDriftDetectionNamespaceInMgmtCluster(getSveltosNamespace())).
+				Delete(ctx,
+					deployments.Items[i].Name, metav1.DeleteOptions{})
+		}
+		err = fmt.Errorf("more than one drift-detection deployment found")
+		return name, err
+	}
+
+	objects := make([]client.Object, len(deployments.Items))
+	for i := range deployments.Items {
+		objects[i] = &deployments.Items[i]
+	}
+
+	return getInstantiatedObjectName(objects)
+}
+
+func getInstantiatedObjectName(objects []client.Object) (name string, err error) {
+	switch len(objects) {
+	case 0:
+		// no cluster exist yet. Return random name.
+		// If one clusterProfile with this name already exists,
+		// a conflict will happen. On retry different name will
+		// be picked
+		prefix := "drift-detection-"
+		const nameLength = 20
+		name = prefix + randutils.RandomString(nameLength)
+		err = nil
+	case 1:
+		name = objects[0].GetName()
+		err = nil
+	default:
+		err = fmt.Errorf("more than one drift-detection deployment found")
+	}
+	return name, err
+}
+
+// getClusterDataFromDriftDetectionManagerDeployment extracts the cluster's namespace, name, and type
+// from the labels of a Deployment representing the drift-detection-manager for a specific cluster.
+// It returns the clusterNamespace, clusterName, clusterType, and a boolean indicating success.
+func getClusterDataFromDriftDetectionManagerDeployment(deployment *appsv1.Deployment) (
+	clusterNamespace, clusterName string, clusterType libsveltosv1beta1.ClusterType, success bool) {
+
+	lbls := deployment.GetLabels()
+	if lbls == nil {
+		return "", "", "", false
+	}
+
+	// 1. Get Cluster Namespace
+	clusterNamespace, ok := lbls[driftDetectionClusterNamespaceLabel]
+	if !ok || clusterNamespace == "" {
+		return "", "", "", false
+	}
+
+	// 2. Get Cluster Name
+	clusterName, ok = lbls[driftDetectionClusterNameLabel]
+	if !ok || clusterName == "" {
+		return "", "", "", false
+	}
+
+	// 3. Get Cluster Type (and convert it back to the proper type)
+	clusterTypeStr, ok := lbls[driftDetectionClusterTypeLabel]
+	if !ok || clusterTypeStr == "" {
+		return "", "", "", false
+	}
+
+	// Convert the string representation (which was lowercased) back to the ClusterType enum.
+	clusterType = libsveltosv1beta1.ClusterTypeCapi
+	if strings.EqualFold(clusterTypeStr, string(libsveltosv1beta1.ClusterTypeSveltos)) {
+		clusterType = libsveltosv1beta1.ClusterTypeSveltos
+	}
+
+	return clusterNamespace, clusterName, clusterType, true
+}
+
+func getDriftDetectionManagerLabels(clusterNamespace, clusterName string,
+	clusterType libsveltosv1beta1.ClusterType) map[string]string {
+
+	// Following labels are added on the objects representing the drift-detection-manager
+	// for this cluster.
+	lbls := make(map[string]string)
+	lbls[driftDetectionClusterNamespaceLabel] = clusterNamespace
+	lbls[driftDetectionClusterNameLabel] = clusterName
+	lbls[driftDetectionClusterTypeLabel] = strings.ToLower(string(clusterType))
+	lbls[driftDetectionFeatureLabelKey] = driftDetectionFeatureLabelValue
+	return lbls
+}
+
+// removeDriftDetectionManagerFromManagementCluster removes the drift-detection-manager resources
+// installed in the management cluster for the cluster: clusterType:clusterNamespace/clusterName
+func removeDriftDetectionManagerFromManagementCluster(ctx context.Context,
+	clusterNamespace, clusterName string, clusterType libsveltosv1beta1.ClusterType,
+	logger logr.Logger) error {
+
+	// Get YAML containing drift-detection-manager resources
+	driftDetectionManagerYAML := string(driftdetection.GetDriftDetectionManagerInMgmtClusterYAML())
+	driftDetectionManagerYAML = prepareDriftDetectionManagerYAML(driftDetectionManagerYAML, clusterNamespace,
+		clusterName, "", clusterType, nil)
+
+	// Addon-controller deploys drift-detection-manager resources for each cluster matching at least
+	// one ClusterProfile with SyncMode set to ContinuousWithDriftDetection.
+	lbls := getDriftDetectionManagerLabels(clusterNamespace, clusterName, clusterType)
+	name, err := getDriftDetectionManagerDeploymentName(ctx, getManagementClusterConfig(), lbls)
+	if err != nil {
+		logger.V(logs.LogInfo).Info(
+			fmt.Sprintf("failed to get name for drift-detection-manager deployment: %v", err))
+		return err
+	}
+
+	driftDetectionManagerYAML = strings.ReplaceAll(driftDetectionManagerYAML, "$NAME", name)
+
+	restConfig := getManagementClusterConfig()
+
+	elements, err := deployer.CustomSplit(driftDetectionManagerYAML)
+	if err != nil {
+		return err
+	}
+	for i := range elements {
+		policy, err := k8s_utils.GetUnstructured([]byte(elements[i]))
+		if err != nil {
+			logger.V(logs.LogInfo).Info(fmt.Sprintf("failed to parse drift detection manager yaml: %v", err))
+			return err
+		}
+
+		if policy.GetKind() == namespaceKind {
+			policy.SetName(getSveltosNamespace())
+		} else if policy.GetNamespace() != "" {
+			policy.SetNamespace(getSveltosNamespace())
+		}
+
+		dr, err := k8s_utils.GetDynamicResourceInterface(restConfig, policy.GroupVersionKind(), policy.GetNamespace())
+		if err != nil {
+			logger.V(logs.LogInfo).Info(fmt.Sprintf("failed to get dynamic client: %v", err))
+			return err
+		}
+
+		err = dr.Delete(ctx, policy.GetName(), metav1.DeleteOptions{})
+		if err != nil && !apierrors.IsNotFound(err) {
+			logger.V(logs.LogInfo).Info(fmt.Sprintf("failed to delete resource %s:%s/%s: %v",
+				policy.GetKind(), policy.GetNamespace(), policy.GetName(), err))
+		}
+	}
+
+	// Propagate the error here (unlike the deletes in the loop above): the caller turns this
+	// into a requeue, so it gets retried via the reconciler instead of leaving the version
+	// ConfigMap behind for good.
+	if err := sveltos_upgrade.DeleteDriftDetectionVersion(ctx, getManagementClusterClient(), getSveltosNamespace(),
+		clusterNamespace, clusterName, clusterType, true, logger); err != nil {
+		logger.V(logs.LogInfo).Info(fmt.Sprintf("failed to delete driftDetection version configMap: %v", err))
+		return err
+	}
+
+	return nil
+}
+
+func getDriftDetectionManagerPatchesOld(ctx context.Context, c client.Client,
+	logger logr.Logger) ([]libsveltosv1beta1.Patch, error) {
+
+	patches := make([]libsveltosv1beta1.Patch, 0)
+	configMapName := getDriftDetectionConfigMap()
+	configMap := &corev1.ConfigMap{}
+	if configMapName != "" {
+		err := c.Get(ctx,
+			types.NamespacedName{Namespace: getSveltosNamespace(), Name: configMapName},
+			configMap)
+		if err != nil {
+			logger.V(logs.LogInfo).Info(fmt.Sprintf("failed to get ConfigMap %s: %v",
+				configMapName, err))
+			return nil, err
+		}
+	}
+
+	for k := range configMap.Data {
+		// Only Deployment can be patched
+		patch := libsveltosv1beta1.Patch{
+			Patch: configMap.Data[k],
+			Target: &libsveltosv1beta1.PatchSelector{
+				Kind:  deploymentKind,
+				Group: appsGroupName,
+			},
+		}
+		patches = append(patches, patch)
+	}
+
+	return patches, nil
+}
+
+func getDriftDetectionManagerPatchesNew(ctx context.Context, c client.Client,
+	configMapNamespace, configMapName string, logger logr.Logger) ([]libsveltosv1beta1.Patch, error) {
+
+	configMap := &corev1.ConfigMap{}
+	if configMapName != "" {
+		err := c.Get(ctx,
+			types.NamespacedName{Namespace: configMapNamespace, Name: configMapName},
+			configMap)
+		if err != nil {
+			logger.V(logs.LogInfo).Info(fmt.Sprintf("failed to get ConfigMap %s: %v",
+				configMapName, err))
+			return nil, err
+		}
+	}
+
+	return getPatchesFromConfigMap(configMap, logger)
+}
+
+func getPerClusterDriftDetectionManagerPatches(ctx context.Context, c client.Client,
+	clusterNamespace, clusterName string, clusterType libsveltosv1beta1.ClusterType,
+	logger logr.Logger) ([]libsveltosv1beta1.Patch, error) {
+
+	var cluster client.Object
+	cluster, err := clusterproxy.GetCluster(ctx, c, clusterNamespace, clusterName, clusterType)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	// get annotation
+	annotations := cluster.GetAnnotations()
+	if annotations == nil {
+		return nil, nil // No annotation, no override
+	}
+
+	configMapRef, ok := annotations[driftDetectionOverrideAnnotation]
+	if !ok || configMapRef == "" {
+		return nil, nil // Annotation present but empty, or not present
+	}
+
+	var configMapNamespace, configMapName string
+	// get configMap namespace, name from annotation
+	parts := strings.Split(configMapRef, "/")
+	const two = 2
+	// If only one part is present, assume it is the ConfigMap name and use the cluster's namespace.
+	if len(parts) == 1 {
+		configMapNamespace = clusterNamespace
+		configMapName = parts[0]
+	} else if len(parts) == two {
+		configMapNamespace = parts[0]
+		configMapName = parts[1]
+
+		// If the namespace part is empty (e.g., "/my-config"), use the cluster's namespace.
+		if configMapNamespace == "" {
+			configMapNamespace = clusterNamespace
+		}
+	} else {
+		logger.Error(nil, "invalid configMap reference format in annotation",
+			"annotation", driftDetectionOverrideAnnotation, "value", configMapRef)
+		return nil, fmt.Errorf("invalid configMap reference format: %s. Expected <namespace>/<name> or just <name>",
+			configMapRef)
+	}
+
+	patches, err := getDriftDetectionManagerPatchesNew(ctx, c, configMapNamespace, configMapName, logger)
+	if err != nil {
+		logger.Error(err, "failed to get ConfigMap with drift-detection patches",
+			"configMapNamespace", configMapNamespace, "configMapName", configMapName)
+		return nil, err
+	}
+
+	return patches, nil
+}
+
+func getGlobalDriftDetectionManagerPatches(ctx context.Context, c client.Client,
+	logger logr.Logger) ([]libsveltosv1beta1.Patch, error) {
+
+	configMapName := getDriftDetectionConfigMap()
+
+	patches, err := getDriftDetectionManagerPatchesNew(ctx, c, getSveltosNamespace(), configMapName, logger)
+	if err == nil {
+		return patches, nil
+	}
+
+	return getDriftDetectionManagerPatchesOld(ctx, c, logger)
+}
+
+// getPatchFromConfigMapEntry parses a single ConfigMap entry into a Patch.
+// The entry can either be a structured libsveltosv1beta1.Patch document (with a
+// "patch" field and an optional "target"), or a legacy bare patch (the raw
+// StrategicMerge/JSON6902 content, with no "patch" wrapper). Each entry is
+// evaluated independently so a ConfigMap can mix both formats across its keys.
+func getPatchFromConfigMapEntry(key, value string, logger logr.Logger) libsveltosv1beta1.Patch {
+	patch := &libsveltosv1beta1.Patch{}
+	err := yaml.Unmarshal([]byte(value), patch)
+	if err != nil || patch.Patch == "" {
+		if err != nil {
+			logger.V(logs.LogInfo).Info(fmt.Sprintf("key %s is not a structured Patch (%v), "+
+				"treating it as a legacy patch", key, err))
+		}
+		// Not a structured Patch document (or "patch" field is missing/empty). Fall back to
+		// treating the whole entry as a legacy, bare patch.
+		patch = &libsveltosv1beta1.Patch{
+			Patch: value,
+		}
+	}
+
+	if patch.Target == nil {
+		patch.Target = &libsveltosv1beta1.PatchSelector{
+			Kind:  deploymentKind,
+			Group: appsGroupName,
+		}
+	}
+
+	return *patch
+}
+
+func getPatchesFromConfigMap(configMap *corev1.ConfigMap, logger logr.Logger,
+) ([]libsveltosv1beta1.Patch, error) {
+
+	patches := make([]libsveltosv1beta1.Patch, 0)
+	for k := range configMap.Data {
+		patches = append(patches, getPatchFromConfigMapEntry(k, configMap.Data[k], logger))
+	}
+
+	return patches, nil
+}
+
+func addTemplateSpecLabels(u *unstructured.Unstructured, lbls map[string]string) (*unstructured.Unstructured, error) {
+	var deployment appsv1.Deployment
+	err := runtime.DefaultUnstructuredConverter.FromUnstructured(u.UnstructuredContent(), &deployment)
+	if err != nil {
+		return nil, err
+	}
+
+	if deployment.Spec.Template.Labels == nil {
+		deployment.Spec.Template.Labels = map[string]string{}
+	}
+	for k := range lbls {
+		deployment.Spec.Template.Labels[k] = lbls[k]
+	}
+
+	content, err := runtime.DefaultUnstructuredConverter.ToUnstructured(&deployment)
+	if err != nil {
+		return nil, err
+	}
+
+	var uDeployment unstructured.Unstructured
+	uDeployment.SetUnstructuredContent(content)
+	return &uDeployment, nil
+}
+
+// ResourceSummaries reside in the same cluster as the drift detection component.
+// This function dynamically selects the appropriate Kubernetes client:
+// - Management cluster's client if drift detection is deployed there.
+// - A managed cluster's client (obtained via clusterproxy) if drift detection is in a managed cluster.
+func getResourceSummaryClient(ctx context.Context, clusterNamespace, clusterName string, clusterType libsveltosv1beta1.ClusterType,
+	logger logr.Logger) (client.Client, error) {
+
+	if getAgentInMgmtCluster() {
+		return getManagementClusterClient(), nil
+	}
+
+	// ResourceSummary is a Sveltos resource created in managed clusters.
+	// Sveltos resources are always created using cluster-admin so that admin does not need to be
+	// given such permissions.
+	return clustercache.GetManager().GetKubernetesClient(ctx, getManagementClusterClient(),
+		clusterNamespace, clusterName, "", "", clusterType, logger)
+}
+
+// Determines the NamespacedName for the ResourceSummary based on the drift detection component's deployment location.
+// If deployed in the management cluster, it uses the cluster's namespace and a management-specific naming scheme.
+// If deployed in a managed cluster, it uses the projectsveltos namespace and a managed-cluster-specific naming scheme.
+func getResourceSummaryNameInfo(clusterNamespace, clusterSummaryName string) types.NamespacedName {
+	var resourceSummaryNamespace, resourceSummaryName string
+
+	if getAgentInMgmtCluster() {
+		resourceSummaryNamespace = clusterNamespace
+		resourceSummaryName = clusterops.GetResourceSummaryNameInManagemntCluster(clusterSummaryName)
+	} else {
+		resourceSummaryNamespace = clusterops.GetResourceSummaryNamespaceInManagedCluster(getSveltosNamespace())
+		resourceSummaryName = clusterops.GetResourceSummaryNameInManagedCluster(clusterNamespace, clusterSummaryName)
+	}
+
+	return types.NamespacedName{Namespace: resourceSummaryNamespace, Name: resourceSummaryName}
+}

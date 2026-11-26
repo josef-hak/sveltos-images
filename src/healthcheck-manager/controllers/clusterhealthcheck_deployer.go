@@ -1,0 +1,1796 @@
+/*
+Copyright 2023. projectsveltos.io. All rights reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package controllers
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"errors"
+	"fmt"
+	"reflect"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/gdexlab/go-render/render"
+	"github.com/go-logr/logr"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/cluster-api/util"
+	"sigs.k8s.io/cluster-api/util/annotations"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	"github.com/projectsveltos/healthcheck-manager/pkg/scope"
+	libsveltosv1beta1 "github.com/projectsveltos/libsveltos/api/v1beta1"
+	"github.com/projectsveltos/libsveltos/lib/clustercache"
+	"github.com/projectsveltos/libsveltos/lib/clusterproxy"
+	"github.com/projectsveltos/libsveltos/lib/deployer"
+	"github.com/projectsveltos/libsveltos/lib/k8s_utils"
+	logs "github.com/projectsveltos/libsveltos/lib/logsettings"
+	"github.com/projectsveltos/libsveltos/lib/pullmode"
+	libsveltosset "github.com/projectsveltos/libsveltos/lib/set"
+	"github.com/projectsveltos/libsveltos/lib/sharding"
+)
+
+const (
+	deployedBySveltos = "true"
+)
+
+type getCurrentHash func(tx context.Context, c client.Client,
+	chc *libsveltosv1beta1.ClusterHealthCheck, cluster *corev1.ObjectReference) ([]byte, error)
+
+type feature struct {
+	id          string
+	currentHash getCurrentHash
+	deploy      deployer.RequestHandler
+	undeploy    deployer.RequestHandler
+}
+
+func (r *ClusterHealthCheckReconciler) isClusterAShardMatch(ctx context.Context,
+	clusterInfo *libsveltosv1beta1.ClusterInfo) (bool, error) {
+
+	clusterType := clusterproxy.GetClusterType(&clusterInfo.Cluster)
+	cluster, err := clusterproxy.GetCluster(ctx, r.Client, clusterInfo.Cluster.Namespace,
+		clusterInfo.Cluster.Name, clusterType)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return true, nil
+		}
+		return false, err
+	}
+
+	return sharding.IsShardAMatch(r.ShardKey, cluster), nil
+}
+
+// deployClusterHealthCheck process (if needed) clusterHealthCheck livenesscheck in each matching cluster.
+// Eventually deploy necessary resources to managed cluster
+func (r *ClusterHealthCheckReconciler) deployClusterHealthCheck(ctx context.Context, chcScope *scope.ClusterHealthCheckScope,
+	f feature, logger logr.Logger) error {
+
+	chc := chcScope.ClusterHealthCheck
+
+	logger = logger.WithValues("clusterhealthcheck", chc.Name)
+	logger.V(logs.LogDebug).Info("request to evaluate/deploy")
+
+	var errorSeen error
+	allProcessed := true
+
+	// 1. Process each cluster (deployment and status updates)
+	for i := range chc.Status.ClusterConditions {
+		c := &chc.Status.ClusterConditions[i]
+
+		l := logger.WithValues("cluster", fmt.Sprintf("%s:%s/%s",
+			c.ClusterInfo.Cluster.Kind, c.ClusterInfo.Cluster.Namespace, c.ClusterInfo.Cluster.Name))
+
+		shardMatch, err := r.isClusterAShardMatch(ctx, &c.ClusterInfo)
+		if err != nil {
+			return err
+		}
+
+		var clusterInfo *libsveltosv1beta1.ClusterInfo
+		if !shardMatch {
+			l.V(logs.LogDebug).Info("cluster is not a shard match")
+			// Since cluster is not a shard match, another deployment will deploy and update
+			// this specific clusterInfo status. Here we simply return current status.
+			if c.ClusterInfo.Status != libsveltosv1beta1.SveltosStatusProvisioned {
+				allProcessed = false
+			}
+			// This is a required parameter. It is set by the deployment matching the
+			// cluster shard. if not set yet, set it to empty
+			if c.ClusterInfo.Hash == nil {
+				str := base64.StdEncoding.EncodeToString([]byte("empty"))
+				c.ClusterInfo.Hash = []byte(str)
+			}
+		} else {
+			clusterInfo, err = r.processClusterHealthCheck(ctx, chcScope, &c.ClusterInfo.Cluster, f, l)
+			if err != nil {
+				errorSeen = keepFailure(errorSeen, err)
+			}
+			if clusterInfo != nil {
+				if clusterInfo.Hash == nil {
+					l.V(logs.LogDebug).Info("hash is not set. Skip this.")
+				} else {
+					recordClusterInfoFailure(ctx, r.Client, chc, clusterInfo)
+					chc.Status.ClusterConditions[i].ClusterInfo = *clusterInfo
+					if clusterInfo.Status != libsveltosv1beta1.SveltosStatusProvisioned &&
+						clusterInfo.Status != libsveltosv1beta1.SveltosStatusFailedNonRetriable {
+
+						l.V(logs.LogDebug).Info("not provisioned yet")
+						allProcessed = false
+					}
+				}
+			}
+		}
+	}
+
+	// 2. Filter out entries with Status Removed
+	n := 0
+	for i := range chc.Status.ClusterConditions {
+		if chc.Status.ClusterConditions[i].ClusterInfo.Status != libsveltosv1beta1.SveltosStatusRemoved {
+			chc.Status.ClusterConditions[n] = chc.Status.ClusterConditions[i]
+			n++
+		}
+	}
+	chc.Status.ClusterConditions = chc.Status.ClusterConditions[:n]
+
+	// 3. Evaluate liveness checks and send notifications for every provisioned cluster
+	var err error
+	chc.Status.ClusterConditions, err = r.evaluateAndNotifyProvisionedClusters(ctx, chc, logger)
+	if err != nil {
+		errorSeen = keepFailure(errorSeen, err)
+	}
+
+	logger.V(logs.LogDebug).Info("set conditions")
+	chcScope.SetClusterConditions(chc.Status.ClusterConditions)
+
+	if errorSeen != nil {
+		return errorSeen
+	}
+
+	if !allProcessed {
+		return errors.New(msgStillQueued)
+	}
+
+	return nil
+}
+
+// evaluateAndNotifyProvisionedClusters re-evaluates liveness checks and delivers notifications for
+// every currently provisioned cluster. evaluateHealthChecksAndSendNotificationsForCluster only
+// resends a notification when its liveness status actually changed (or all notifications are
+// explicitly requested to be resent), so calling it on every reconcile is safe. This must run for
+// every provisioned cluster, not just ones newly transitioning to Provisioned: a cluster's liveness
+// state (backed by HealthCheckReport) can keep changing long after it was first provisioned, and
+// Status.Conditions needs to track that, not freeze at whatever it was on first provisioning.
+// Only the clusters this instance is a shard match for are processed: the instance owning the shard
+// of a cluster is the only one evaluating its liveness checks and delivering its notifications.
+// Otherwise two instances would take decisions (notification policy included) from their own,
+// possibly stale, copy of what was delivered.
+// Returns an error if liveness checks could not be evaluated, or if any notification failed to
+// deliver.
+func (r *ClusterHealthCheckReconciler) evaluateAndNotifyProvisionedClusters(ctx context.Context,
+	chc *libsveltosv1beta1.ClusterHealthCheck, logger logr.Logger) ([]libsveltosv1beta1.ClusterCondition, error) {
+
+	var errorSeen error
+
+	for i := range chc.Status.ClusterConditions {
+		condition := &chc.Status.ClusterConditions[i]
+
+		if condition.ClusterInfo.Status != libsveltosv1beta1.SveltosStatusProvisioned {
+			continue
+		}
+
+		shardMatch, err := r.isClusterAShardMatch(ctx, &condition.ClusterInfo)
+		if err != nil {
+			errorSeen = err
+			continue
+		}
+		if !shardMatch {
+			// Another instance evaluates this cluster and delivers its notifications
+			continue
+		}
+
+		cluster := &condition.ClusterInfo.Cluster
+
+		notSummary, conditions, err := evaluateHealthChecksAndSendNotificationsForCluster(ctx,
+			getManagementClusterClient(), cluster.Namespace, cluster.Name,
+			clusterproxy.GetClusterType(cluster), chc, logger)
+
+		if conditions == nil {
+			// Liveness checks could not even be evaluated (e.g. failed to fetch the
+			// HealthCheckReport/ClusterSummary). This is a genuine "cluster health is
+			// unknown" problem, distinct from a notification failing to deliver, so
+			// demote status to get this cluster looked at again.
+			failureMessage := fmt.Sprintf("failed to evaluate liveness checks: %v", err)
+			condition.ClusterInfo.Status = libsveltosv1beta1.SveltosStatusProvisioning
+			condition.ClusterInfo.FailureMessage = &failureMessage
+			errorSeen = err
+			continue
+		}
+
+		// Liveness checks were evaluated successfully: persist that regardless of whether
+		// every notification was delivered. A notification failure is not a deployment
+		// failure: leave ClusterInfo.Status/FailureMessage alone (a flaky webhook must not
+		// trigger a pointless redeploy of the HealthCheck on the next reconcile) and let
+		// NotificationSummaries carry the per-channel detail instead.
+		condition.Conditions = conditions
+		condition.NotificationSummaries = notSummary
+		if err != nil {
+			errorSeen = err
+		}
+	}
+	return chc.Status.ClusterConditions, errorSeen
+}
+
+func (r *ClusterHealthCheckReconciler) undeployClusterHealthCheck(ctx context.Context, chcScope *scope.ClusterHealthCheckScope,
+	f feature, logger logr.Logger) error {
+
+	chc := chcScope.ClusterHealthCheck
+
+	logger = logger.WithValues("clusterhealthcheck", chc.Name)
+	logger.V(logs.LogDebug).Info("request to undeploy")
+
+	var err error
+	for i := range chc.Status.ClusterConditions {
+		clusterRef := &chc.Status.ClusterConditions[i].ClusterInfo.Cluster
+
+		l := logger.WithValues("cluster", fmt.Sprintf("%s:%s/%s",
+			clusterRef.Kind, clusterRef.Namespace, clusterRef.Name))
+
+		shardMatch, tmpErr := r.isClusterAShardMatch(ctx, &chc.Status.ClusterConditions[i].ClusterInfo)
+		if tmpErr != nil {
+			err = tmpErr
+			continue
+		}
+
+		if !shardMatch && chc.Status.ClusterConditions[i].ClusterInfo.Status != libsveltosv1beta1.SveltosStatusRemoved {
+			// If shard is not a match, wait for other controller to remove
+			err = fmt.Errorf("remove pending")
+			continue
+		}
+
+		newInfo, tmpErr := r.removeClusterHealthCheck(ctx, chcScope, clusterRef, chc.Status.ClusterConditions[i].ClusterInfo.Hash,
+			f, l)
+
+		// Always update the slice with the returned state if it exists
+		if newInfo != nil {
+			recordClusterInfoFailure(ctx, r.Client, chc, newInfo)
+			chc.Status.ClusterConditions[i].ClusterInfo = *newInfo
+		}
+
+		if tmpErr != nil {
+			err = keepFailure(err, tmpErr)
+			continue
+		}
+	}
+
+	// Filter out entries with Statuslibsveltosv1beta1.SveltosStatusRemoved
+	n := 0
+	for i := range chc.Status.ClusterConditions {
+		if chc.Status.ClusterConditions[i].ClusterInfo.Status != libsveltosv1beta1.SveltosStatusRemoved {
+			chc.Status.ClusterConditions[n] = chc.Status.ClusterConditions[i]
+			n++
+		}
+	}
+	// Truncate the slice to the new length
+	chc.Status.ClusterConditions = chc.Status.ClusterConditions[:n]
+
+	return err
+}
+
+// processClusterHealthCheck detect whether it is needed to deploy ClusterHealthCheck in current passed cluster.
+func (r *ClusterHealthCheckReconciler) processClusterHealthCheck(ctx context.Context, chcScope *scope.ClusterHealthCheckScope,
+	cluster *corev1.ObjectReference, f feature, logger logr.Logger,
+) (*libsveltosv1beta1.ClusterInfo, error) {
+
+	chc := chcScope.ClusterHealthCheck
+
+	// Get ClusterHealthCheck Spec hash (at this very precise moment)
+	currentHash, err := clusterHealthCheckHash(ctx, r.Client, chc, cluster)
+	if err != nil {
+		return nil, err
+	}
+
+	if !isClusterStillMatching(chcScope, cluster) {
+		return r.removeClusterHealthCheck(ctx, chcScope, cluster, currentHash, f, logger)
+	}
+
+	clusterInfo := &libsveltosv1beta1.ClusterInfo{
+		Cluster:        *cluster,
+		Hash:           currentHash,
+		FailureMessage: nil,
+		Status:         libsveltosv1beta1.SveltosStatusProvisioning,
+	}
+
+	proceed, err := r.canProceed(ctx, chcScope, cluster, logger)
+	if err != nil {
+		failureMessage := err.Error()
+		clusterInfo.FailureMessage = &failureMessage
+		return clusterInfo, err
+	} else if !proceed {
+		failureMessage := msgClusterPausedOrNotReady
+		clusterInfo.FailureMessage = &failureMessage
+		return clusterInfo, nil
+	}
+	isHealthy, err := r.isAgentHealthy(ctx, cluster, logger)
+	if err != nil {
+		failureMessage := err.Error()
+		clusterInfo.FailureMessage = &failureMessage
+		return clusterInfo, err
+	}
+	if !isHealthy {
+		failureMessage := msgAgentNotHealthy
+		logger.V(logs.LogInfo).Info(failureMessage)
+		clusterInfo.FailureMessage = &failureMessage
+		clusterInfo.Status = libsveltosv1beta1.SveltosStatusFailedNonRetriable
+		return clusterInfo, nil
+	}
+
+	// Remove any queued entry to cleanup
+	r.Deployer.CleanupEntries(cluster.Namespace, cluster.Name, chc.Name, f.id,
+		clusterproxy.GetClusterType(cluster), true)
+
+	// If undeploying feature is in progress, wait for it to complete.
+	// Otherwise, if we redeploy feature while same feature is still being cleaned up, if two workers process those request in
+	// parallel some resources might end up missing.
+	if r.Deployer.IsInProgress(cluster.Namespace, cluster.Name, chc.Name, f.id, clusterproxy.GetClusterType(cluster), true) {
+		msg := msgCleanupInProgress
+		clusterInfo.FailureMessage = &msg
+		logger.V(logs.LogDebug).Info(msg)
+		return clusterInfo, errors.New(msgCleanupInProgress)
+	}
+
+	isPullMode, err := clusterproxy.IsClusterInPullMode(ctx, r.Client, cluster.Namespace,
+		cluster.Name, clusterproxy.GetClusterType(cluster), logger)
+	if err != nil {
+		msg := fmt.Sprintf("failed to verify if Cluster is in pull mode: %v", err)
+		logger.V(logs.LogDebug).Info(msg)
+		clusterInfo.FailureMessage = &msg
+		return clusterInfo, err
+	}
+
+	// Get the ClusterHealthCheck hash when ClusterHealthCheck was last deployed/evaluated in this cluster (if ever)
+	hash, _ := r.getCHCInClusterHashAndStatus(chc, cluster)
+	isConfigSame := reflect.DeepEqual(hash, currentHash)
+	if !isConfigSame {
+		logger.V(logs.LogDebug).Info(fmt.Sprintf("ClusterHealthCheck has changed. Current hash %x. Previous hash %x",
+			currentHash, hash))
+		// Reset HealthCheckReport Status in the management cluster. This will cause report to be re-evaluated.
+		// Since something has changed in the ClusterHealthCheck configuration, this make sures reports are re-evaluated.
+		// Without this, only HealthCheckReport update (in the HealthCheckReport collection code) will trigger a re-evaluation.
+		err := r.resetHealthCheckReportStatus(ctx, chc, cluster, isPullMode, logger)
+		if err != nil {
+			msg := err.Error()
+			clusterInfo.FailureMessage = &msg
+			logger.V(logs.LogDebug).Error(err, "failed resetting EventReport status")
+			return clusterInfo, err
+		}
+	} else {
+		logger.V(logs.LogDebug).Info("clusterhealthcheck has not changed")
+	}
+
+	return r.proceedProcessingClusterHealthCheck(ctx, chcScope, cluster, isPullMode, isConfigSame, currentHash, f, logger)
+}
+
+func (r *ClusterHealthCheckReconciler) proceedProcessingClusterHealthCheck(ctx context.Context, chcScope *scope.ClusterHealthCheckScope,
+	cluster *corev1.ObjectReference, isPullMode, isConfigSame bool, currentHash []byte, f feature, logger logr.Logger,
+) (*libsveltosv1beta1.ClusterInfo, error) {
+
+	clusterInfo := &libsveltosv1beta1.ClusterInfo{
+		Cluster:        *cluster,
+		Hash:           currentHash,
+		FailureMessage: nil,
+		Status:         libsveltosv1beta1.SveltosStatusProvisioning,
+	}
+
+	chc := chcScope.ClusterHealthCheck
+	_, currentStatus := r.getCHCInClusterHashAndStatus(chc, cluster)
+
+	var deployerStatus *libsveltosv1beta1.SveltosFeatureStatus
+	var result deployer.Result
+
+	if isConfigSame {
+		result = r.Deployer.GetResult(ctx, cluster.Namespace, cluster.Name, chc.Name, f.id,
+			clusterproxy.GetClusterType(cluster), false)
+		deployerStatus = r.convertResultStatus(result)
+	}
+
+	if deployerStatus != nil {
+		logger.V(logs.LogDebug).Info(fmt.Sprintf("result is available %q. updating status.", *deployerStatus))
+
+		clusterInfo.Status = *deployerStatus
+
+		if result.Err != nil {
+			errorMessage := result.Err.Error()
+			clusterInfo.FailureMessage = &errorMessage
+
+			clustercache.GetManager().InvalidateOnAuthError(cluster.Namespace, cluster.Name,
+				clusterproxy.GetClusterType(cluster), result.Err)
+		}
+
+		if *deployerStatus == libsveltosv1beta1.SveltosStatusProvisioned {
+			if isPullMode {
+				// provisioned here means configuration for sveltos-applier has been successufully prepared.
+				// In pull mode, verify now agent has deployed the configuration.
+				return r.proceedDeployingCHCnPullMode(ctx, chcScope, cluster, f, isConfigSame,
+					currentHash, logger)
+			}
+			return clusterInfo, nil
+		}
+		if *deployerStatus == libsveltosv1beta1.SveltosStatusProvisioning {
+			return clusterInfo, errors.New(msgStillProvisioning)
+		}
+	} else if isConfigSame && currentStatus != nil && *currentStatus == libsveltosv1beta1.SveltosStatusProvisioned {
+		logger.V(logs.LogDebug).Info("already deployed")
+		clusterInfo.Status = libsveltosv1beta1.SveltosStatusProvisioned
+		clusterInfo.FailureMessage = nil
+	} else {
+		logger.V(logs.LogDebug).Info("no result is available. queue job and mark status as provisioning")
+		clusterInfo.Status = libsveltosv1beta1.SveltosStatusProvisioning
+
+		// Getting here means either ClusterHealthCheck failed to be deployed or ClusterHealthCheck has changed.
+		// ClusterHealthCheck must be (re)deployed.
+		options := deployer.Options{HandlerOptions: make(map[string]any)}
+		options.HandlerOptions[configurationHash] = currentHash
+		if err := r.Deployer.Deploy(ctx, cluster.Namespace, cluster.Name, chc.Name, f.id, clusterproxy.GetClusterType(cluster),
+			false, f.deploy, programDuration, options); err != nil {
+			return clusterInfo, err
+		}
+	}
+
+	if clusterInfo.Hash == nil {
+		panic(1)
+	}
+
+	return clusterInfo, nil
+}
+
+func (r *ClusterHealthCheckReconciler) proceedDeployingCHCnPullMode(ctx context.Context,
+	chcScope *scope.ClusterHealthCheckScope, cluster *corev1.ObjectReference, f feature,
+	isConfigSame bool, currentHash []byte, logger logr.Logger) (*libsveltosv1beta1.ClusterInfo, error) {
+
+	var pullmodeStatus *libsveltosv1beta1.FeatureStatus
+
+	clusterInfo := &libsveltosv1beta1.ClusterInfo{
+		Cluster:        *cluster,
+		Hash:           currentHash,
+		FailureMessage: nil,
+		Status:         libsveltosv1beta1.SveltosStatusProvisioning,
+	}
+
+	chc := chcScope.ClusterHealthCheck
+	if isConfigSame {
+		pullmodeHash, err := pullmode.GetRequestorHash(ctx, getManagementClusterClient(),
+			cluster.Namespace, cluster.Name, libsveltosv1beta1.ClusterHealthCheckKind, chc.Name, f.id, logger)
+		if err != nil {
+			if !apierrors.IsNotFound(err) {
+				msg := fmt.Sprintf("failed to get pull mode hash: %v", err)
+				logger.V(logs.LogDebug).Info(msg)
+				clusterInfo.FailureMessage = &msg
+				return clusterInfo, err
+			} else {
+				isConfigSame = false
+			}
+		} else {
+			isConfigSame = reflect.DeepEqual(pullmodeHash, currentHash)
+		}
+	}
+
+	if isConfigSame {
+		// only if configuration hash matches, check if feature is deployed
+		logger.V(logs.LogDebug).Info("hash has not changed")
+		var err error
+		pullmodeStatus, err = r.proceesAgentDeploymentStatus(ctx, chc, cluster, f, logger)
+		if err != nil {
+			failureMessage := err.Error()
+			clusterInfo.FailureMessage = &failureMessage
+			return clusterInfo, err
+		}
+	}
+
+	if pullmodeStatus != nil {
+		logger.V(logs.LogDebug).Info(fmt.Sprintf("agent result is available. updating status: %v", *pullmodeStatus))
+		switch *pullmodeStatus {
+		case libsveltosv1beta1.FeatureStatusProvisioned:
+			if err := pullmode.TerminateDeploymentTracking(ctx, r.Client, cluster.Namespace,
+				cluster.Name, libsveltosv1beta1.ClusterHealthCheckKind, chc.Name, f.id, logger); err != nil {
+				failureMessage := fmt.Sprintf("failed to terminate tracking: %v", err)
+				logger.V(logs.LogDebug).Info(failureMessage)
+				clusterInfo.FailureMessage = &failureMessage
+			}
+			clusterInfo.Status = libsveltosv1beta1.SveltosStatusProvisioned
+			return clusterInfo, nil
+		case libsveltosv1beta1.FeatureStatusProvisioning:
+			msg := "agent is provisioning the content"
+			logger.V(logs.LogDebug).Info(msg)
+			clusterInfo.Status = libsveltosv1beta1.SveltosStatusProvisioning
+			return clusterInfo, nil
+		case libsveltosv1beta1.FeatureStatusFailed:
+			logger.V(logs.LogDebug).Info("agent failed provisioning the content")
+			clusterInfo.Status = libsveltosv1beta1.SveltosStatusFailed
+		case libsveltosv1beta1.FeatureStatusFailedNonRetriable, libsveltosv1beta1.FeatureStatusRemoving,
+			libsveltosv1beta1.FeatureStatusAgentRemoving, libsveltosv1beta1.FeatureStatusRemoved:
+			logger.V(logs.LogDebug).Info("proceed deploying")
+		case libsveltosv1beta1.FeatureStatusBlocked:
+			// Blocked is set by addon-controller while a predecessor ClusterSummary waits on a
+			// successor (TransitionFrom) or dependency (DependsOn). ClusterHealthCheck has
+			// neither concept and the agent never reports it in a ConfigurationGroup, so this
+			// case is unreachable in practice. Listed only to satisfy exhaustive.
+			logger.V(logs.LogDebug).Info("proceed deploying")
+		}
+	} else {
+		clusterInfo.Status = libsveltosv1beta1.SveltosStatusProvisioning
+	}
+
+	// Getting here means either agent failed to deploy feature or configuration has changed.
+	// Either way, feature must be (re)deployed. Queue so new configuration for agent is prepared.
+	options := deployer.Options{HandlerOptions: make(map[string]any)}
+	options.HandlerOptions[configurationHash] = currentHash
+
+	logger.V(logs.LogDebug).Info("queueing request to deploy")
+	if err := r.Deployer.Deploy(ctx, cluster.Namespace, cluster.Name,
+		chc.Name, f.id, clusterproxy.GetClusterType(cluster), false,
+		f.deploy, programDuration, options); err != nil {
+		return nil, err
+	}
+
+	return clusterInfo, errors.New(msgDeployQueued)
+}
+
+// If SveltosCluster is in pull mode, verify whether agent has pulled and successuffly deployed it.
+func (r *ClusterHealthCheckReconciler) proceesAgentDeploymentStatus(ctx context.Context,
+	chc *libsveltosv1beta1.ClusterHealthCheck, cluster *corev1.ObjectReference, f feature, logger logr.Logger,
+) (*libsveltosv1beta1.FeatureStatus, error) {
+
+	logger.V(logs.LogDebug).Info("Verify if agent has deployed content and process it")
+
+	status, err := pullmode.GetDeploymentStatus(ctx, r.Client, cluster.Namespace, cluster.Name,
+		libsveltosv1beta1.ClusterHealthCheckKind, chc.Name, f.id, logger)
+
+	if err != nil {
+		if pullmode.IsProcessingMismatch(err) {
+			provisioning := libsveltosv1beta1.FeatureStatusProvisioning
+			return &provisioning, nil
+		} else if pullmode.IsActionNotSetToDeploy(err) {
+			_ = pullmode.TerminateDeploymentTracking(ctx, r.Client, cluster.Namespace,
+				cluster.Name, libsveltosv1beta1.ClusterHealthCheckKind, chc.Name, f.id, logger)
+		}
+		return nil, err
+	}
+
+	return status.DeploymentStatus, err
+}
+
+func (r *ClusterHealthCheckReconciler) removeClusterHealthCheck(ctx context.Context, chcScope *scope.ClusterHealthCheckScope,
+	cluster *corev1.ObjectReference, currentHash []byte, f feature, logger logr.Logger) (*libsveltosv1beta1.ClusterInfo, error) {
+
+	chc := chcScope.ClusterHealthCheck
+
+	clusterInfo := &libsveltosv1beta1.ClusterInfo{
+		Cluster:        *cluster,
+		Status:         libsveltosv1beta1.SveltosStatusRemoving,
+		Hash:           currentHash,
+		FailureMessage: nil,
+	}
+
+	logger.V(logs.LogDebug).Info("request to undeploy")
+
+	isPresent, isDeleted, err := r.isClusterPresent(ctx, cluster)
+	if err != nil {
+		failureMessage := err.Error()
+		clusterInfo.FailureMessage = &failureMessage
+		return clusterInfo, err
+	}
+
+	if !isPresent || isDeleted {
+		clusterInfo.Status = libsveltosv1beta1.SveltosStatusRemoved
+		return clusterInfo, nil
+	}
+
+	// Remove any queued entry to deploy/evaluate
+	r.Deployer.CleanupEntries(cluster.Namespace, cluster.Name, chc.Name, f.id,
+		clusterproxy.GetClusterType(cluster), false)
+
+	// If deploying feature is in progress, wait for it to complete.
+	// Otherwise, if we cleanup feature while same feature is still being provisioned, if two workers process those request in
+	// parallel some resources might be left over.
+	if r.Deployer.IsInProgress(cluster.Namespace, cluster.Name, chc.Name, f.id,
+		clusterproxy.GetClusterType(cluster), false) {
+
+		message := msgProvisioningInProgress
+		logger.V(logs.LogDebug).Info(message)
+		clusterInfo.FailureMessage = &message
+		return clusterInfo, fmt.Errorf("deploying %s still in progress. Wait before cleanup", f.id)
+	}
+
+	result := r.Deployer.GetResult(ctx, cluster.Namespace, cluster.Name, chc.Name, f.id,
+		clusterproxy.GetClusterType(cluster), true)
+	status := r.convertResultStatus(result)
+
+	if status != nil {
+		if *status == libsveltosv1beta1.SveltosStatusRemoving {
+			return clusterInfo, fmt.Errorf("feature is still being removed")
+		}
+
+		if *status == libsveltosv1beta1.SveltosStatusRemoved {
+			// The result is consumed by GetResult. Unless the status is set to Removed, the cluster entry is
+			// never dropped and the removal is queued again at the next reconciliation.
+			clusterInfo.Status = libsveltosv1beta1.SveltosStatusRemoved
+			return clusterInfo, nil
+		}
+
+		if result.Err != nil {
+			failureMessage := result.Err.Error()
+			clusterInfo.FailureMessage = &failureMessage
+
+			clustercache.GetManager().InvalidateOnAuthError(cluster.Namespace, cluster.Name,
+				clusterproxy.GetClusterType(cluster), result.Err)
+		}
+	} else {
+		logger.V(logs.LogDebug).Info("no result is available. mark status as removing")
+	}
+
+	logger.V(logs.LogDebug).Info("queueing request to un-deploy")
+	if err := r.Deployer.Deploy(ctx, cluster.Namespace, cluster.Name, chc.Name, f.id,
+		clusterproxy.GetClusterType(cluster), true,
+		undeployClusterHealthCheckResourcesFromCluster, programDuration, deployer.Options{}); err != nil {
+		failureMessage := err.Error()
+		clusterInfo.FailureMessage = &failureMessage
+		return clusterInfo, err
+	}
+
+	return clusterInfo, errors.New(msgCleanupQueued)
+}
+
+func (r *ClusterHealthCheckReconciler) convertResultStatus(result deployer.Result) *libsveltosv1beta1.SveltosFeatureStatus {
+	switch result.ResultStatus {
+	case deployer.Deployed:
+		s := libsveltosv1beta1.SveltosStatusProvisioned
+		return &s
+	case deployer.Failed:
+		s := libsveltosv1beta1.SveltosStatusFailed
+		return &s
+	case deployer.InProgress:
+		s := libsveltosv1beta1.SveltosStatusProvisioning
+		return &s
+	case deployer.Removed:
+		s := libsveltosv1beta1.SveltosStatusRemoved
+		return &s
+	case deployer.Unavailable:
+		return nil
+	}
+
+	return nil
+}
+
+// getCHCInClusterHashAndStatus returns the hash of the ClusterHealthCheck that was deployed/evaluated in a given
+// Cluster (if ever deployed/evaluated)
+func (r *ClusterHealthCheckReconciler) getCHCInClusterHashAndStatus(chc *libsveltosv1beta1.ClusterHealthCheck,
+	cluster *corev1.ObjectReference) ([]byte, *libsveltosv1beta1.SveltosFeatureStatus) {
+
+	for i := range chc.Status.ClusterConditions {
+		cCondition := &chc.Status.ClusterConditions[i]
+		if isClusterConditionForCluster(cCondition, cluster.Namespace, cluster.Name, clusterproxy.GetClusterType(cluster)) {
+			return cCondition.ClusterInfo.Hash, &cCondition.ClusterInfo.Status
+		}
+	}
+
+	return nil, nil
+}
+
+// isPaused returns true if Sveltos/CAPI Cluster is paused or ClusterHealthCheck has paused annotation.
+func (r *ClusterHealthCheckReconciler) isPaused(ctx context.Context, cluster *corev1.ObjectReference,
+	chc *libsveltosv1beta1.ClusterHealthCheck) (bool, error) {
+
+	isClusterPaused, err := clusterproxy.IsClusterPaused(ctx, r.Client, cluster.Namespace, cluster.Name,
+		clusterproxy.GetClusterType(cluster))
+
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+
+	if isClusterPaused {
+		return true, nil
+	}
+
+	return annotations.HasPaused(chc), nil
+}
+
+// canProceed returns true if cluster is ready to be programmed and it is not paused.
+func (r *ClusterHealthCheckReconciler) canProceed(ctx context.Context, chcScope *scope.ClusterHealthCheckScope,
+	cluster *corev1.ObjectReference, logger logr.Logger) (bool, error) {
+
+	logger = logger.WithValues("cluster", fmt.Sprintf("%s:%s/%s", cluster.Kind, cluster.Namespace, cluster.Name))
+
+	paused, err := r.isPaused(ctx, cluster, chcScope.ClusterHealthCheck)
+	if err != nil {
+		return false, err
+	}
+
+	if paused {
+		logger.V(logs.LogDebug).Info("Cluster/ClusterHealthCheck is paused")
+		return false, nil
+	}
+
+	ready, err := clusterproxy.IsClusterReadyToBeConfigured(ctx, r.Client, cluster, chcScope.Logger)
+	if err != nil {
+		// A cluster referenced by ClusterRefs might not exist (yet). Cluster creation
+		// will trigger a new reconciliation.
+		if apierrors.IsNotFound(err) {
+			logger.V(logs.LogDebug).Info("Cluster not found")
+			return false, nil
+		}
+		return false, err
+	}
+
+	if !ready {
+		logger.V(logs.LogDebug).Info("Cluster is not ready yet")
+		return false, nil
+	}
+
+	return true, nil
+}
+
+// isAgentHealthy returns true if the cluster is NOT in pull mode,
+// OR if it is in pull mode and the heartbeat is current.
+func (r *ClusterHealthCheckReconciler) isAgentHealthy(ctx context.Context,
+	clusterRef *corev1.ObjectReference, logger logr.Logger) (bool, error) {
+
+	clusterType := clusterproxy.GetClusterType(clusterRef)
+	if clusterType != libsveltosv1beta1.ClusterTypeSveltos {
+		return true, nil
+	}
+
+	isPullMode, err := clusterproxy.IsClusterInPullMode(ctx, r.Client, clusterRef.Namespace,
+		clusterRef.Name, clusterType, logger)
+	if err != nil {
+		msg := fmt.Sprintf("failed to verify if Cluster is in pull mode: %v", err)
+		logger.V(logs.LogDebug).Info(msg)
+		return false, err
+	}
+
+	if !isPullMode {
+		return true, nil
+	}
+
+	sveltosCluster := &libsveltosv1beta1.SveltosCluster{}
+	err = r.Get(ctx,
+		types.NamespacedName{
+			Namespace: clusterRef.Namespace,
+			Name:      clusterRef.Name,
+		}, sveltosCluster)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+
+	// Check if the failure message indicates a heartbeat timeout
+	if pullmode.IsAgentTimeoutError(sveltosCluster) {
+		return false, nil
+	}
+
+	return true, nil
+}
+
+// getSortedSpec returns a copy of spec with ClusterRefs sorted, so that the order in which
+// clusters are listed does not change the hash.
+func getSortedSpec(spec *libsveltosv1beta1.ClusterHealthCheckSpec) *libsveltosv1beta1.ClusterHealthCheckSpec {
+	specCopy := spec.DeepCopy()
+
+	sort.Slice(specCopy.ClusterRefs, func(i, j int) bool {
+		a, b := &specCopy.ClusterRefs[i], &specCopy.ClusterRefs[j]
+		if a.Namespace != b.Namespace {
+			return a.Namespace < b.Namespace
+		}
+		if a.Name != b.Name {
+			return a.Name < b.Name
+		}
+		return a.Kind < b.Kind
+	})
+
+	return specCopy
+}
+
+// clusterHealthCheckHash returns the clusterHealthCheck hash
+func clusterHealthCheckHash(ctx context.Context, c client.Client,
+	chc *libsveltosv1beta1.ClusterHealthCheck, cluster *corev1.ObjectReference) ([]byte, error) {
+
+	h := sha256.New()
+	var config string
+	// Render the spec by value (not by pointer): the hash must stay the same for existing
+	// ClusterHealthChecks, otherwise upgrading would redeploy everywhere.
+	config += render.AsCode(*getSortedSpec(&chc.Spec))
+
+	includeClusterSummaries := false
+	for i := range chc.Spec.LivenessChecks {
+		if chc.Spec.LivenessChecks[i].Type == libsveltosv1beta1.LivenessTypeAddons {
+			includeClusterSummaries = true
+			break
+		}
+	}
+
+	if includeClusterSummaries {
+		clusterSummaries, err := fetchClusterSummaries(ctx, c, cluster.Namespace, cluster.Name,
+			clusterproxy.GetClusterType(cluster))
+		if err != nil {
+			return nil, err
+		}
+
+		// Sort by namespace, then by name
+		sort.Slice(clusterSummaries.Items, func(i, j int) bool {
+			if clusterSummaries.Items[i].Namespace != clusterSummaries.Items[j].Namespace {
+				return clusterSummaries.Items[i].Namespace < clusterSummaries.Items[j].Namespace
+			}
+			return clusterSummaries.Items[i].Name < clusterSummaries.Items[j].Name
+		})
+
+		for i := range clusterSummaries.Items {
+			cs := &clusterSummaries.Items[i]
+
+			// Sort FeatureSummaries by FeatureID
+			sort.Slice(cs.Status.FeatureSummaries, func(i, j int) bool {
+				return cs.Status.FeatureSummaries[i].FeatureID < cs.Status.FeatureSummaries[j].FeatureID
+			})
+
+			config += render.AsCode(cs.Status.FeatureSummaries)
+		}
+	}
+
+	// When in agentless mode, HealthCheck instances are not copied to managed cluster anymore.
+	// This addition ensures the ClusterHealthCheck is redeployed due to the change in deployment location.
+	if getAgentInMgmtCluster() {
+		config += ("agentless")
+	}
+
+	var tmpConfig string
+	tmpConfig, err := fetchReferencedResources(ctx, c, chc, cluster)
+	if err != nil {
+		return nil, err
+	}
+	config += render.AsCode(tmpConfig)
+
+	h.Write([]byte(config))
+	return h.Sum(nil), nil
+}
+
+// fetchReferencedResources fetches referenced HealthChecks and corresponding
+// HealthCheckReports. Returns slice of byte representing those.
+func fetchReferencedResources(ctx context.Context, c client.Client,
+	chc *libsveltosv1beta1.ClusterHealthCheck, cluster *corev1.ObjectReference) (string, error) {
+
+	var config string
+	for i := range chc.Spec.LivenessChecks {
+		lc := &chc.Spec.LivenessChecks[i]
+		if lc.Type == libsveltosv1beta1.LivenessTypeHealthCheck {
+			resource, err := fetchHealthCheck(ctx, c, lc.LivenessSourceRef)
+			if err != nil {
+				return "", err
+			}
+			if resource == nil {
+				continue
+			}
+			config += render.AsCode(resource.Spec)
+
+			list, err := fetchHealthCheckReports(ctx, c, cluster.Namespace, cluster.Name, resource.Name,
+				clusterproxy.GetClusterType(cluster))
+			if err != nil {
+				return "", err
+			}
+
+			// Sort the list of reports by Namespace, then Name
+			sort.Slice(list.Items, func(i, j int) bool {
+				if list.Items[i].Namespace != list.Items[j].Namespace {
+					return list.Items[i].Namespace < list.Items[j].Namespace
+				}
+				return list.Items[i].Name < list.Items[j].Name
+			})
+			for j := range list.Items {
+				// Filter to include only ObjectRef and HealthStatus
+				filteredStatuses := filterResourceStatuses(list.Items[j].Spec.ResourceStatuses)
+
+				// Sort by ObjectRef for consistent ordering
+				sort.Slice(filteredStatuses, func(i, j int) bool {
+					if filteredStatuses[i].ObjectRef.Namespace != filteredStatuses[j].ObjectRef.Namespace {
+						return filteredStatuses[i].ObjectRef.Namespace < filteredStatuses[j].ObjectRef.Namespace
+					}
+					if filteredStatuses[i].ObjectRef.Name != filteredStatuses[j].ObjectRef.Name {
+						return filteredStatuses[i].ObjectRef.Name < filteredStatuses[j].ObjectRef.Name
+					}
+					if filteredStatuses[i].ObjectRef.Kind != filteredStatuses[j].ObjectRef.Kind {
+						return filteredStatuses[i].ObjectRef.Kind < filteredStatuses[j].ObjectRef.Kind
+					}
+					return filteredStatuses[i].ObjectRef.APIVersion < filteredStatuses[j].ObjectRef.APIVersion
+				})
+
+				config += render.AsCode(filteredStatuses)
+			}
+		}
+	}
+
+	return config, nil
+}
+
+// filteredResourceStatus contains only the fields we want to include in the hash
+type filteredResourceStatus struct {
+	ObjectRef    corev1.ObjectReference         `json:"objectRef"`
+	HealthStatus libsveltosv1beta1.HealthStatus `json:"healthStatus"`
+}
+
+// filterResourceStatuses creates a filtered copy of resource statuses
+// containing only ObjectRef and HealthStatus fields (excludes Resource and Message)
+func filterResourceStatuses(statuses []libsveltosv1beta1.ResourceStatus) []filteredResourceStatus {
+	filtered := make([]filteredResourceStatus, len(statuses))
+	for i := range statuses {
+		rs := &statuses[i]
+		filtered[i] = filteredResourceStatus{
+			ObjectRef:    rs.ObjectRef,
+			HealthStatus: rs.HealthStatus,
+		}
+	}
+	return filtered
+}
+
+// fetchHealthCheck fetches referenced HealthCheck
+func fetchHealthCheck(ctx context.Context, c client.Client, ref *corev1.ObjectReference,
+) (*libsveltosv1beta1.HealthCheck, error) {
+
+	if ref == nil {
+		return nil, nil
+	}
+
+	healthCheck := &libsveltosv1beta1.HealthCheck{}
+	err := c.Get(ctx, types.NamespacedName{Name: ref.Name}, healthCheck)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	return healthCheck, nil
+}
+
+// processClusterHealthCheckForCluster does following:
+// - deploy ClusterHealthCheck in cluster if needed (only if one of the liveness checks requires to
+// look at resources directly in managed cluster);
+func processClusterHealthCheckForCluster(ctx context.Context, c client.Client,
+	clusterNamespace, clusterName, applicant, featureID string,
+	clusterType libsveltosv1beta1.ClusterType, options deployer.Options, logger logr.Logger) error {
+
+	logger = logger.WithValues("clusterhealthcheck", applicant)
+	logger = logger.WithValues("cluster", fmt.Sprintf("%s:%s/%s", clusterType, clusterNamespace, clusterName))
+
+	chc := &libsveltosv1beta1.ClusterHealthCheck{}
+	err := c.Get(ctx, types.NamespacedName{Name: applicant}, chc)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			logger.V(logs.LogDebug).Info("clusterHealthCheck not found")
+			return nil
+		}
+		return err
+	}
+
+	if !chc.DeletionTimestamp.IsZero() {
+		logger.V(logs.LogDebug).Info("clusterHealthCheck marked for deletion")
+		return nil
+	}
+
+	logger.V(logs.LogDebug).Info("Deploy clusterHealthCheck")
+
+	err = deployHealthChecks(ctx, c, clusterNamespace, clusterName, clusterType, chc, options, logger)
+	if err != nil {
+		logger.V(logs.LogDebug).Info("failed to deploy referenced HealthChecks")
+		return err
+	}
+
+	err = removeStaleHealthChecks(ctx, c, clusterNamespace, clusterName, clusterType, chc, false, logger)
+	if err != nil {
+		logger.V(logs.LogDebug).Info("failed to remove stale HealthChecks")
+		return err
+	}
+
+	logger.V(logs.LogDebug).Info("Deployed clusterHealthCheck")
+	return nil
+}
+
+// evaluateHealthChecksAndSendNotificationsForCluster does following:
+// - evaluate all health checks (updating ClusterHealthCheck Status)
+// - send notifications
+func evaluateHealthChecksAndSendNotificationsForCluster(ctx context.Context, c client.Client,
+	clusterNamespace, clusterName string, clusterType libsveltosv1beta1.ClusterType,
+	chc *libsveltosv1beta1.ClusterHealthCheck, logger logr.Logger,
+) ([]libsveltosv1beta1.NotificationSummary, []libsveltosv1beta1.Condition, error) {
+
+	logger.V(logs.LogDebug).Info("Evaluate health checks and send Notifications for clusterHealthCheck")
+
+	conditions, changed, err := evaluateClusterHealthCheckForCluster(ctx, c, clusterNamespace, clusterName,
+		clusterType, chc, logger)
+	if err != nil {
+		logger.V(logs.LogInfo).Error(err, "failed to evaluate livenessChecks")
+		return nil, nil, err
+	}
+
+	return sendNotifications(ctx, c, clusterNamespace, clusterName, clusterType, chc, changed, conditions,
+		logger)
+}
+
+// undeployClusterHealthCheckResourcesFromCluster cleans resources associtated with ClusterHealthCheck instance from cluster
+func undeployClusterHealthCheckResourcesFromCluster(ctx context.Context, c client.Client,
+	clusterNamespace, clusterName, applicant, featureID string,
+	clusterType libsveltosv1beta1.ClusterType, options deployer.Options, logger logr.Logger) error {
+
+	logger = logger.WithValues("clusterhealthcheck", applicant)
+
+	chc := &libsveltosv1beta1.ClusterHealthCheck{}
+	err := c.Get(ctx, types.NamespacedName{Name: applicant}, chc)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			logger.V(logs.LogDebug).Info("clusterHealthCheck not found")
+			return nil
+		}
+		return err
+	}
+
+	logger = logger.WithValues("cluster", fmt.Sprintf("%s:%s/%s", clusterType, clusterNamespace, clusterName))
+	logger.V(logs.LogDebug).Info("Undeploy clusterHealthCheck")
+
+	isPullMode, err := clusterproxy.IsClusterInPullMode(ctx, c, clusterNamespace, clusterName,
+		clusterType, logger)
+	if err != nil {
+		msg := fmt.Sprintf("failed to verify if Cluster is in pull mode: %v", err)
+		logger.V(logs.LogDebug).Info(msg)
+		return err
+	}
+
+	if isPullMode {
+		logger.V(logs.LogDebug).Info("Undeploy clusterHealthCheck in pull mode")
+		err = undeployClusterHealthCheckInPullMode(ctx, c, clusterNamespace, clusterName, chc, logger)
+		if err != nil {
+			logger.V(logs.LogInfo).Error(err, "failed to undeploy clusterHealthCheck in pull mode")
+			return err
+		}
+
+		err = removeLegacyConfigurationBundles(ctx, c, clusterNamespace, clusterName, chc, logger)
+		if err != nil {
+			logger.V(logs.LogInfo).Error(err, "failed to remove legacy configurationBundles")
+			return err
+		}
+	}
+
+	logger.V(logs.LogDebug).Info("Undeploy clusterHealthCheck. Removing HealthChecks")
+	// The ClusterHealthCheck might still reference the HealthChecks, but the cluster is not a match anymore
+	err = removeStaleHealthChecks(ctx, c, clusterNamespace, clusterName, clusterType, chc, true, logger)
+	if err != nil {
+		logger.V(logs.LogInfo).Error(err, "failed to remove health checks")
+		return err
+	}
+
+	logger.V(logs.LogDebug).Info("Undeploy clusterHealthCheck. Removing HealthCheckReports")
+	err = removeReportsOfReferencedHealthChecks(ctx, c, clusterNamespace, clusterName, clusterType, chc, logger)
+	if err != nil {
+		logger.V(logs.LogInfo).Error(err, "failed to remove stale HealthCheckReports")
+		return err
+	}
+
+	logger.V(logs.LogDebug).Info("Undeployed clusterHealthCheck")
+	return nil
+}
+
+// removeReportsOfReferencedHealthChecks removes all HealthCheckReports pulled from this managed cluster because
+// of the HealthChecks referenced by the ClusterHealthCheck liveness checks.
+func removeReportsOfReferencedHealthChecks(ctx context.Context, c client.Client,
+	clusterNamespace, clusterName string, clusterType libsveltosv1beta1.ClusterType,
+	chc *libsveltosv1beta1.ClusterHealthCheck, logger logr.Logger) error {
+
+	for i := range chc.Spec.LivenessChecks {
+		lc := &chc.Spec.LivenessChecks[i]
+		if lc.Type != libsveltosv1beta1.LivenessTypeHealthCheck || lc.LivenessSourceRef == nil {
+			continue
+		}
+
+		// A HealthCheckReport is labeled with the name of the HealthCheck, not with the name of the liveness check
+		err := removeStaleHealthCheckReports(ctx, c, clusterNamespace, clusterName, lc.LivenessSourceRef.Name,
+			clusterType, logger)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// evaluateClusterHealthCheckForCluster re-evaluates all LivenessChecks.
+// Returns:
+// - list of libsveltosv1beta1.Condition for this cluster;
+// - bool indicating whether one of the liveness checks changed status;
+// - if an error occurs, returns the error
+func evaluateClusterHealthCheckForCluster(ctx context.Context, c client.Client,
+	clusterNamespace, clusterName string, clusterType libsveltosv1beta1.ClusterType,
+	chc *libsveltosv1beta1.ClusterHealthCheck, logger logr.Logger) ([]libsveltosv1beta1.Condition, bool, error) {
+
+	conditions := make([]libsveltosv1beta1.Condition, len(chc.Spec.LivenessChecks))
+
+	statusChanged := false
+	for i := range chc.Spec.LivenessChecks {
+		livenessCheck := chc.Spec.LivenessChecks[i]
+
+		conditions[i] = libsveltosv1beta1.Condition{
+			Type:               libsveltosv1beta1.ConditionType(getConditionType(&livenessCheck)),
+			LastTransitionTime: metav1.Time{Time: time.Now()},
+		}
+
+		var tmpStatusChanged bool
+		passing, tmpStatusChanged, message, err := evaluateLivenessCheck(ctx, c, clusterNamespace, clusterName, clusterType, chc,
+			&livenessCheck, logger)
+		if err != nil {
+			logger.V(logs.LogDebug).Info("failed to evaluate livenessCheck %v. Err: %v", livenessCheck, err)
+			return nil, false, err
+		}
+		if tmpStatusChanged {
+			statusChanged = true
+		}
+
+		conditions[i].Name = livenessCheck.Name
+		conditions[i].Status = getConditionStatus(passing)
+		if !passing {
+			conditions[i].Severity = libsveltosv1beta1.ConditionSeverityWarning
+			conditions[i].Message = message
+		}
+
+		// LastTransitionTime is the time of the last status change: do not move it forward
+		// when the status is the same as in the previous evaluation
+		previous := getPreviousCondition(chc, clusterNamespace, clusterName, clusterType, &livenessCheck)
+		if previous != nil && previous.Status == conditions[i].Status {
+			conditions[i].LastTransitionTime = previous.LastTransitionTime
+		}
+	}
+
+	return conditions, statusChanged, nil
+}
+
+// sendNotification sends notifications defined in ClusterHealthCheck.
+// if resendAll is set to true, all Notifications are sent. Otherwise only the ones which have not been
+// sent yet will be delivered.
+func sendNotifications(ctx context.Context, c client.Client, clusterNamespace, clusterName string,
+	clusterType libsveltosv1beta1.ClusterType, chc *libsveltosv1beta1.ClusterHealthCheck, resendAll bool,
+	conditions []libsveltosv1beta1.Condition, logger logr.Logger,
+) ([]libsveltosv1beta1.NotificationSummary, []libsveltosv1beta1.Condition, error) {
+
+	notificationStatus := make(map[string]libsveltosv1beta1.NotificationStatus)
+	// Ignore status if all notifications need to be sent again
+	if !resendAll {
+		notificationStatus = buildNotificationStatusMap(clusterNamespace, clusterName, clusterType, chc)
+	}
+	previousSummaries := buildNotificationSummaryMap(clusterNamespace, clusterName, clusterType, chc)
+	state := getClusterState(conditions)
+	now := time.Now()
+
+	notificationSummaries := make([]libsveltosv1beta1.NotificationSummary, 0)
+
+	var sendNotificationError error
+	for i := range chc.Spec.Notifications {
+		n := &chc.Spec.Notifications[i]
+
+		var summary libsveltosv1beta1.NotificationSummary
+		var err error
+		if hasNotificationPolicy(n) {
+			// Policy decides based on what was delivered the last time, not on what changed since the last evaluation
+			summary, err = processNotificationWithPolicy(ctx, c, clusterNamespace, clusterName, clusterType, chc, n,
+				previousSummaries[n.Name], conditions, state, now, logger)
+		} else {
+			summary, err = processNotification(ctx, c, clusterNamespace, clusterName, clusterType, chc, n,
+				notificationStatus, resendAll, conditions, logger)
+		}
+		if err != nil {
+			sendNotificationError = err
+		}
+		// previousSummaries is what the ClusterHealthCheck recorded before this evaluation
+		recordNotificationFailure(ctx, c, chc, clusterNamespace, clusterName, clusterType, n,
+			previousSummaries[n.Name], &summary)
+		notificationSummaries = append(notificationSummaries, summary)
+	}
+
+	return notificationSummaries, conditions, sendNotificationError
+}
+
+// processNotification delivers the notification if it changed (or was never delivered)
+func processNotification(ctx context.Context, c client.Client, clusterNamespace, clusterName string,
+	clusterType libsveltosv1beta1.ClusterType, chc *libsveltosv1beta1.ClusterHealthCheck,
+	n *libsveltosv1beta1.Notification, notificationStatus map[string]libsveltosv1beta1.NotificationStatus,
+	resendAll bool, conditions []libsveltosv1beta1.Condition, logger logr.Logger,
+) (libsveltosv1beta1.NotificationSummary, error) {
+
+	delivered := libsveltosv1beta1.NotificationSummary{Name: n.Name, Status: libsveltosv1beta1.NotificationStatusDelivered}
+
+	if !doSendNotification(n, notificationStatus, resendAll) {
+		return delivered, nil
+	}
+
+	if err := sendNotification(ctx, c, clusterNamespace, clusterName, clusterType, chc, n, conditions, logger); err != nil {
+		logger.V(logs.LogInfo).Error(err, fmt.Sprintf("failed to deliver notification %s:%s", n.Type, n.Name))
+		failureMessage := err.Error()
+		return libsveltosv1beta1.NotificationSummary{
+			Name:           n.Name,
+			Status:         libsveltosv1beta1.NotificationStatusFailedToDeliver,
+			FailureMessage: &failureMessage,
+		}, err
+	}
+
+	return delivered, nil
+}
+
+// processNotificationWithPolicy delivers the notification if its policy says so.
+// The returned summary carries what is needed to take the next decision.
+func processNotificationWithPolicy(ctx context.Context, c client.Client, clusterNamespace, clusterName string,
+	clusterType libsveltosv1beta1.ClusterType, chc *libsveltosv1beta1.ClusterHealthCheck,
+	n *libsveltosv1beta1.Notification, previous *libsveltosv1beta1.NotificationSummary,
+	conditions []libsveltosv1beta1.Condition, state clusterState, now time.Time, logger logr.Logger,
+) (libsveltosv1beta1.NotificationSummary, error) {
+
+	summary := libsveltosv1beta1.NotificationSummary{Name: n.Name, Status: libsveltosv1beta1.NotificationStatusDelivered}
+	if previous != nil {
+		// Keep what was delivered the last time
+		summary = *previous.DeepCopy()
+		summary.Name = n.Name
+	}
+
+	send, wait := evaluateNotificationPolicy(n.Policy, previous, state, now)
+	if !send {
+		logger.V(logs.LogDebug).Info(fmt.Sprintf("notification %s:%s not delivered. Policy: next evaluation in %v",
+			n.Type, n.Name, wait))
+		return summary, nil
+	}
+
+	if err := sendNotification(ctx, c, clusterNamespace, clusterName, clusterType, chc, n, conditions, logger); err != nil {
+		logger.V(logs.LogInfo).Error(err, fmt.Sprintf("failed to deliver notification %s:%s", n.Type, n.Name))
+		failureMessage := err.Error()
+		summary.Status = libsveltosv1beta1.NotificationStatusFailedToDeliver
+		summary.FailureMessage = &failureMessage
+		return summary, err
+	}
+
+	sentTime := metav1.Time{Time: now}
+	failing := state.failing
+	summary.Status = libsveltosv1beta1.NotificationStatusDelivered
+	summary.FailureMessage = nil
+	summary.LastSentTime = &sentTime
+	summary.LastSentFailing = &failing
+	summary.LastSentMessageHash = state.messageHash
+
+	return summary, nil
+}
+
+// isClusterStillMatching returns true if cluster is still matching by looking at ClusterHealthCheck
+// Status MatchingClusterRefs
+func isClusterStillMatching(chcScope *scope.ClusterHealthCheckScope, cluster *corev1.ObjectReference) bool {
+	for i := range chcScope.ClusterHealthCheck.Status.MatchingClusterRefs {
+		matchingCluster := &chcScope.ClusterHealthCheck.Status.MatchingClusterRefs[i]
+		if reflect.DeepEqual(*matchingCluster, *cluster) {
+			return true
+		}
+	}
+	return false
+}
+
+// removeStaleHealthCheckReports removes stale HealthCheckReports from the management cluster.
+func removeStaleHealthCheckReports(ctx context.Context, c client.Client,
+	clusterNamespace, clusterName, healthCheckName string,
+	clusterType libsveltosv1beta1.ClusterType, logger logr.Logger) error {
+
+	listOptions := []client.ListOption{
+		client.InNamespace(clusterNamespace),
+		client.MatchingLabels{
+			libsveltosv1beta1.HealthCheckReportClusterNameLabel: clusterName,
+			libsveltosv1beta1.HealthCheckReportClusterTypeLabel: strings.ToLower(string(clusterType)),
+			libsveltosv1beta1.HealthCheckNameLabel:              healthCheckName,
+		},
+	}
+
+	healthCheckReportList := &libsveltosv1beta1.HealthCheckReportList{}
+	err := c.List(ctx, healthCheckReportList, listOptions...)
+	if err != nil {
+		logger.V(logs.LogInfo).Error(err, "failed to list HealthCheckReports.")
+		return err
+	}
+
+	for i := range healthCheckReportList.Items {
+		err = c.Delete(ctx, &healthCheckReportList.Items[i])
+		// Someone else might have removed it since it was listed
+		if err != nil && !apierrors.IsNotFound(err) {
+			logger.V(logs.LogInfo).Error(err, "failed to delete HealthCheckReport")
+			return err
+		}
+	}
+
+	return nil
+}
+
+// removeStaleHealthChecks removes stale HealthChecks.
+// - If removeAll is true, ClusterHealthCheck will be removed as OwnerReference from any HealthCheck instance,
+// even the ones it is still referencing. removeAll must be true when the ClusterHealthCheck is deleted or when
+// the cluster is not a match anymore: nothing must be deployed in the cluster anymore;
+// - If removeAll is false, the cluster is still a match and ClusterHealthCheck will be removed as OwnerReference
+// from any HealthCheck instance it used to referenced and it is not referencing anymore.
+// An HealthCheck with zero OwnerReference will be deleted from managed cluster.
+func removeStaleHealthChecks(ctx context.Context, c client.Client,
+	clusterNamespace, clusterName string, clusterType libsveltosv1beta1.ClusterType,
+	chc *libsveltosv1beta1.ClusterHealthCheck, removeAll bool, logger logr.Logger) error {
+
+	isPullMode, err := clusterproxy.IsClusterInPullMode(ctx, c, clusterNamespace, clusterName,
+		clusterType, logger)
+	if err != nil {
+		logger.V(logs.LogInfo).Error(err, "failed to verify if Cluster is in pull mode")
+		return err
+	}
+
+	if isPullMode {
+		// In pull mode stale healthChecks in the managed clusters are removed by Sveltos-applier
+		return nil
+	}
+
+	// Create a map (for faster indexing) of the HealthChecks to keep: when removing all, none.
+	currentReferenced := &libsveltosset.Set{}
+	if !removeAll {
+		currentReferenced = getReferencedHealthChecks(chc, logger)
+	}
+
+	if getAgentInMgmtCluster() {
+		return removeHealthCheckFromConfigMap(ctx, c, clusterNamespace, clusterName, clusterType, chc,
+			currentReferenced, logger)
+	}
+
+	return proceedRemovingStaleHealthChecks(ctx, c, clusterNamespace, clusterName, clusterType,
+		chc, currentReferenced, logger)
+}
+
+func proceedRemovingStaleHealthChecks(ctx context.Context, c client.Client,
+	clusterNamespace, clusterName string, clusterType libsveltosv1beta1.ClusterType,
+	chc *libsveltosv1beta1.ClusterHealthCheck, currentReferenced *libsveltosset.Set, logger logr.Logger) error {
+
+	remoteClient, err := clustercache.GetManager().GetKubernetesClient(ctx, c, clusterNamespace, clusterName,
+		"", "", clusterType, logger)
+	if err != nil {
+		logger.V(logs.LogInfo).Error(err, "failed to get managed cluster client")
+		return err
+	}
+
+	healthCheckList := &libsveltosv1beta1.HealthCheckList{}
+	err = remoteClient.List(ctx, healthCheckList)
+	if err != nil {
+		logger.V(logs.LogInfo).Error(err, "failed to get list HealthChecks")
+		// GetKubernetesClient succeeding only means the cached rest.Config was non-nil - it does
+		// not verify the credentials still work, since client.New performs no network call. A
+		// token that expired since the config was cached surfaces here, on first actual use.
+		clustercache.GetManager().InvalidateOnAuthError(clusterNamespace, clusterName, clusterType, err)
+		return err
+	}
+
+	for i := range healthCheckList.Items {
+		hc := &healthCheckList.Items[i]
+
+		objRef := &corev1.ObjectReference{
+			APIVersion: libsveltosv1beta1.GroupVersion.String(),
+			Kind:       libsveltosv1beta1.HealthCheckKind,
+			Name:       hc.Name,
+		}
+
+		if currentReferenced.Has(objRef) {
+			// healthCheck is still referenced
+			continue
+		}
+
+		targetGK := schema.GroupKind{
+			Group: libsveltosv1beta1.GroupVersion.Group,
+			Kind:  libsveltosv1beta1.ClusterHealthCheckKind,
+		}
+
+		if !util.IsOwnedByObject(hc, chc, targetGK) {
+			continue
+		}
+
+		k8s_utils.RemoveOwnerReference(hc, chc)
+
+		if len(hc.GetOwnerReferences()) != 0 {
+			// Other ClusterHealthChecks are still deploying this very same policy
+			err = remoteClient.Update(ctx, hc)
+			if err != nil {
+				logger.V(logs.LogInfo).Error(err, "failed to get update HealthCheck")
+				clustercache.GetManager().InvalidateOnAuthError(clusterNamespace, clusterName, clusterType, err)
+				return err
+			}
+			continue
+		}
+
+		// Since HealthCheck is about to be removed from the managed cluster, removes all
+		// HealthCheckReports pulled from this managed cluster because of this HealthCheck
+		err = removeStaleHealthCheckReports(ctx, c, clusterNamespace, clusterName, hc.Name, clusterType, logger)
+		if err != nil {
+			return err
+		}
+
+		err = remoteClient.Delete(ctx, hc)
+		if err != nil {
+			logger.V(logs.LogInfo).Error(err, "failed to get delete HealthCheck")
+			clustercache.GetManager().InvalidateOnAuthError(clusterNamespace, clusterName, clusterType, err)
+			return err
+		}
+	}
+
+	return nil
+}
+
+func undeployClusterHealthCheckInPullMode(ctx context.Context, c client.Client,
+	clusterNamespace, clusterName string, chc *libsveltosv1beta1.ClusterHealthCheck, logger logr.Logger) error {
+
+	// ClusterHealthCheck follows a strict state machine for resource removal:
+	//
+	// 1. Create ConfigurationGroup with action=Remove
+	// 2. Monitor ConfigurationGroup status:
+	//    - Missing ConfigurationGroup = resources successfully removed
+	//    - ConfigurationGroup.Status = Removed = resources successfully removed
+	var retError error
+	agentStatus, err := pullmode.GetRemoveStatus(ctx, c, clusterNamespace, clusterName,
+		libsveltosv1beta1.ClusterHealthCheckKind, chc.Name, libsveltosv1beta1.FeatureClusterHealthCheck, logger)
+	if err != nil {
+		// GetRemoveStatus returns NotFound when there is no ConfigurationGroup, and ActionNotSetToRemove when the
+		// ConfigurationGroup is still the one used to deploy (the agent has not confirmed the deployment yet).
+		// In both cases removal has not been requested yet. That is not a failure, the request is made below.
+		if !apierrors.IsNotFound(err) && !pullmode.IsActionNotSetToRemove(err) {
+			retError = err
+		}
+	} else if agentStatus != nil {
+		if agentStatus.DeploymentStatus != nil && *agentStatus.DeploymentStatus == libsveltosv1beta1.FeatureStatusRemoved {
+			logger.V(logs.LogDebug).Info("agent removed content")
+			err = pullmode.TerminateDeploymentTracking(ctx, c, clusterNamespace, clusterName,
+				libsveltosv1beta1.ClusterHealthCheckKind, chc.Name, libsveltosv1beta1.FeatureClusterHealthCheck, logger)
+			if err != nil {
+				return err
+			}
+			return nil
+		} else if agentStatus.FailureMessage != nil {
+			retError = errors.New(*agentStatus.FailureMessage)
+		} else {
+			return errors.New(msgAgentRemoving)
+		}
+	}
+
+	logger.V(logs.LogDebug).Info("queueing request to un-deploy")
+	setters := prepareSetters(chc, nil)
+	err = pullmode.RemoveDeployedResources(ctx, c, clusterNamespace, clusterName, libsveltosv1beta1.ClusterHealthCheckKind, chc.Name,
+		libsveltosv1beta1.FeatureClusterHealthCheck, logger, setters...)
+	if err != nil {
+		logger.V(logs.LogDebug).Error(err, "removeDeployedResources failed")
+		return err
+	}
+
+	if retError != nil {
+		return retError
+	}
+
+	return errors.New(msgAgentCleanupQueued)
+}
+
+// deployHealthChecks deploys (creates or updates) all HealthChecks referenced by this ClusterHealthCheck
+// instance.
+func deployHealthChecks(ctx context.Context, c client.Client,
+	clusterNamespace, clusterName string, clusterType libsveltosv1beta1.ClusterType,
+	chc *libsveltosv1beta1.ClusterHealthCheck, options deployer.Options, logger logr.Logger) error {
+
+	isPullMode, err := clusterproxy.IsClusterInPullMode(ctx, c, clusterNamespace, clusterName, clusterType, logger)
+	if err != nil {
+		logger.V(logs.LogInfo).Error(err, "failed to verify if Cluster is in pull mode")
+		return err
+	}
+
+	if isPullMode {
+		// If SveltosCluster is in pull mode, discard all previous staged resources. Those will be regenerated now.
+		err := pullmode.DiscardStagedResourcesForDeployment(ctx, c, clusterNamespace, clusterName,
+			libsveltosv1beta1.ClusterHealthCheckKind, chc.Name, libsveltosv1beta1.FeatureClusterHealthCheck, logger)
+		if err != nil {
+			return err
+		}
+	}
+
+	// classifier installs sveltos-agent and CRDs it needs, including
+	// HealthCheck and HealthCheckReport CRDs.
+
+	for i := range chc.Spec.LivenessChecks {
+		lc := chc.Spec.LivenessChecks[i]
+		err := deployHealthCheck(ctx, c, clusterNamespace, clusterName, clusterType, chc, &lc, isPullMode, logger)
+		if err != nil {
+			logger.V(logs.LogInfo).Error(err, "failed to get deploy healthCheck")
+			return err
+		}
+	}
+
+	if isPullMode {
+		configurationHash, _ := options.HandlerOptions[configurationHash].([]byte)
+		setters := prepareSetters(chc, configurationHash)
+		err := pullmode.CommitStagedResourcesForDeployment(ctx, c, clusterNamespace, clusterName,
+			libsveltosv1beta1.ClusterHealthCheckKind, chc.Name, libsveltosv1beta1.FeatureClusterHealthCheck,
+			logger, setters...)
+		if err != nil {
+			return err
+		}
+
+		return removeLegacyConfigurationBundles(ctx, c, clusterNamespace, clusterName, chc, logger)
+	}
+
+	return nil
+}
+
+// deployHealthCheck deploys (creates or updates) referenced HealthCheck and recursively any ConfigMap/Secret
+// the HealthCheck references (containing the lua script)
+func deployHealthCheck(ctx context.Context, c client.Client, clusterNamespace, clusterName string,
+	clusterType libsveltosv1beta1.ClusterType, chc *libsveltosv1beta1.ClusterHealthCheck,
+	lc *libsveltosv1beta1.LivenessCheck, isPullMode bool, logger logr.Logger) error {
+
+	if lc.Type != libsveltosv1beta1.LivenessTypeHealthCheck {
+		return nil
+	}
+
+	if lc.LivenessSourceRef == nil {
+		// nothing to do
+		return nil
+	}
+
+	if lc.LivenessSourceRef.Kind != libsveltosv1beta1.HealthCheckKind ||
+		lc.LivenessSourceRef.APIVersion != libsveltosv1beta1.GroupVersion.String() {
+
+		msg := fmt.Sprintf("liveness check %s of type HealthCheck can only reference HealthCheck resource", lc.Name)
+		logger.V(logs.LogInfo).Info(msg)
+		return fmt.Errorf("%s", msg)
+	}
+
+	// Fetch HealthCheck
+	healthCheck := &libsveltosv1beta1.HealthCheck{}
+	err := c.Get(ctx, types.NamespacedName{Name: lc.LivenessSourceRef.Name}, healthCheck)
+	if err != nil {
+		logger.V(logs.LogInfo).Error(err, "failed to fetch HealthCheck")
+		return err
+	}
+
+	if getAgentInMgmtCluster() && !isPullMode {
+		return addHealthCheckToConfigMap(ctx, c, clusterNamespace, clusterName, clusterType,
+			chc, healthCheck, logger)
+	}
+
+	var remoteClient client.Client
+	if !isPullMode {
+		remoteClient, err = clustercache.GetManager().GetKubernetesClient(ctx, c, clusterNamespace, clusterName,
+			"", "", clusterType, logger)
+		if err != nil {
+			logger.V(logs.LogInfo).Error(err, "failed to get managed cluster client")
+			return err
+		}
+	}
+
+	err = createOrUpdateHealthCheck(ctx, remoteClient, chc, healthCheck, clusterNamespace, clusterName,
+		isPullMode, logger)
+	if err != nil {
+		logger.V(logs.LogInfo).Error(err, "failed to create/update HealthCheck")
+		// remoteClient was built from a cached rest.Config whose credentials were never
+		// actually exercised until this Get/Update/Create - a token that expired since the
+		// config was cached surfaces here, on first real use.
+		clustercache.GetManager().InvalidateOnAuthError(clusterNamespace, clusterName, clusterType, err)
+		return err
+	}
+
+	return nil
+}
+
+func createOrUpdateHealthCheck(ctx context.Context, remoteClient client.Client,
+	chc *libsveltosv1beta1.ClusterHealthCheck, healthCheck *libsveltosv1beta1.HealthCheck,
+	clusterNamespace, clusterName string, isPullMode bool, logger logr.Logger) error {
+
+	logger = logger.WithValues("healthCheck", healthCheck.Name)
+
+	if !isPullMode {
+		currentHealthCheck := &libsveltosv1beta1.HealthCheck{}
+		err := remoteClient.Get(context.TODO(), types.NamespacedName{Name: healthCheck.Name}, currentHealthCheck)
+		if err == nil {
+			logger.V(logs.LogDebug).Info("updating healthCheck")
+			currentHealthCheck.Spec = healthCheck.Spec
+			// Copy labels. If admin-label is set, sveltos-agent will impersonate
+			// ServiceAccount representing the tenant admin when fetching resources
+			currentHealthCheck.Labels = healthCheck.Labels
+			currentHealthCheck.Annotations = map[string]string{
+				libsveltosv1beta1.DeployedBySveltosAnnotation: deployedBySveltos,
+			}
+			k8s_utils.AddOwnerReference(currentHealthCheck, chc)
+			return remoteClient.Update(ctx, currentHealthCheck)
+		}
+
+		currentHealthCheck.Name = healthCheck.Name
+		currentHealthCheck.Spec = healthCheck.Spec
+		// Copy labels. If admin-label is set, sveltos-agent will impersonate
+		// ServiceAccount representing the tenant admin when fetching resources
+		currentHealthCheck.Labels = healthCheck.Labels
+		currentHealthCheck.Annotations = map[string]string{
+			libsveltosv1beta1.DeployedBySveltosAnnotation: deployedBySveltos,
+		}
+		k8s_utils.AddOwnerReference(currentHealthCheck, chc)
+
+		logger.V(logs.LogDebug).Info("creating healthCheck")
+		return remoteClient.Create(ctx, currentHealthCheck)
+	}
+
+	toDeployHealthCheck := getHealthCheckToDeploy(healthCheck)
+	unstructuredObj, err := runtime.DefaultUnstructuredConverter.ToUnstructured(&toDeployHealthCheck)
+	if err != nil {
+		logger.V(logs.LogDebug).Error(err, "failed to convert HealthCheck instance to unstructured")
+	}
+
+	u := &unstructured.Unstructured{}
+	u.SetUnstructuredContent(unstructuredObj)
+
+	// Each key becomes its own ConfigurationBundle. The key must be unique per HealthCheck: a ClusterHealthCheck
+	// can reference several HealthChecks and a shared key would make each one overwrite the previous one.
+	resources := map[string][]unstructured.Unstructured{}
+	resources["healthcheck-instance-"+healthCheck.Name] = []unstructured.Unstructured{*u}
+	// The requestor kind must be the one used to commit, discard and remove: ConfigurationBundles are looked up
+	// by it, so bundles staged with another kind are never found, and never deleted.
+	return pullmode.StageResourcesForDeployment(ctx, getManagementClusterClient(), clusterNamespace, clusterName,
+		libsveltosv1beta1.ClusterHealthCheckKind, chc.Name, libsveltosv1beta1.FeatureClusterHealthCheck, resources,
+		false, logger)
+}
+
+// removeLegacyConfigurationBundles removes the ConfigurationBundles staged for this ClusterHealthCheck by
+// versions which used HealthCheckReportKind as requestor kind. No ConfigurationGroup references them, and
+// nothing looking them up by ClusterHealthCheckKind finds them, so they would stay forever.
+func removeLegacyConfigurationBundles(ctx context.Context, c client.Client, clusterNamespace, clusterName string,
+	chc *libsveltosv1beta1.ClusterHealthCheck, logger logr.Logger) error {
+
+	return pullmode.TerminateDeploymentTracking(ctx, c, clusterNamespace, clusterName,
+		libsveltosv1beta1.HealthCheckReportKind, chc.Name, libsveltosv1beta1.FeatureClusterHealthCheck, logger)
+}
+
+func getHealthCheckToDeploy(healthCheck *libsveltosv1beta1.HealthCheck) *libsveltosv1beta1.HealthCheck {
+	toDeploy := &libsveltosv1beta1.HealthCheck{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: healthCheck.Name,
+			Annotations: map[string]string{
+				libsveltosv1beta1.DeployedBySveltosAnnotation: deployedBySveltos,
+			},
+		},
+		Spec: healthCheck.Spec,
+	}
+
+	addTypeInformationToObject(getManagementClusterScheme(), toDeploy)
+	return toDeploy
+}
+
+func getReferencedHealthChecks(chc *libsveltosv1beta1.ClusterHealthCheck, logger logr.Logger) *libsveltosset.Set {
+	currentReferenced := &libsveltosset.Set{}
+
+	if !chc.DeletionTimestamp.IsZero() {
+		// if ClusterHealthCheck is deleted, assume it is not referencing any HealthCheck instance
+		return currentReferenced
+	}
+
+	for i := range chc.Spec.LivenessChecks {
+		lc := chc.Spec.LivenessChecks[i]
+		if lc.Type == libsveltosv1beta1.LivenessTypeHealthCheck {
+			if lc.LivenessSourceRef != nil {
+				currentReferenced.Insert(&corev1.ObjectReference{
+					APIVersion: libsveltosv1beta1.GroupVersion.String(), // the only resources that can be referenced is HealthCheck
+					Kind:       libsveltosv1beta1.HealthCheckKind,
+					Name:       lc.LivenessSourceRef.Name,
+				})
+			}
+		}
+	}
+
+	return currentReferenced
+}
+
+func prepareSetters(chc *libsveltosv1beta1.ClusterHealthCheck, configurationHash []byte) []pullmode.Option {
+	setters := make([]pullmode.Option, 0)
+	setters = append(setters, pullmode.WithRequestorHash(configurationHash))
+	sourceRef := corev1.ObjectReference{
+		APIVersion: chc.APIVersion,
+		Kind:       chc.Kind,
+		Name:       chc.Name,
+		UID:        chc.UID,
+	}
+
+	setters = append(setters, pullmode.WithSourceRef(&sourceRef))
+
+	return setters
+}
+
+func (r *ClusterHealthCheckReconciler) isClusterPresent(ctx context.Context,
+	clusterRef *corev1.ObjectReference) (present, deleted bool, err error) {
+
+	var cluster client.Object
+
+	cluster, err = clusterproxy.GetCluster(ctx, r.Client, clusterRef.Namespace,
+		clusterRef.Name, clusterproxy.GetClusterType(clusterRef))
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, false, nil
+		}
+	}
+
+	return true, !cluster.GetDeletionTimestamp().IsZero(), err
+}
+
+func (r *ClusterHealthCheckReconciler) resetHealthCheckReportStatus(ctx context.Context,
+	chc *libsveltosv1beta1.ClusterHealthCheck, clusterRef *corev1.ObjectReference, isPullMode bool,
+	logger logr.Logger) error {
+
+	clusterType := clusterproxy.GetClusterType(clusterRef)
+	var kubernetesClient client.Client
+	var err error
+	var healthCheckReportNamespace, healthCheckReportName string
+
+	for i := range chc.Spec.LivenessChecks {
+		if chc.Spec.LivenessChecks[i].Type != libsveltosv1beta1.LivenessTypeHealthCheck {
+			continue
+		}
+
+		if getAgentInMgmtCluster() || isPullMode {
+			healthCheckReportName = libsveltosv1beta1.GetHealthCheckReportName(chc.Spec.LivenessChecks[i].Name,
+				clusterRef.Name, &clusterType)
+			healthCheckReportNamespace = clusterRef.Namespace
+			kubernetesClient = r.Client
+		} else {
+			healthCheckReportName = chc.Spec.LivenessChecks[i].Name
+			healthCheckReportNamespace = getSveltosNamespace()
+			kubernetesClient, err = clustercache.GetManager().GetKubernetesClient(ctx, r.Client, clusterRef.Namespace,
+				clusterRef.Name, "", "", clusterType, logger)
+			if err != nil {
+				logger.V(logs.LogInfo).Error(err, "failed to get client")
+				return err
+			}
+		}
+
+		currentHealthCheckReport := &libsveltosv1beta1.HealthCheckReport{}
+		err := kubernetesClient.Get(ctx,
+			types.NamespacedName{Namespace: healthCheckReportNamespace, Name: healthCheckReportName},
+			currentHealthCheckReport)
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				return nil
+			}
+			return err
+		}
+
+		if currentHealthCheckReport.Status.Phase == nil ||
+			*currentHealthCheckReport.Status.Phase != libsveltosv1beta1.ReportProcessed {
+
+			return nil
+		}
+		delivering := libsveltosv1beta1.ReportDelivering
+		currentHealthCheckReport.Status.Phase = &delivering
+		logger.V(logs.LogDebug).Info(fmt.Sprintf("Reset HealthCheckReport %s/%s Status.Phase",
+			currentHealthCheckReport.Namespace, currentHealthCheckReport.Name))
+		return kubernetesClient.Status().Update(ctx, currentHealthCheckReport)
+	}
+
+	return nil
+}

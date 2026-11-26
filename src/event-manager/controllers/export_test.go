@@ -1,0 +1,149 @@
+/*
+Copyright 2023. projectsveltos.io. All rights reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package controllers
+
+import (
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/rest"
+)
+
+var (
+	RemoveEventReports                       = removeEventReports
+	RemoveEventReportsFromCluster            = removeEventReportsFromCluster
+	CollectAndProcessEventReportsFromCluster = collectAndProcessEventReportsFromCluster
+	CollectAndProcessAllEventReports         = collectAndProcessAllEventReports
+	RemoveStaleEventReportsOnce              = removeStaleEventReportsOnce
+	DeleteEventReport                        = deleteEventReport
+	ProcessEventTriggerForCluster            = processEventTriggerForCluster
+	UpdateEventReportStatus                  = updateEventReportStatus
+	SetEventReportFailureMessage             = setEventReportFailureMessage
+	SkipCollecting                           = skipCollecting
+	RecordClusterInfoFailure                 = recordClusterInfoFailure
+	IsAgentHeartbeatCurrent                  = isAgentHeartbeatCurrent
+	ProcessOneEventReport                    = processOneEventReport
+)
+
+var (
+	RequeueEventTriggerForCluster   = (*EventTriggerReconciler).requeueEventTriggerForCluster
+	RequeueEventTriggerForReference = (*EventTriggerReconciler).requeueEventTriggerForReference
+	UpdateClusterInfo               = (*EventTriggerReconciler).updateClusterInfo
+	CleanMaps                       = (*EventTriggerReconciler).cleanMaps
+	UpdateMaps                      = (*EventTriggerReconciler).updateMaps
+	ProcessEventTrigger             = (*EventTriggerReconciler).processEventTrigger
+	GetClustersFromClusterSets      = (*EventTriggerReconciler).getClustersFromClusterSets
+
+	ProcessCluster = processCluster
+
+	GetKeyFromObject      = getKeyFromObject
+	GetHandlersForFeature = getHandlersForFeature
+	GetConsumersForEntry  = getConsumersForEntry
+
+	GetCloudEvents = getCloudEvents
+	GetResources   = getResources
+)
+
+type (
+	CurrentObject  = currentObject
+	CurrentObjects = currentObjects
+)
+
+var (
+	EventTriggerHash                = eventTriggerHash
+	RemoveStaleEventSources         = removeStaleEventSources
+	RemoveStaleEventReports         = removeStaleEventReports
+	DeployEventSource               = deployEventSource
+	AppendCloudEventClusterProfiles = appendCloudEventClusterProfiles
+
+	InstantiateOneClusterProfilePerAllResource = instantiateOneClusterProfilePerAllResource
+	InstantiateOneClusterProfilePerResource    = instantiateOneClusterProfilePerResource
+	RemoveClusterProfiles                      = removeClusterProfiles
+
+	InstantiateCloudEventAction = instantiateCloudEventAction
+	PrepareCurrentObjectList    = prepareCurrentObjectList
+
+	InstantiateFromGeneratorsPerResource = instantiateFromGeneratorsPerResource
+	DeleteInstantiatedFromGenerators     = deleteInstantiatedFromGenerators
+
+	GetInstantiatedObjectLabels = getInstantiatedObjectLabels
+	GetClusterProfileName       = getClusterProfileName
+
+	InstantiateReferencedPolicyRefs = instantiateReferencedPolicyRefs
+	InstantiateDataSection          = instantiateDataSection
+	RemoveConfigMaps                = removeConfigMaps
+	RemoveSecrets                   = removeSecrets
+	UnstructuredToTyped             = unstructuredToTyped
+
+	InstantiateHelmCharts        = instantiateHelmCharts
+	InstantiateKustomizationRefs = instantiateKustomizationRefs
+	InstantiateStringField       = instantiateStringField
+
+	InstantiatePatchesFromWithResource     = instantiatePatchesFromWithResource
+	InstantiatePatchesFromWithAllResources = instantiatePatchesFromWithAllResources
+
+	BuildEventTriggersForEventSourceMap = buildEventTriggersForEventSourceMap
+	BuildEventTriggersForClusterMap     = buildEventTriggersForClusterMap
+	BuildClustersWithEventTrigger       = buildClustersWithEventTrigger
+	ShouldIgnore                        = shouldIgnore
+	ShouldReprocess                     = shouldReprocess
+	IsEventTriggerMatchingTheCluster    = isEventTriggerMatchingTheCluster
+)
+
+var (
+	GetTrackerInstance       = getTrackerInstance
+	StopTrackingConsumer     = (*tracker).stopTrackingConsumer
+	TrackResourceForConsumer = (*tracker).trackResourceForConsumer
+	GetConsumersForResource  = (*tracker).getConsumersForResource
+)
+
+const (
+	ReferencedResourceNamespaceLabel = referencedResourceNamespaceLabel
+	ReferencedResourceNameLabel      = referencedResourceNameLabel
+)
+
+// fetcher
+var (
+	GetConfigMap             = getConfigMap
+	GetSecret                = getSecret
+	FetchPolicyRefs          = fetchPolicyRefs
+	FetchEventReports        = fetchEventReports
+	FetchEventSource         = fetchEventSource
+	FetchReferencedResources = fetchReferencedResources
+)
+
+func SetSchema(s *runtime.Scheme) {
+	mgmtClusterSchema = s
+}
+
+func SetConfig(config *rest.Config) {
+	mgmtClusterConfig = config
+}
+
+var (
+	HasMatchingResources    = hasMatchingResources
+	IncrementZeroMatchCount = incrementZeroMatchCount
+	ResetZeroMatchCount     = resetZeroMatchCount
+	ZeroMatchThreshold      = zeroMatchThreshold
+)
+
+// ResetZeroMatchCounters clears all entries in the package-level counter map.
+// For use in tests only.
+func ResetZeroMatchCounters() {
+	zeroMatchCounts.Range(func(k, _ any) bool {
+		zeroMatchCounts.Delete(k)
+		return true
+	})
+}

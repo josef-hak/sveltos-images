@@ -1,0 +1,631 @@
+/*
+Copyright 2022. projectsveltos.io. All rights reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package controllers_test
+
+import (
+	"context"
+	"fmt"
+	"reflect"
+	"time"
+
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+
+	"github.com/gdexlab/go-render/render"
+	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/rest"
+	"k8s.io/klog/v2/textlogger"
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	configv1beta1 "github.com/projectsveltos/addon-controller/api/v1beta1"
+	"github.com/projectsveltos/addon-controller/controllers"
+	"github.com/projectsveltos/addon-controller/lib/clusterops"
+	"github.com/projectsveltos/addon-controller/pkg/scope"
+	libsveltosv1beta1 "github.com/projectsveltos/libsveltos/api/v1beta1"
+	"github.com/projectsveltos/libsveltos/lib/deployer"
+)
+
+var _ = Describe("HandlersResource", func() {
+	var clusterProfile *configv1beta1.ClusterProfile
+	var clusterSummary *configv1beta1.ClusterSummary
+	var cluster *clusterv1.Cluster
+	var namespace string
+
+	BeforeEach(func() {
+		namespace = randomString()
+
+		cluster = &clusterv1.Cluster{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      upstreamClusterNamePrefix + randomString(),
+				Namespace: namespace,
+				Labels: map[string]string{
+					testDCLabelKey: testEngValue,
+				},
+			},
+		}
+
+		clusterProfile = &configv1beta1.ClusterProfile{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: clusterProfileNamePrefix + randomString(),
+			},
+			Spec: configv1beta1.Spec{
+				ClusterSelector: libsveltosv1beta1.Selector{
+					LabelSelector: metav1.LabelSelector{
+						MatchLabels: map[string]string{
+							randomString(): randomString(),
+						},
+					},
+				},
+			},
+		}
+
+		clusterSummaryName := clusterops.GetClusterSummaryName(configv1beta1.ClusterProfileKind,
+			clusterProfile.Name, cluster.Name, false)
+		clusterSummary = &configv1beta1.ClusterSummary{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      clusterSummaryName,
+				Namespace: cluster.Namespace,
+			},
+			Spec: configv1beta1.ClusterSummarySpec{
+				ClusterNamespace: cluster.Namespace,
+				ClusterName:      cluster.Name,
+				ClusterType:      libsveltosv1beta1.ClusterTypeCapi,
+			},
+		}
+
+		prepareForDeployment(clusterProfile, clusterSummary, cluster)
+
+		// Get ClusterSummary so OwnerReference is set
+		Expect(testEnv.Get(context.TODO(),
+			types.NamespacedName{Namespace: clusterSummary.Namespace, Name: clusterSummary.Name}, clusterSummary)).To(Succeed())
+	})
+
+	AfterEach(func() {
+		deleteResources(namespace, clusterProfile, clusterSummary)
+	})
+
+	It("DeployResources creates referenced ClusterRole", func() {
+		clusterRoleName := randomString()
+		configMap := createConfigMapWithPolicy("default", randomString(), fmt.Sprintf(viewClusterRole, clusterRoleName))
+
+		currentClusterSummary := &configv1beta1.ClusterSummary{}
+		Expect(testEnv.Get(context.TODO(),
+			types.NamespacedName{Namespace: clusterSummary.Namespace, Name: clusterSummary.Name}, currentClusterSummary)).To(Succeed())
+		// We are using testEnv for both management and managed cluster. So ask Sveltos to deploy same ClusterRole in both
+		// managed and management cluster. If for instance we had deployed ClusterRole just to the managed cluster,
+		// then as part of cleaning stale resources in the management cluster, Sveltos would have removed it.
+		currentClusterSummary.Spec.ClusterProfileSpec.PolicyRefs = []configv1beta1.PolicyRef{
+			{
+				Namespace:      configMap.Namespace,
+				Name:           configMap.Name,
+				Kind:           string(libsveltosv1beta1.ConfigMapReferencedResourceKind),
+				DeploymentType: configv1beta1.DeploymentTypeLocal,
+			},
+			{
+				Namespace:      configMap.Namespace,
+				Name:           configMap.Name,
+				Kind:           string(libsveltosv1beta1.ConfigMapReferencedResourceKind),
+				DeploymentType: configv1beta1.DeploymentTypeRemote,
+			},
+		}
+		Expect(testEnv.Update(context.TODO(), currentClusterSummary)).To(Succeed())
+
+		Expect(testEnv.Create(context.TODO(), configMap)).To(Succeed())
+		Expect(waitForObject(context.TODO(), testEnv.Client, configMap)).To(Succeed())
+
+		Expect(addTypeInformationToObject(testEnv.Scheme(), clusterProfile)).To(Succeed())
+
+		// Eventual loop so testEnv Cache is synced
+		Eventually(func() error {
+			return controllers.GenericDeploy(ctx, testEnv.Client, cluster.Namespace, cluster.Name, clusterSummary.Name,
+				string(libsveltosv1beta1.FeatureResources), libsveltosv1beta1.ClusterTypeCapi, deployer.Options{},
+				textlogger.NewLogger(textlogger.NewConfig()))
+		}, timeout, pollingInterval).Should(BeNil())
+
+		// Eventual loop so testEnv Cache is synced
+		Eventually(func() error {
+			currentClusterRole := &rbacv1.ClusterRole{}
+			return testEnv.Get(context.TODO(), types.NamespacedName{Name: clusterRoleName}, currentClusterRole)
+		}, timeout, pollingInterval).Should(BeNil())
+
+		currentClusterRole := &rbacv1.ClusterRole{}
+		Expect(testEnv.Get(context.TODO(), types.NamespacedName{Name: clusterRoleName}, currentClusterRole)).To(Succeed())
+		// OwnerReference is not set anymore
+		Expect(currentClusterRole.OwnerReferences).To(BeNil())
+		Expect(currentClusterRole.Annotations).ToNot(BeNil())
+		v, ok := currentClusterRole.Annotations[deployer.OwnerName]
+		Expect(ok).To(BeTrue())
+		Expect(v).To(Equal(clusterProfile.Name))
+
+		v, ok = currentClusterRole.Annotations[deployer.OwnerKind]
+		Expect(ok).To(BeTrue())
+		Expect(v).To(Equal(configv1beta1.ClusterProfileKind))
+	})
+
+	It("unDeployResources removes all ClusterRole and Role created by a ClusterSummary", func() {
+		role0 := &rbacv1.Role{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: namespace,
+				Name:      randomString(),
+				Labels: map[string]string{
+					deployer.ReasonLabel: string(libsveltosv1beta1.FeatureResources),
+				},
+				Annotations: map[string]string{
+					deployer.ReferenceKindAnnotation:      string(libsveltosv1beta1.ConfigMapReferencedResourceKind),
+					deployer.ReferenceNameAnnotation:      randomString(),
+					deployer.ReferenceNamespaceAnnotation: randomString(),
+					deployer.ReasonLabel:                  string(libsveltosv1beta1.FeatureResources),
+				},
+			},
+		}
+
+		role1 := &rbacv1.Role{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: namespace,
+				Name:      randomString(),
+			},
+		}
+
+		clusterRole0 := &rbacv1.ClusterRole{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: randomString(),
+				Labels: map[string]string{
+					deployer.ReasonLabel: string(libsveltosv1beta1.FeatureResources),
+				},
+				Annotations: map[string]string{
+					deployer.ReferenceKindAnnotation:      string(libsveltosv1beta1.ConfigMapReferencedResourceKind),
+					deployer.ReferenceNameAnnotation:      randomString(),
+					deployer.ReferenceNamespaceAnnotation: randomString(),
+				},
+			},
+		}
+
+		Expect(addTypeInformationToObject(testEnv.Scheme(), clusterSummary)).To(Succeed())
+
+		Expect(testEnv.Create(context.TODO(), role0)).To(Succeed())
+		Expect(testEnv.Create(context.TODO(), role1)).To(Succeed())
+		Expect(testEnv.Create(context.TODO(), clusterRole0)).To(Succeed())
+		Expect(waitForObject(context.TODO(), testEnv.Client, clusterRole0)).To(Succeed())
+		addOwnerReference(ctx, testEnv.Client, role0, clusterProfile)
+		addOwnerReference(ctx, testEnv.Client, clusterRole0, clusterProfile)
+
+		currentClusterSummary := &configv1beta1.ClusterSummary{}
+		Expect(testEnv.Get(context.TODO(),
+			types.NamespacedName{Namespace: clusterSummary.Namespace, Name: clusterSummary.Name},
+			currentClusterSummary)).To(Succeed())
+		currentClusterSummary.Status.FeatureSummaries = []configv1beta1.FeatureSummary{
+			{
+				FeatureID: libsveltosv1beta1.FeatureResources,
+				Status:    libsveltosv1beta1.FeatureStatusProvisioned,
+			},
+		}
+		currentClusterSummary.Status.DeployedGVKs = []libsveltosv1beta1.FeatureDeploymentInfo{
+			{
+				FeatureID: libsveltosv1beta1.FeatureResources,
+				DeployedGroupVersionKind: []string{
+					testClusterRoleKindV1,
+					"Role.v1.rbac.authorization.k8s.io",
+				},
+			},
+		}
+		Expect(testEnv.Status().Update(context.TODO(), currentClusterSummary)).To(Succeed())
+
+		// Wait for cache to be updated
+		Eventually(func() bool {
+			err := testEnv.Get(context.TODO(),
+				types.NamespacedName{Namespace: clusterSummary.Namespace, Name: clusterSummary.Name},
+				currentClusterSummary)
+			return err == nil &&
+				currentClusterSummary.Status.FeatureSummaries != nil
+		}, timeout, pollingInterval).Should(BeTrue())
+
+		Expect(controllers.GenericUndeploy(ctx, testEnv.Client, cluster.Namespace, cluster.Name, clusterSummary.Name,
+			string(libsveltosv1beta1.FeatureResources), libsveltosv1beta1.ClusterTypeCapi, deployer.Options{},
+			textlogger.NewLogger(textlogger.NewConfig()))).To(Succeed())
+
+		// UnDeployResources finds all policies deployed because of a clusterSummary and deletes those.
+		// Expect role0 and cluster0 to be deleted. role1 should remain as ConfigLabelName is not set on it
+
+		currentRole := &rbacv1.Role{}
+		Eventually(func() bool {
+			err := testEnv.Get(context.TODO(),
+				types.NamespacedName{Namespace: role1.Namespace, Name: role1.Name}, currentRole)
+			if err != nil {
+				return false
+			}
+			err = testEnv.Get(context.TODO(),
+				types.NamespacedName{Namespace: role0.Namespace, Name: role0.Name}, currentRole)
+			return err != nil &&
+				apierrors.IsNotFound(err)
+		}, timeout, pollingInterval).Should(BeTrue())
+
+		currentClusterRole := &rbacv1.ClusterRole{}
+		Eventually(func() bool {
+			err := testEnv.Get(context.TODO(),
+				types.NamespacedName{Name: clusterRole0.Name}, currentClusterRole)
+			return err != nil &&
+				apierrors.IsNotFound(err)
+		}, timeout, pollingInterval).Should(BeTrue())
+	})
+
+	It("undeployResources propagates a management cluster cleanup failure even when the remote cleanup succeeds", func() {
+		// ClusterType Capi never routes through pull mode, so this exercises the push-mode
+		// branch of undeployResources: a local (management cluster) cleanup pass and a
+		// remote (managed cluster) cleanup pass, run one after the other.
+		currentClusterSummary := &configv1beta1.ClusterSummary{}
+		Expect(testEnv.Get(context.TODO(),
+			types.NamespacedName{Namespace: clusterSummary.Namespace, Name: clusterSummary.Name},
+			currentClusterSummary)).To(Succeed())
+		currentClusterSummary.Status.FeatureSummaries = []configv1beta1.FeatureSummary{
+			{
+				FeatureID: libsveltosv1beta1.FeatureResources,
+				Status:    libsveltosv1beta1.FeatureStatusProvisioned,
+			},
+		}
+		currentClusterSummary.Status.DeployedGVKs = []libsveltosv1beta1.FeatureDeploymentInfo{
+			{
+				FeatureID:                libsveltosv1beta1.FeatureResources,
+				DeployedGroupVersionKind: []string{"ConfigMap.v1."},
+			},
+		}
+		Expect(testEnv.Status().Update(context.TODO(), currentClusterSummary)).To(Succeed())
+
+		// Wait for cache to be updated
+		Eventually(func() bool {
+			err := testEnv.Get(context.TODO(),
+				types.NamespacedName{Namespace: clusterSummary.Namespace, Name: clusterSummary.Name},
+				currentClusterSummary)
+			return err == nil && currentClusterSummary.Status.DeployedGVKs != nil
+		}, timeout, pollingInterval).Should(BeTrue())
+
+		// Break only the rest.Config the local (management cluster) cleanup pass builds its
+		// discovery/dynamic client from. managementClusterClient is left untouched, so the
+		// remote pass - which resolves its own client independently, from the kubeconfig Secret
+		// created in BeforeEach - keeps working. That is what lets this test tell the two passes
+		// apart: the local pass must fail while the remote pass succeeds.
+		brokenConfig := rest.CopyConfig(testEnv.Config)
+		brokenConfig.Host = unreachableHost
+		brokenConfig.Timeout = 2 * time.Second
+		oldConfig := controllers.SetManagementClusterConfigForTest(brokenConfig)
+		defer controllers.SetManagementClusterConfigForTest(oldConfig)
+
+		err := controllers.UndeployResources(ctx, testEnv.Client, cluster.Namespace, cluster.Name, clusterSummary.Name,
+			string(libsveltosv1beta1.FeatureResources), libsveltosv1beta1.ClusterTypeCapi, deployer.Options{},
+			textlogger.NewLogger(textlogger.NewConfig()))
+		// The local cleanup pass failed (unreachable management cluster config). Even though the
+		// remote cleanup pass succeeds, that failure must not be silently dropped.
+		Expect(err).ToNot(BeNil())
+	})
+
+	It("updateDeployedGroupVersionKind updates ClusterSummary Status with list of deployed GroupVersionKinds", func() {
+		Expect(waitForObject(context.TODO(), testEnv.Client, clusterProfile)).To(Succeed())
+
+		localReports := []libsveltosv1beta1.ResourceReport{
+			{
+				Resource: libsveltosv1beta1.Resource{
+					Name:      randomString(),
+					Namespace: randomString(),
+					Group:     randomString(),
+					Version:   randomString(),
+					Kind:      randomString(),
+				},
+			},
+		}
+
+		remoteReports := []libsveltosv1beta1.ResourceReport{
+			{
+				Resource: libsveltosv1beta1.Resource{
+					Name:      randomString(),
+					Namespace: randomString(),
+					Group:     randomString(),
+					Version:   randomString(),
+					Kind:      randomString(),
+				},
+			},
+		}
+
+		_, err := controllers.UpdateDeployedGroupVersionKind(context.TODO(), clusterSummary, libsveltosv1beta1.FeatureResources,
+			localReports, remoteReports, textlogger.NewLogger(textlogger.NewConfig()))
+		Expect(err).To(BeNil())
+
+		// wait for cache to sync
+		Eventually(func() bool {
+			err := testEnv.Get(context.TODO(),
+				types.NamespacedName{Namespace: clusterSummary.Namespace, Name: clusterSummary.Name},
+				clusterSummary)
+			return err == nil && clusterSummary.Status.DeployedGVKs != nil
+		}, timeout, pollingInterval).Should(BeTrue())
+
+		Expect(testEnv.Get(context.TODO(),
+			types.NamespacedName{Namespace: clusterSummary.Namespace, Name: clusterSummary.Name},
+			clusterSummary)).To(Succeed())
+		Expect(clusterSummary.Status.DeployedGVKs).ToNot(BeNil())
+		Expect(len(clusterSummary.Status.DeployedGVKs)).To(Equal(1))
+		Expect(clusterSummary.Status.DeployedGVKs[0].FeatureID).To(Equal(libsveltosv1beta1.FeatureResources))
+		Expect(clusterSummary.Status.DeployedGVKs[0].DeployedGroupVersionKind).To(ContainElement(
+			fmt.Sprintf("%s.%s.%s", localReports[0].Resource.Kind, localReports[0].Resource.Version, localReports[0].Resource.Group)))
+		Expect(clusterSummary.Status.DeployedGVKs[0].DeployedGroupVersionKind).To(ContainElement(
+			fmt.Sprintf("%s.%s.%s", remoteReports[0].Resource.Kind, remoteReports[0].Resource.Version, remoteReports[0].Resource.Group)))
+	})
+
+	It("persistResourceReportsOnError still persists ResourceReports on ClusterReport before returning the deploy error", func() {
+		clusterSummary.Spec.ClusterProfileSpec.SyncMode = configv1beta1.SyncModeDryRun
+
+		clusterReport := &configv1beta1.ClusterReport{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: clusterops.GetClusterReportName(configv1beta1.ClusterProfileKind,
+					clusterProfile.Name, clusterSummary.Spec.ClusterName, clusterSummary.Spec.ClusterType),
+				Namespace: clusterSummary.Spec.ClusterNamespace,
+			},
+			Spec: configv1beta1.ClusterReportSpec{
+				ClusterNamespace: clusterSummary.Spec.ClusterNamespace,
+				ClusterName:      clusterSummary.Spec.ClusterName,
+			},
+		}
+
+		initObjects := []client.Object{clusterSummary, clusterReport}
+		c := fake.NewClientBuilder().WithScheme(scheme).
+			WithStatusSubresource(initObjects...).WithObjects(initObjects...).Build()
+
+		remoteReports := []libsveltosv1beta1.ResourceReport{
+			{
+				Action:   string(libsveltosv1beta1.CreateResourceAction),
+				Resource: libsveltosv1beta1.Resource{Name: randomString(), Kind: randomString()},
+			},
+			{
+				Action:   string(libsveltosv1beta1.ErrorResourceAction),
+				Message:  "StatefulSet.apps is invalid: spec: Forbidden: updates to statefulset spec for fields other than allowed ones are forbidden",
+				Resource: libsveltosv1beta1.Resource{Name: randomString(), Kind: "StatefulSet"},
+			},
+		}
+		deployErr := fmt.Errorf("deploying resource StatefulSet %s/%s failed", namespace, randomString())
+
+		err := controllers.PersistResourceReportsOnError(context.TODO(), c, clusterSummary, false, remoteReports,
+			libsveltosv1beta1.FeatureResources, deployErr)
+		Expect(err).To(Equal(deployErr))
+
+		currentClusterReport := &configv1beta1.ClusterReport{}
+		Expect(c.Get(context.TODO(),
+			types.NamespacedName{Name: clusterReport.Name, Namespace: clusterReport.Namespace}, currentClusterReport)).To(Succeed())
+		Expect(currentClusterReport.Status.ResourceReports).To(HaveLen(2))
+		Expect(currentClusterReport.Status.ResourceReports).To(ContainElement(remoteReports[1]))
+	})
+})
+
+var _ = Describe("Hash methods", func() {
+	It("ResourcesHash returns consistent hash considering all referenced core resources", func() {
+		clusterRole1 := rbacv1.ClusterRole{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "clusterrole1",
+			},
+			Rules: []rbacv1.PolicyRule{
+				{Verbs: []string{testCreateVerb, testGetVerb}, APIGroups: []string{testCertManagerGroup}, Resources: []string{testCertificateRequestsResource}},
+				{Verbs: []string{testCreateVerb, testDeleteVerb}, APIGroups: []string{""}, Resources: []string{testNamespacesResource, testDeploymentsResource}},
+			},
+		}
+
+		namespace := &corev1.Namespace{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "my-namespace",
+			},
+		}
+		Expect(testEnv.Create(context.TODO(), namespace)).To(Succeed())
+		Expect(waitForObject(context.TODO(), testEnv, namespace)).To(Succeed())
+
+		Expect(addTypeInformationToObject(scheme, &clusterRole1)).To(Succeed())
+		configMap1 := createConfigMapWithPolicy(namespace.Name, "a-configmap-1", render.AsCode(clusterRole1))
+		Expect(testEnv.Create(context.TODO(), configMap1)).To(Succeed())
+		Expect(waitForObject(context.TODO(), testEnv, configMap1)).To(Succeed())
+
+		clusterRole2 := rbacv1.ClusterRole{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "clusterrole2",
+			},
+			Rules: []rbacv1.PolicyRule{
+				{Verbs: []string{"get", "list"}, APIGroups: []string{"apiextensions.k8s.io"}, Resources: []string{"customresourcedefinitions"}},
+			},
+		}
+		Expect(addTypeInformationToObject(scheme, &clusterRole2)).To(Succeed())
+		configMap2 := createConfigMapWithPolicy(namespace.Name, "a-configmap-2", render.AsCode(clusterRole2))
+		Expect(testEnv.Create(context.TODO(), configMap2)).To(Succeed())
+		Expect(waitForObject(context.TODO(), testEnv, configMap2)).To(Succeed())
+
+		clusterSummary := &configv1beta1.ClusterSummary{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      randomString(),
+				Namespace: namespace.Name,
+			},
+			Spec: configv1beta1.ClusterSummarySpec{
+				ClusterNamespace: namespace.Name,
+				ClusterName:      randomString(),
+				ClusterType:      libsveltosv1beta1.ClusterTypeSveltos,
+				ClusterProfileSpec: configv1beta1.Spec{
+					PolicyRefs: []configv1beta1.PolicyRef{
+						{
+							Namespace: configMap1.Namespace, Name: configMap1.Name,
+							Kind: string(libsveltosv1beta1.ConfigMapReferencedResourceKind),
+						},
+						{
+							Namespace: configMap2.Namespace, Name: configMap2.Name,
+							Kind: string(libsveltosv1beta1.ConfigMapReferencedResourceKind),
+						},
+						{
+							Namespace: defaultNamespace, Name: "non-existing",
+							Kind: string(libsveltosv1beta1.ConfigMapReferencedResourceKind),
+						},
+					},
+					Patches: []libsveltosv1beta1.Patch{
+						{
+							Patch: testEnvLabelPatch,
+						},
+					},
+					Tier: 100,
+				},
+			},
+		}
+		Expect(testEnv.Create(context.TODO(), clusterSummary)).To(Succeed())
+		Expect(waitForObject(context.TODO(), testEnv, clusterSummary)).To(Succeed())
+
+		cluster := &libsveltosv1beta1.SveltosCluster{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      clusterSummary.Spec.ClusterName,
+				Namespace: clusterSummary.Spec.ClusterNamespace,
+			},
+		}
+		Expect(testEnv.Create(context.TODO(), cluster)).To(Succeed())
+		Expect(waitForObject(context.TODO(), testEnv, cluster)).To(Succeed())
+
+		clusterSummaryScope, err := scope.NewClusterSummaryScope(&scope.ClusterSummaryScopeParams{
+			Client:         testEnv,
+			Logger:         textlogger.NewLogger(textlogger.NewConfig()),
+			ClusterSummary: clusterSummary,
+			ControllerName: testControllerNameSummary,
+		})
+		Expect(err).To(BeNil())
+
+		expectedHash, err := controllers.ResourcesHash(context.TODO(), testEnv, clusterSummaryScope.ClusterSummary,
+			textlogger.NewLogger(textlogger.NewConfig()))
+		Expect(err).To(BeNil())
+		// Must be consistent
+		for range 10 {
+			hash, err := controllers.ResourcesHash(context.TODO(), testEnv, clusterSummaryScope.ClusterSummary,
+				textlogger.NewLogger(textlogger.NewConfig()))
+			Expect(err).To(BeNil())
+			Expect(reflect.DeepEqual(hash, expectedHash)).To(BeTrue())
+		}
+	})
+
+	It("ResourcesHash changes when the target Cluster's watch-namespaces annotation changes, "+
+		"only in ContinuousWithDriftDetection mode", func() {
+		namespace := &corev1.Namespace{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: randomString(),
+			},
+		}
+		Expect(testEnv.Create(context.TODO(), namespace)).To(Succeed())
+		Expect(waitForObject(context.TODO(), testEnv, namespace)).To(Succeed())
+
+		cluster := &libsveltosv1beta1.SveltosCluster{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      randomString(),
+				Namespace: namespace.Name,
+			},
+		}
+		Expect(testEnv.Create(context.TODO(), cluster)).To(Succeed())
+		Expect(waitForObject(context.TODO(), testEnv, cluster)).To(Succeed())
+
+		newClusterSummary := func(syncMode configv1beta1.SyncMode) *configv1beta1.ClusterSummary {
+			cs := &configv1beta1.ClusterSummary{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      randomString(),
+					Namespace: namespace.Name,
+				},
+				Spec: configv1beta1.ClusterSummarySpec{
+					ClusterNamespace: cluster.Namespace,
+					ClusterName:      cluster.Name,
+					ClusterType:      libsveltosv1beta1.ClusterTypeSveltos,
+					ClusterProfileSpec: configv1beta1.Spec{
+						SyncMode: syncMode,
+					},
+				},
+			}
+			Expect(testEnv.Create(context.TODO(), cs)).To(Succeed())
+			Expect(waitForObject(context.TODO(), testEnv, cs)).To(Succeed())
+			return cs
+		}
+
+		driftClusterSummary := newClusterSummary(configv1beta1.SyncModeContinuousWithDriftDetection)
+		beforeHash, err := controllers.ResourcesHash(context.TODO(), testEnv, driftClusterSummary,
+			textlogger.NewLogger(textlogger.NewConfig()))
+		Expect(err).To(BeNil())
+
+		continuousClusterSummary := newClusterSummary(configv1beta1.SyncModeContinuous)
+		continuousBeforeHash, err := controllers.ResourcesHash(context.TODO(), testEnv, continuousClusterSummary,
+			textlogger.NewLogger(textlogger.NewConfig()))
+		Expect(err).To(BeNil())
+
+		updatedWatchNamespaces := "ns-a,ns-b"
+		cluster.Annotations = map[string]string{
+			controllers.AgentWatchNamespacesAnnotation: updatedWatchNamespaces,
+		}
+		Expect(testEnv.Update(context.TODO(), cluster)).To(Succeed())
+
+		// waitForObject only confirms the object still exists, which for an Update (unlike a
+		// Create) is trivially already true: it says nothing about whether this specific
+		// annotation value has propagated through testEnv's cache yet. getClusterProfileSpecHash
+		// reads through that same cache (getManagementClusterClient), so poll for the real value
+		// there instead, or afterHash below could still observe the pre-update annotations.
+		Eventually(func() bool {
+			current := &libsveltosv1beta1.SveltosCluster{}
+			if err := testEnv.Get(context.TODO(), client.ObjectKeyFromObject(cluster), current); err != nil {
+				return false
+			}
+			return current.Annotations[controllers.AgentWatchNamespacesAnnotation] == updatedWatchNamespaces
+		}, timeout, pollingInterval).Should(BeTrue())
+
+		afterHash, err := controllers.ResourcesHash(context.TODO(), testEnv, driftClusterSummary,
+			textlogger.NewLogger(textlogger.NewConfig()))
+		Expect(err).To(BeNil())
+		Expect(reflect.DeepEqual(beforeHash, afterHash)).To(BeFalse())
+
+		// Same annotation change must NOT affect the hash outside ContinuousWithDriftDetection:
+		// nothing reads --watch-namespaces in that mode, so it would just be wasted cost.
+		continuousAfterHash, err := controllers.ResourcesHash(context.TODO(), testEnv, continuousClusterSummary,
+			textlogger.NewLogger(textlogger.NewConfig()))
+		Expect(err).To(BeNil())
+		Expect(reflect.DeepEqual(continuousBeforeHash, continuousAfterHash)).To(BeTrue())
+	})
+
+	It("resourcesHash changes when the redeploy annotation changes", func() {
+		clusterSummary := &configv1beta1.ClusterSummary{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      randomString(),
+				Namespace: randomString(),
+			},
+			Spec: configv1beta1.ClusterSummarySpec{
+				ClusterType: libsveltosv1beta1.ClusterTypeSveltos,
+				ClusterProfileSpec: configv1beta1.Spec{
+					SyncMode: configv1beta1.SyncModeContinuous,
+				},
+			},
+		}
+		logger := textlogger.NewLogger(textlogger.NewConfig())
+
+		noAnnotationHash, err := controllers.ResourcesHash(context.TODO(), testEnv, clusterSummary, logger)
+		Expect(err).To(BeNil())
+
+		clusterSummary.Annotations = map[string]string{configv1beta1.ProfileRedeployAnnotation: "1"}
+		firstHash, err := controllers.ResourcesHash(context.TODO(), testEnv, clusterSummary, logger)
+		Expect(err).To(BeNil())
+		Expect(reflect.DeepEqual(noAnnotationHash, firstHash)).To(BeFalse())
+
+		sameHash, err := controllers.ResourcesHash(context.TODO(), testEnv, clusterSummary, logger)
+		Expect(err).To(BeNil())
+		Expect(reflect.DeepEqual(firstHash, sameHash)).To(BeTrue())
+
+		clusterSummary.Annotations[configv1beta1.ProfileRedeployAnnotation] = "2"
+		secondHash, err := controllers.ResourcesHash(context.TODO(), testEnv, clusterSummary, logger)
+		Expect(err).To(BeNil())
+		Expect(reflect.DeepEqual(firstHash, secondHash)).To(BeFalse())
+	})
+})

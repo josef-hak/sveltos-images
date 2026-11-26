@@ -1,0 +1,587 @@
+/*
+Copyright 2022. projectsveltos.io. All rights reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package onboard
+
+import (
+	"context"
+	"flag"
+	"fmt"
+	"os"
+	"strings"
+	"time"
+
+	"github.com/docopt/docopt-go"
+	"github.com/go-logr/logr"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
+	ctrl "sigs.k8s.io/controller-runtime"
+
+	libsveltosv1beta1 "github.com/projectsveltos/libsveltos/api/v1beta1"
+	logs "github.com/projectsveltos/libsveltos/lib/logsettings"
+	"github.com/projectsveltos/sveltosctl/internal/commands/generate"
+	"github.com/projectsveltos/sveltosctl/internal/utils"
+)
+
+const (
+	//nolint: gosec // Sveltos secret postfix
+	sveltosKubeconfigSecretNamePostfix = "-sveltos-kubeconfig"
+	//nolint: gosec // Sveltos secret postfix
+	sveltosCASecretNamePostfix   = "-sveltos-ca"
+	kubeconfig                   = "kubeconfig"
+	caKey                        = "ca.crt"
+	shardingAnnotationKey        = "sharding.projectsveltos.io/key"
+	watchNamespacesAnnotationKey = "agent.projectsveltos.io/watch-namespaces"
+	rbacAPIGroup                 = "rbac.authorization.k8s.io"
+	serviceAccountKind           = "ServiceAccount"
+	roleKind                     = "Role"
+
+	// sveltosClusterManagerNamespaceDefault is the namespace Sveltos is installed in by default.
+	// Sveltos can be installed in any namespace though, so --sveltos-namespace lets callers override it.
+	sveltosClusterManagerNamespaceDefault = "projectsveltos"
+)
+
+// validateManagementClusterURL checks that --management-cluster-url looks like a kubeconfig
+// "server:" value (a full URL with scheme), since it is substituted directly into one. A bare
+// host:port would silently produce a broken kubeconfig instead of failing here.
+func validateManagementClusterURL(url string) error {
+	if url == "" {
+		return fmt.Errorf("--management-cluster-url is required when --token is used")
+	}
+	if !strings.HasPrefix(url, "https://") && !strings.HasPrefix(url, "http://") {
+		return fmt.Errorf("--management-cluster-url must include a scheme, e.g. https://<host>:<port>")
+	}
+	return nil
+}
+
+func onboardSveltosCluster(ctx context.Context, clusterNamespace, clusterName, shard string, kubeconfigData []byte,
+	labels map[string]string, renew bool, logger logr.Logger) error {
+
+	instance := utils.GetAccessInstance()
+
+	secretName := clusterName + sveltosKubeconfigSecretNamePostfix
+	logger.V(logs.LogDebug).Info(fmt.Sprintf("Verifying Secret %s/%s does not exist already", clusterNamespace, secretName))
+	secret := &corev1.Secret{}
+	err := instance.GetResource(ctx, types.NamespacedName{Namespace: clusterNamespace, Name: secretName}, secret)
+	if err != nil && !apierrors.IsNotFound(err) {
+		return err
+	}
+
+	err = patchSecret(ctx, clusterNamespace, secretName, kubeconfigData, logger)
+	if err != nil {
+		return err
+	}
+
+	err = patchSveltosCluster(ctx, clusterNamespace, clusterName, shard, labels, renew, logger)
+	if err != nil {
+		return err
+	}
+
+	//nolint: forbidigo // print success message
+	fmt.Printf("cluster %s successfully registered/updated in namespace %s.", clusterName, clusterNamespace)
+	return nil
+}
+
+func patchSveltosCluster(ctx context.Context, clusterNamespace, clusterName, shard string,
+	labels map[string]string, renew bool, logger logr.Logger) error {
+
+	instance := utils.GetAccessInstance()
+
+	currentSveltosCluster := &libsveltosv1beta1.SveltosCluster{}
+	err := instance.GetResource(ctx, types.NamespacedName{Namespace: clusterNamespace, Name: clusterName},
+		currentSveltosCluster)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			logger.V(logs.LogDebug).Info(fmt.Sprintf("Creating SveltosCluster %s/%s", clusterNamespace, clusterName))
+			currentSveltosCluster.Namespace = clusterNamespace
+			currentSveltosCluster.Name = clusterName
+			currentSveltosCluster.Labels = labels
+			currentSveltosCluster.Spec.KubeconfigKeyName = kubeconfig
+			if renew {
+				currentSveltosCluster.Spec.TokenRequestRenewalOption = &libsveltosv1beta1.TokenRequestRenewalOption{
+					RenewTokenRequestInterval: metav1.Duration{Duration: 1 * time.Hour},
+					TokenDuration:             metav1.Duration{Duration: 5 * time.Hour},
+				}
+			}
+			if shard != "" {
+				currentSveltosCluster.Annotations = map[string]string{
+					shardingAnnotationKey: shard,
+				}
+			}
+
+			return instance.CreateResource(ctx, currentSveltosCluster)
+		}
+		return err
+	}
+
+	logger.V(logs.LogDebug).Info("Updating SveltosCluster")
+	currentSveltosCluster.Labels = labels
+	currentSveltosCluster.Spec.KubeconfigKeyName = kubeconfig
+	if shard != "" {
+		currentSveltosCluster.Annotations = map[string]string{
+			shardingAnnotationKey: shard,
+		}
+	} else if currentSveltosCluster.Annotations != nil {
+		delete(currentSveltosCluster.Annotations, shardingAnnotationKey)
+	}
+	return instance.UpdateResource(ctx, currentSveltosCluster)
+}
+
+func patchSecret(ctx context.Context, clusterNamespace, secretName string, kubeconfigData []byte, logger logr.Logger) error {
+	instance := utils.GetAccessInstance()
+
+	currentSecret := &corev1.Secret{}
+	err := instance.GetResource(ctx, types.NamespacedName{Namespace: clusterNamespace, Name: secretName}, currentSecret)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			logger.V(logs.LogDebug).Info(fmt.Sprintf("Creating Secret %s/%s", clusterNamespace, secretName))
+			currentSecret.Namespace = clusterNamespace
+			currentSecret.Name = secretName
+			currentSecret.Data = map[string][]byte{kubeconfig: kubeconfigData}
+			return instance.CreateResource(ctx, currentSecret)
+		}
+		return err
+	}
+
+	logger.V(logs.LogDebug).Info(fmt.Sprintf("Updating Secret %s/%s", clusterNamespace, secretName))
+	currentSecret.Data = map[string][]byte{
+		kubeconfig: kubeconfigData,
+	}
+
+	return instance.UpdateResource(ctx, currentSecret)
+}
+
+// RegisterCluster takes care of creating all necessary internal resources to import a cluster
+func RegisterCluster(ctx context.Context, args []string, logger logr.Logger) error { //nolint: funlen // command description
+	doc := `Usage:
+  sveltosctl register cluster [options] --namespace=<name> --cluster=<name> [--kubeconfig=<file>] [--fleet-cluster-context=<value>] [--pullmode]
+                                [--labels=<value>] [--shard=<key>] [--service-account-token] [--token] [--sveltos-namespace=<name>]
+                                [--management-cluster-url=<url>] [--watch-namespaces=<value>] [--verbose]
+
+     --namespace=<name>                  Specifies the namespace where Sveltos will create a resource (SveltosCluster) to represent
+                                         the registered cluster.
+     --cluster=<name>                    Defines a name for the registered cluster within Sveltos.
+     --kubeconfig=<file>                 (Optional) Provides the path to a file containing the kubeconfig for the Kubernetes cluster
+                                         you want to register.
+                                         If you don't have a kubeconfig file yet, you can use the "sveltosctl generate kubeconfig"
+                                         command.
+                                         Be sure to point that command to the specific cluster you want to manage.
+                                         This will help you create the necessary kubeconfig file before registering the cluster
+                                         with Sveltos.
+                                         Either --kubeconfig or --fleet-cluster-context must be provided.
+     --fleet-cluster-context=<value>     (Optional) If your kubeconfig has multiple contexts:
+                                         - One context points to the management cluster (default one)
+                                         - Another context points to the cluster you actually want to manage;
+                                         In this case, you can specify the context name with the --fleet-cluster-context flag.
+                                         This tells the command to use the specific context to generate a Kubeconfig Sveltos
+                                         can use and then create a SveltosCluster with it so you don't have to provide kubeconfig
+                                         Either --kubeconfig or --fleet-cluster-context must be provided.
+     --pullmode                          (Optional) this registers a cluster in pull mode. When enabled, the managed cluster will actively
+                                         fetch its configurations from the management cluster, which is ideal for scenarios with
+                                         firewall restrictions or when direct inbound access to the managed cluster is undesirable.
+                                         This flag outputs the specialized YAML configuration that needs to be applied to the managed
+                                         cluster to complete its setup.
+     --labels=<key1=value1,key2=value2>  (Optional) This option allows you to specify labels for the SveltosCluster resource
+                                         being created. The format for labels is <key1=value1,key2=value2>, where each key-value
+                                         pair is separated by a comma (,) and the key and value are separated by an equal sign (=).
+                                         You can define multiple labels by adding more key-value pairs separated by commas.
+     --shard=<shard key>                 Optional. Assigns the cluster to a specific controller shard. This automatically adds the annotation
+                                         sharding.projectsveltos.io/key: <value> to the SveltosCluster resource, ensuring the correct shard
+                                         processes it.
+     --service-account-token             (Optional) Use a non-expiring ServiceAccount token for management cluster registration.
+                                         When enabled, Sveltos will automatically create the necessary ServiceAccount infrastructure
+                                         (ServiceAccount, ClusterRole, and ClusterRoleBinding) in the managed cluster and
+                                         generate a long-lived token by also creating a Secret of type kubernetes.io/service-account-token.
+     --token                              (Optional) Only valid together with --pullmode. Instead of a long-lived Secret of type
+                                         kubernetes.io/service-account-token, requests a short-lived token via TokenRequest and
+                                         configures the SveltosCluster so sveltoscluster-manager automatically renews it going forward.
+                                         This also grants sveltoscluster-manager's own ServiceAccount permission to renew this
+                                         cluster's token, scoped to this cluster's ServiceAccount only.
+     --sveltos-namespace=<name>           (Optional) Only used together with --token. The namespace where Sveltos is installed in
+                                         the management cluster. Defaults to "projectsveltos".
+     --management-cluster-url=<url>       (Required with --token) The management cluster's API server address, reachable from the
+                                         managed cluster, including scheme (e.g. https://203.0.113.10:6443). This is the same
+                                         kind of value found in the "server:" field of any kubeconfig. sveltoscluster-manager
+                                         runs in-cluster, so its own view of the management cluster's address is typically an
+                                         internal one (e.g. the kubernetes.default.svc ClusterIP) that the managed cluster
+                                         cannot reach; this value is used instead every time the token is renewed. This is
+                                         often, but not necessarily, the same address as the current kubeconfig's server (for
+                                         example, if this command is being run through a port-forward, proxy, or VPN tunnel
+                                         not reachable from the managed cluster).
+     --watch-namespaces=<value>           (Optional) Only valid together with --pullmode. Comma-separated list of namespaces
+                                         restricting which namespaces sveltos-applier is allowed to manage resources in.
+                                         Sets the agent.projectsveltos.io/watch-namespaces annotation on the created
+                                         SveltosCluster, and the --watch-namespaces flag on sveltos-applier in the generated
+                                         YAML, to the same value. A namespaced resource outside this list is rejected instead
+                                         of deployed, and stale-resource lookups only search these namespaces instead of
+                                         cluster-wide. Cluster-scoped resources are not affected, and the ClusterRole in the
+                                         generated YAML still grants cluster-wide access: narrowing it to just these
+                                         namespaces requires a separate override (see Sveltos Applier Overrides in the docs).
+
+Options:
+  -h --help                  Show this screen.
+     --verbose               Verbose mode. Print each step.
+
+Description:
+  The register cluster command registers a cluster to be managed by Sveltos using a kubeconfig.
+  To register an EKS, GKE, or AKS cluster using workload identity, use the register cluster-eks,
+  register cluster-gke, or register cluster-aks commands instead.
+`
+	parsedArgs, err := docopt.ParseArgs(doc, nil, "1.0")
+	if err != nil {
+		logger.V(logs.LogInfo).Error(err, "failed to parse args")
+		return fmt.Errorf(
+			"invalid option: 'sveltosctl %s'. Use flag '--help' to read about a specific subcommand. Error: %w",
+			strings.Join(args, " "),
+			err,
+		)
+	}
+	if len(parsedArgs) == 0 {
+		return nil
+	}
+
+	_ = flag.Lookup("v").Value.Set(fmt.Sprint(logs.LogInfo))
+	if parsedArgs["--verbose"].(bool) {
+		if err := flag.Lookup("v").Value.Set(fmt.Sprint(logs.LogDebug)); err != nil {
+			return err
+		}
+	}
+
+	namespace := ""
+	if passedNamespace := parsedArgs["--namespace"]; passedNamespace != nil {
+		namespace = passedNamespace.(string)
+	}
+
+	cluster := ""
+	if passedCluster := parsedArgs["--cluster"]; passedCluster != nil {
+		cluster = passedCluster.(string)
+	}
+
+	var labels map[string]string
+	if passedLabels := parsedArgs["--labels"]; passedLabels != nil {
+		labels, err = stringToMap(passedLabels.(string))
+		if err != nil {
+			return err
+		}
+	}
+
+	shard := ""
+	if passedShard := parsedArgs["--shard"]; passedShard != nil {
+		shard = passedShard.(string)
+	}
+
+	pmArgs, err := parsePullModeArgs(parsedArgs)
+	if err != nil {
+		return err
+	}
+
+	if pmArgs.PullMode {
+		return onboardSveltosClusterInPullMode(ctx, namespace, cluster, shard, pmArgs.SveltosNamespace,
+			pmArgs.ManagementClusterURL, pmArgs.WatchNamespaces, labels, pmArgs.TokenRenewal, logger)
+	}
+
+	renew := true
+	satoken := parsedArgs["--service-account-token"].(bool)
+	if satoken {
+		renew = false
+	}
+
+	kubeconfigFile := ""
+	if passedKubeconfig := parsedArgs["--kubeconfig"]; passedKubeconfig != nil {
+		kubeconfigFile = passedKubeconfig.(string)
+		renew = false
+		satoken = false
+	}
+
+	fleetClusterContext := ""
+	if passedContext := parsedArgs["--fleet-cluster-context"]; passedContext != nil {
+		fleetClusterContext = passedContext.(string)
+	}
+
+	if kubeconfigFile == "" && fleetClusterContext == "" {
+		return fmt.Errorf("either kubeconfig or fleet-cluster-context must be specified")
+	}
+
+	data, err := getKubeconfigData(ctx, kubeconfigFile, fleetClusterContext, satoken, logger)
+	if err != nil {
+		return err
+	}
+
+	return onboardSveltosCluster(ctx, namespace, cluster, shard, data, labels, renew, logger)
+}
+
+// pullModeArgs holds the parsed --pullmode/--token/--sveltos-namespace/--management-cluster-url/
+// --watch-namespaces flags, bundled together since parsePullModeArgs validates them jointly.
+type pullModeArgs struct {
+	PullMode             bool
+	TokenRenewal         bool
+	SveltosNamespace     string
+	ManagementClusterURL string
+	WatchNamespaces      string
+}
+
+// parsePullModeArgs parses and validates the --pullmode/--token/--sveltos-namespace/
+// --management-cluster-url/--watch-namespaces flags together, since they're only meaningful in
+// combination with each other (--token requires --pullmode, --management-cluster-url requires
+// --token, --sveltos-namespace only applies with --token, and --watch-namespaces only applies
+// with --pullmode).
+func parsePullModeArgs(parsedArgs docopt.Opts) (pullModeArgs, error) {
+	var result pullModeArgs
+
+	result.PullMode = parsedArgs["--pullmode"].(bool)
+	result.TokenRenewal = parsedArgs["--token"].(bool)
+	if !result.PullMode && result.TokenRenewal {
+		return pullModeArgs{}, fmt.Errorf("--token can only be used together with --pullmode")
+	}
+
+	if passedManagementClusterURL := parsedArgs["--management-cluster-url"]; passedManagementClusterURL != nil {
+		result.ManagementClusterURL = passedManagementClusterURL.(string)
+	}
+	if result.TokenRenewal {
+		if err := validateManagementClusterURL(result.ManagementClusterURL); err != nil {
+			return pullModeArgs{}, err
+		}
+	}
+
+	result.SveltosNamespace = sveltosClusterManagerNamespaceDefault
+	if passedSveltosNamespace := parsedArgs["--sveltos-namespace"]; passedSveltosNamespace != nil {
+		result.SveltosNamespace = passedSveltosNamespace.(string)
+	}
+
+	if passedWatchNamespaces := parsedArgs["--watch-namespaces"]; passedWatchNamespaces != nil {
+		result.WatchNamespaces = passedWatchNamespaces.(string)
+	}
+	if !result.PullMode && result.WatchNamespaces != "" {
+		return pullModeArgs{}, fmt.Errorf("--watch-namespaces can only be used together with --pullmode")
+	}
+
+	return result, nil
+}
+
+func onboardSveltosClusterWithWorkloadIdentity(
+	ctx context.Context,
+	clusterNamespace, clusterName, shard string,
+	wi *libsveltosv1beta1.WorkloadIdentityConfig,
+	caFile string,
+	labels map[string]string,
+	logger logr.Logger,
+) error {
+
+	if caFile != "" {
+		caData, err := os.ReadFile(caFile)
+		if err != nil {
+			return fmt.Errorf("failed to read CA file %s: %w", caFile, err)
+		}
+		caSecretName := clusterName + sveltosCASecretNamePostfix
+		if err := patchCASecret(ctx, clusterNamespace, caSecretName, caData, logger); err != nil {
+			return err
+		}
+		wi.CASecretRef = &corev1.LocalObjectReference{Name: caSecretName}
+	}
+
+	if err := patchSveltosClusterWithWorkloadIdentity(ctx, clusterNamespace, clusterName, shard, wi, labels, logger); err != nil {
+		return err
+	}
+
+	//nolint: forbidigo // print success message
+	fmt.Printf("cluster %s successfully registered/updated in namespace %s.", clusterName, clusterNamespace)
+	return nil
+}
+
+func patchSveltosClusterWithWorkloadIdentity(
+	ctx context.Context,
+	clusterNamespace, clusterName, shard string,
+	wi *libsveltosv1beta1.WorkloadIdentityConfig,
+	labels map[string]string,
+	logger logr.Logger,
+) error {
+
+	instance := utils.GetAccessInstance()
+
+	current := &libsveltosv1beta1.SveltosCluster{}
+	err := instance.GetResource(ctx, types.NamespacedName{Namespace: clusterNamespace, Name: clusterName}, current)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			logger.V(logs.LogDebug).Info(fmt.Sprintf("Creating SveltosCluster %s/%s", clusterNamespace, clusterName))
+			current.Namespace = clusterNamespace
+			current.Name = clusterName
+			current.Labels = labels
+			current.Spec.WorkloadIdentity = wi
+			if shard != "" {
+				current.Annotations = map[string]string{shardingAnnotationKey: shard}
+			}
+			return instance.CreateResource(ctx, current)
+		}
+		return err
+	}
+
+	logger.V(logs.LogDebug).Info("Updating SveltosCluster")
+	current.Labels = labels
+	current.Spec.WorkloadIdentity = wi
+	current.Spec.KubeconfigKeyName = ""
+	if shard != "" {
+		if current.Annotations == nil {
+			current.Annotations = map[string]string{}
+		}
+		current.Annotations[shardingAnnotationKey] = shard
+	} else if current.Annotations != nil {
+		delete(current.Annotations, shardingAnnotationKey)
+	}
+	return instance.UpdateResource(ctx, current)
+}
+
+func patchCASecret(ctx context.Context, clusterNamespace, secretName string, caData []byte, logger logr.Logger) error {
+	instance := utils.GetAccessInstance()
+
+	current := &corev1.Secret{}
+	err := instance.GetResource(ctx, types.NamespacedName{Namespace: clusterNamespace, Name: secretName}, current)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			logger.V(logs.LogDebug).Info(fmt.Sprintf("Creating CA Secret %s/%s", clusterNamespace, secretName))
+			current.Namespace = clusterNamespace
+			current.Name = secretName
+			current.Data = map[string][]byte{caKey: caData}
+			return instance.CreateResource(ctx, current)
+		}
+		return err
+	}
+
+	logger.V(logs.LogDebug).Info(fmt.Sprintf("Updating CA Secret %s/%s", clusterNamespace, secretName))
+	current.Data = map[string][]byte{caKey: caData}
+	return instance.UpdateResource(ctx, current)
+}
+
+func getKubeconfigData(ctx context.Context, kubeconfigFile, fleetClusterContext string,
+	satoken bool, logger logr.Logger) ([]byte, error) {
+
+	var data []byte
+	if fleetClusterContext != "" {
+		currentContext, err := getCurrentContext()
+		if err != nil {
+			return nil, err
+		}
+		kubeconfigData, err := createKubeconfig(ctx, fleetClusterContext, satoken, logger)
+		if err != nil {
+			return nil, err
+		}
+		err = switchCurrentContext(currentContext)
+		if err != nil {
+			return nil, err
+		}
+		data = []byte(kubeconfigData)
+	} else {
+		var err error
+		data, err = os.ReadFile(kubeconfigFile)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return data, nil
+}
+
+func stringToMap(data string) (map[string]string, error) {
+	const keyValueLength = 2
+	result := make(map[string]string)
+	for _, pair := range strings.Split(data, ",") {
+		kv := strings.Split(pair, "=")
+		if len(kv) != keyValueLength {
+			return nil, fmt.Errorf("invalid key-value pair format: %s", pair)
+		}
+		key := strings.TrimSpace(kv[0])
+		value := strings.TrimSpace(kv[1])
+		result[key] = value
+	}
+	return result, nil
+}
+
+func createKubeconfig(ctx context.Context, fleetClusterContext string, satoken bool,
+	logger logr.Logger) (string, error) {
+
+	logger.V(logs.LogDebug).Info("Get current context")
+	currentContext, err := getCurrentContext()
+	if err != nil {
+		return "", err
+	}
+	logger.V(logs.LogDebug).Info(fmt.Sprintf("current context %s", currentContext))
+
+	logger.V(logs.LogDebug).Info(fmt.Sprintf("Switch context to %s", fleetClusterContext))
+	err = switchCurrentContext(fleetClusterContext)
+	if err != nil {
+		return "", err
+	}
+	logger.V(logs.LogDebug).Info(fmt.Sprintf("switched to context %s", fleetClusterContext))
+
+	var remoteRestConfig *rest.Config
+	remoteRestConfig, err = ctrl.GetConfig()
+	if err != nil {
+		return "", err
+	}
+
+	logger.V(logs.LogDebug).Info("Generate Kubeconfig")
+	var data string
+	data, err = generate.GenerateKubeconfigForServiceAccount(ctx, remoteRestConfig, generate.Projectsveltos,
+		generate.Projectsveltos, 0, true, false, satoken, logger)
+	if err != nil {
+		return "", err
+	}
+
+	logger.V(logs.LogDebug).Info(fmt.Sprintf("Reset context to %s", currentContext))
+	err = switchCurrentContext(currentContext)
+	if err != nil {
+		return "", err
+	}
+	logger.V(logs.LogDebug).Info(fmt.Sprintf("switched to context %s", currentContext))
+
+	return data, nil
+}
+
+func getCurrentContext() (string, error) {
+	kubeconfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(clientcmd.NewDefaultClientConfigLoadingRules(), &clientcmd.ConfigOverrides{})
+	config, err := kubeconfig.RawConfig()
+	if err != nil {
+		return "", err
+	}
+
+	return config.CurrentContext, nil
+}
+
+func switchCurrentContext(fleetClusterContext string) error {
+	kubeconfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(clientcmd.NewDefaultClientConfigLoadingRules(), &clientcmd.ConfigOverrides{})
+	config, err := kubeconfig.RawConfig()
+
+	if err != nil {
+		return err
+	}
+
+	for contextName := range config.Contexts {
+		if contextName == fleetClusterContext {
+			config.CurrentContext = fleetClusterContext
+			err = clientcmd.ModifyConfig(clientcmd.NewDefaultPathOptions(), config, true)
+			if err != nil {
+				return fmt.Errorf("error ModifyConfig: %w", err)
+			}
+
+			return nil
+		}
+	}
+
+	return fmt.Errorf("error context %s not found", fleetClusterContext)
+}

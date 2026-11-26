@@ -1,0 +1,15 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: manager
+  namespace: projectsveltos
+spec:
+  template:
+    spec:
+      initContainers:
+      - image: docker.io/projectsveltos/classifier:v1.17.0
+        name: migrate
+      containers:
+      # Change the value of image field below to your controller image URL
+      - image: docker.io/projectsveltos/classifier:v1.17.0
+        name: manager

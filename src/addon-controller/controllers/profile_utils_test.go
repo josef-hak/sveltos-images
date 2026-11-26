@@ -1,0 +1,2022 @@
+/*
+Copyright 2022. projectsveltos.io. All rights reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package controllers_test
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"reflect"
+	"time"
+
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+
+	"github.com/go-logr/logr"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/client-go/util/retry"
+	"k8s.io/klog/v2/textlogger"
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+
+	configv1beta1 "github.com/projectsveltos/addon-controller/api/v1beta1"
+	"github.com/projectsveltos/addon-controller/controllers"
+	"github.com/projectsveltos/addon-controller/internal/test/helpers/external"
+	"github.com/projectsveltos/addon-controller/lib/clusterops"
+	"github.com/projectsveltos/addon-controller/pkg/scope"
+	libsveltosv1beta1 "github.com/projectsveltos/libsveltos/api/v1beta1"
+)
+
+const (
+	clusterKind = "Cluster"
+)
+
+var _ = Describe("Profile: Reconciler", func() {
+	var logger logr.Logger
+	var clusterProfile *configv1beta1.ClusterProfile
+	var matchingCluster *clusterv1.Cluster
+	var nonMatchingCluster *clusterv1.Cluster
+	var namespace string
+
+	BeforeEach(func() {
+		namespace = "profile-utils-" + randomString()
+
+		key1 := randomString()
+		value1 := randomString()
+		key2 := randomString()
+		value2 := randomString()
+
+		logger = textlogger.NewLogger(textlogger.NewConfig())
+		initialized := true
+		matchingCluster = &clusterv1.Cluster{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      upstreamClusterNamePrefix + randomString(),
+				Namespace: namespace,
+				Labels: map[string]string{
+					key1: value1,
+					key2: value2,
+				},
+			},
+			Status: clusterv1.ClusterStatus{
+				Initialization: clusterv1.ClusterInitializationStatus{
+					ControlPlaneInitialized: &initialized,
+				},
+			},
+		}
+		Expect(addTypeInformationToObject(scheme, matchingCluster)).To(Succeed())
+
+		nonMatchingCluster = &clusterv1.Cluster{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      upstreamClusterNamePrefix + randomString(),
+				Namespace: namespace,
+				Labels: map[string]string{
+					key2: value2,
+				},
+			},
+			Status: clusterv1.ClusterStatus{
+				Initialization: clusterv1.ClusterInitializationStatus{
+					ControlPlaneInitialized: &initialized,
+				},
+			},
+		}
+		Expect(addTypeInformationToObject(scheme, nonMatchingCluster)).To(Succeed())
+
+		clusterProfile = &configv1beta1.ClusterProfile{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: clusterProfileNamePrefix + randomString(),
+			},
+			Spec: configv1beta1.Spec{
+				ClusterSelector: libsveltosv1beta1.Selector{
+					LabelSelector: metav1.LabelSelector{
+						MatchLabels: map[string]string{
+							key1: value1,
+							key2: value2,
+						},
+					},
+				},
+			},
+		}
+		Expect(addTypeInformationToObject(scheme, clusterProfile)).To(Succeed())
+	})
+
+	It("isProfilePaused returns true when profile has paused annotation", func() {
+		c := fake.NewClientBuilder().WithScheme(scheme).Build()
+
+		profileScope, err := scope.NewProfileScope(scope.ProfileScopeParams{
+			Client:         c,
+			Logger:         logger,
+			Profile:        clusterProfile,
+			ControllerName: testControllerNameProfile,
+		})
+		Expect(err).To(BeNil())
+
+		Expect(controllers.IsProfilePaused(profileScope)).To(BeFalse())
+
+		clusterProfile.Annotations = map[string]string{
+			configv1beta1.ProfilePausedAnnotation: testTrueValue,
+		}
+
+		profileScope, err = scope.NewProfileScope(scope.ProfileScopeParams{
+			Client:         c,
+			Logger:         logger,
+			Profile:        clusterProfile,
+			ControllerName: testControllerNameProfile,
+		})
+		Expect(err).To(BeNil())
+
+		Expect(controllers.IsProfilePaused(profileScope)).To(BeTrue())
+	})
+
+	It("getMatchingCluster considers both ClusterSelector and ClusterRefs", func() {
+		clusterCRD := external.TestClusterCRD.DeepCopy()
+
+		initObjects := []client.Object{
+			clusterCRD,
+			matchingCluster,
+			nonMatchingCluster,
+			clusterProfile,
+		}
+
+		c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(initObjects...).WithObjects(initObjects...).Build()
+
+		profileScope, err := scope.NewProfileScope(scope.ProfileScopeParams{
+			Client:         c,
+			Logger:         logger,
+			Profile:        clusterProfile,
+			ControllerName: testControllerNameProfile,
+		})
+		Expect(err).To(BeNil())
+
+		// Only clusterSelector is, so only matchingCluster is a match
+		matching, err := controllers.GetMatchingClusters(context.TODO(), c, "", profileScope.GetSelector(),
+			profileScope.GetSpec().ClusterRefs, textlogger.NewLogger(textlogger.NewConfig()))
+		Expect(err).To(BeNil())
+		Expect(len(matching)).To(Equal(1))
+
+		clusterProfile.Spec.ClusterRefs = []corev1.ObjectReference{
+			{
+				Kind:       clusterKind,
+				APIVersion: clusterv1.GroupVersion.String(),
+				Name:       nonMatchingCluster.Name,
+				Namespace:  nonMatchingCluster.Namespace,
+			},
+		}
+
+		// Both clusterSelector (matchingCluster is a match) and ClusterRefs (nonMatchingCluster is referenced) are set
+		// So two clusters are now matching
+		matching, err = controllers.GetMatchingClusters(context.TODO(), c, "", profileScope.GetSelector(),
+			profileScope.GetSpec().ClusterRefs, textlogger.NewLogger(textlogger.NewConfig()))
+		Expect(err).To(BeNil())
+		Expect(len(matching)).To(Equal(2))
+	})
+
+	It("UpdateClusterConfiguration idempotently adds ClusterProfile as OwnerReference and in Status.ClusterProfileResources", func() {
+		ns := &corev1.Namespace{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: namespace,
+			},
+		}
+
+		clusterConfiguration := &configv1beta1.ClusterConfiguration{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: matchingCluster.Namespace,
+				Name:      controllers.GetClusterConfigurationName(matchingCluster.Name, libsveltosv1beta1.ClusterTypeCapi),
+			},
+		}
+
+		initObjects := []client.Object{
+			clusterProfile,
+			ns,
+			clusterConfiguration,
+		}
+
+		c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(initObjects...).WithObjects(initObjects...).Build()
+
+		currentClusterConfiguration := &configv1beta1.ClusterConfiguration{}
+		Expect(c.Get(context.TODO(),
+			types.NamespacedName{Namespace: clusterConfiguration.Namespace, Name: clusterConfiguration.Name}, currentClusterConfiguration)).To(Succeed())
+
+		Expect(controllers.UpdateClusterConfigurationWithProfile(context.TODO(), c, clusterProfile, currentClusterConfiguration)).To(Succeed())
+
+		Expect(c.Get(context.TODO(),
+			types.NamespacedName{Namespace: clusterConfiguration.Namespace, Name: clusterConfiguration.Name}, currentClusterConfiguration)).To(Succeed())
+
+		Expect(len(currentClusterConfiguration.OwnerReferences)).To(Equal(1))
+		Expect(currentClusterConfiguration.OwnerReferences[0].Name).To(Equal(clusterProfile.Name))
+
+		Expect(len(currentClusterConfiguration.Status.ClusterProfileResources)).To(Equal(1))
+
+		Expect(controllers.UpdateClusterConfigurationWithProfile(context.TODO(), c, clusterProfile, currentClusterConfiguration)).To(Succeed())
+
+		Expect(len(currentClusterConfiguration.OwnerReferences)).To(Equal(1))
+		Expect(len(currentClusterConfiguration.Status.ClusterProfileResources)).To(Equal(1))
+	})
+
+	It("updateClusterConfigurations succeeds for a newly matching cluster even when the cache has not "+
+		"observed the just-created ClusterConfiguration yet (regression for stale-cache race)", func() {
+		ns := &corev1.Namespace{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: namespace,
+			},
+		}
+
+		clusterProfile.Status.MatchingClusterRefs = []corev1.ObjectReference{
+			{
+				Namespace:  matchingCluster.Namespace,
+				Name:       matchingCluster.Name,
+				Kind:       clusterKind,
+				APIVersion: clusterv1.GroupVersion.String(),
+			},
+		}
+
+		initObjects := []client.Object{
+			clusterProfile,
+			ns,
+		}
+
+		clusterConfigurationName := controllers.GetClusterConfigurationName(matchingCluster.Name, libsveltosv1beta1.ClusterTypeCapi)
+
+		// Simulate the cache lag seen in production: right after ClusterConfiguration is
+		// created, a Get for it (as served from the informer cache) still returns NotFound.
+		// updateClusterConfigurations must not depend on being able to re-Get the object it
+		// just created for a cluster newly starting to match.
+		// ClusterConfiguration is created by the code under test, so it is not among initObjects.
+		// Register it explicitly as having a status subresource, otherwise the fake client
+		// returns NotFound on Status().Update().
+		c := fake.NewClientBuilder().WithScheme(scheme).
+			WithStatusSubresource(append(initObjects, &configv1beta1.ClusterConfiguration{})...).
+			WithObjects(initObjects...).
+			WithInterceptorFuncs(interceptor.Funcs{
+				Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object,
+					opts ...client.GetOption) error {
+
+					if _, ok := obj.(*configv1beta1.ClusterConfiguration); ok && key.Name == clusterConfigurationName {
+						return apierrors.NewNotFound(
+							schema.GroupResource{Group: configv1beta1.GroupVersion.Group, Resource: "clusterconfigurations"},
+							key.Name)
+					}
+					return cl.Get(ctx, key, obj, opts...)
+				},
+			}).Build()
+
+		clusterProfileScope, err := scope.NewProfileScope(scope.ProfileScopeParams{
+			Client:         c,
+			Logger:         logger,
+			Profile:        clusterProfile,
+			ControllerName: testControllerNameProfile,
+		})
+		Expect(err).To(BeNil())
+
+		Expect(controllers.UpdateClusterConfigurations(context.TODO(), c, clusterProfileScope)).To(Succeed())
+	})
+
+	It("CleanClusterConfiguration idempotently removes ClusterProfile as OwnerReference and from Status.ClusterProfileResources", func() {
+		ns := &corev1.Namespace{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: namespace,
+			},
+		}
+		Expect(testEnv.Create(context.TODO(), ns)).To(Succeed())
+		Expect(waitForObject(context.TODO(), testEnv, ns)).To(Succeed())
+
+		clusterConfiguration := &configv1beta1.ClusterConfiguration{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: matchingCluster.Namespace,
+				Name:      controllers.GetClusterConfigurationName(matchingCluster.Name, libsveltosv1beta1.ClusterTypeCapi),
+			},
+		}
+		Expect(testEnv.Create(context.TODO(), clusterConfiguration)).To(Succeed())
+		Expect(waitForObject(context.TODO(), testEnv, clusterConfiguration)).To(Succeed())
+
+		Expect(testEnv.Create(context.TODO(), clusterProfile)).To(Succeed())
+		Expect(waitForObject(context.TODO(), testEnv, clusterProfile)).To(Succeed())
+
+		currentClusterProfile := &configv1beta1.ClusterProfile{}
+		Expect(testEnv.Get(context.TODO(), types.NamespacedName{Name: clusterProfile.Name}, currentClusterProfile)).To(Succeed())
+
+		currentClusterConfiguration := &configv1beta1.ClusterConfiguration{}
+		Expect(testEnv.Get(context.TODO(),
+			types.NamespacedName{
+				Namespace: clusterConfiguration.Namespace,
+				Name:      clusterConfiguration.Name,
+			},
+			currentClusterConfiguration)).To(Succeed())
+
+		// Preprare clusterConfiguration with Status section. OwnerReference
+		clusterConfiguration.OwnerReferences = []metav1.OwnerReference{
+			{
+				Kind:       currentClusterProfile.Kind,
+				Name:       currentClusterProfile.Name,
+				APIVersion: currentClusterProfile.APIVersion,
+				UID:        currentClusterProfile.UID,
+			},
+			{ // Add a second fake Owner, so that when removing ClusterProfile as owner,
+				// ClusterConfiguration is not deleted
+				Kind:       currentClusterProfile.Kind,
+				Name:       randomString(),
+				APIVersion: currentClusterProfile.APIVersion,
+				UID:        types.UID(randomString()),
+			},
+		}
+
+		Expect(testEnv.Update(context.TODO(), clusterConfiguration)).To(Succeed())
+
+		err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			err := testEnv.Get(context.TODO(),
+				types.NamespacedName{
+					Namespace: clusterConfiguration.Namespace,
+					Name:      clusterConfiguration.Name,
+				},
+				currentClusterConfiguration)
+			if err != nil {
+				return err
+			}
+
+			currentClusterConfiguration.Status =
+				configv1beta1.ClusterConfigurationStatus{
+					ClusterProfileResources: []configv1beta1.ClusterProfileResource{
+						{
+							ClusterProfileName: clusterProfile.Name,
+						},
+					},
+				}
+			return testEnv.Status().Update(context.TODO(), currentClusterConfiguration)
+		})
+		Expect(err).To(BeNil())
+
+		Eventually(func() bool {
+			err := testEnv.Get(context.TODO(),
+				types.NamespacedName{
+					Namespace: clusterConfiguration.Namespace,
+					Name:      clusterConfiguration.Name,
+				},
+				currentClusterConfiguration)
+			if err != nil {
+				return false
+			}
+			return currentClusterConfiguration.Status.ClusterProfileResources != nil
+		}, timeout, pollingInterval).Should(BeTrue())
+
+		Expect(controllers.CleanClusterConfiguration(context.TODO(), testEnv, currentClusterProfile,
+			currentClusterConfiguration)).To(Succeed())
+
+		Eventually(func() bool {
+			err := testEnv.Get(context.TODO(),
+				types.NamespacedName{
+					Namespace: clusterConfiguration.Namespace,
+					Name:      clusterConfiguration.Name,
+				},
+				currentClusterConfiguration)
+			if err != nil {
+				return false
+			}
+			return len(currentClusterConfiguration.OwnerReferences) == 1 &&
+				len(currentClusterConfiguration.Status.ClusterProfileResources) == 0
+		}, timeout, pollingInterval).Should(BeTrue())
+
+		Expect(controllers.CleanClusterConfiguration(context.TODO(), testEnv, currentClusterProfile,
+			currentClusterConfiguration)).To(Succeed())
+
+		Eventually(func() bool {
+			err := testEnv.Get(context.TODO(),
+				types.NamespacedName{
+					Namespace: clusterConfiguration.Namespace,
+					Name:      clusterConfiguration.Name,
+				},
+				currentClusterConfiguration)
+			if err != nil {
+				return false
+			}
+			return len(currentClusterConfiguration.OwnerReferences) == 1 &&
+				len(currentClusterConfiguration.Status.ClusterProfileResources) == 0
+		}, timeout, pollingInterval).Should(BeTrue())
+	})
+
+	It("CleanClusterConfiguration succeeds when ClusterConfiguration was concurrently modified", func() {
+		ns := &corev1.Namespace{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: namespace,
+			},
+		}
+		Expect(testEnv.Create(context.TODO(), ns)).To(Succeed())
+		Expect(waitForObject(context.TODO(), testEnv, ns)).To(Succeed())
+
+		clusterConfiguration := &configv1beta1.ClusterConfiguration{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: matchingCluster.Namespace,
+				Name:      controllers.GetClusterConfigurationName(matchingCluster.Name, libsveltosv1beta1.ClusterTypeCapi),
+			},
+		}
+		Expect(testEnv.Create(context.TODO(), clusterConfiguration)).To(Succeed())
+		Expect(waitForObject(context.TODO(), testEnv, clusterConfiguration)).To(Succeed())
+
+		Expect(testEnv.Create(context.TODO(), clusterProfile)).To(Succeed())
+		Expect(waitForObject(context.TODO(), testEnv, clusterProfile)).To(Succeed())
+
+		currentClusterProfile := &configv1beta1.ClusterProfile{}
+		Expect(testEnv.Get(context.TODO(), types.NamespacedName{Name: clusterProfile.Name}, currentClusterProfile)).To(Succeed())
+
+		// staleClusterConfiguration mimics the copy a reconciler goroutine would have listed
+		// before another goroutine (managing a different ClusterProfile matching the same
+		// cluster) concurrently updates the same object.
+		staleClusterConfiguration := &configv1beta1.ClusterConfiguration{}
+		Expect(testEnv.Get(context.TODO(),
+			types.NamespacedName{
+				Namespace: clusterConfiguration.Namespace,
+				Name:      clusterConfiguration.Name,
+			},
+			staleClusterConfiguration)).To(Succeed())
+
+		staleClusterConfiguration.OwnerReferences = []metav1.OwnerReference{
+			{
+				Kind:       currentClusterProfile.Kind,
+				Name:       currentClusterProfile.Name,
+				APIVersion: currentClusterProfile.APIVersion,
+				UID:        currentClusterProfile.UID,
+			},
+			{ // Add a second fake Owner, so that when removing ClusterProfile as owner,
+				// ClusterConfiguration is not deleted
+				Kind:       currentClusterProfile.Kind,
+				Name:       randomString(),
+				APIVersion: currentClusterProfile.APIVersion,
+				UID:        types.UID(randomString()),
+			},
+		}
+		Expect(testEnv.Update(context.TODO(), staleClusterConfiguration)).To(Succeed())
+
+		Eventually(func() bool {
+			err := testEnv.Get(context.TODO(),
+				types.NamespacedName{
+					Namespace: clusterConfiguration.Namespace,
+					Name:      clusterConfiguration.Name,
+				},
+				staleClusterConfiguration)
+			if err != nil {
+				return false
+			}
+			return len(staleClusterConfiguration.OwnerReferences) == 2
+		}, timeout, pollingInterval).Should(BeTrue())
+
+		// Simulate a second, concurrent writer bumping the object's ResourceVersion
+		// (e.g. another ClusterProfile's reconcile updating the same ClusterConfiguration)
+		// without staleClusterConfiguration's in-memory copy being refreshed.
+		concurrentWriterCopy := &configv1beta1.ClusterConfiguration{}
+		Expect(testEnv.Get(context.TODO(),
+			types.NamespacedName{
+				Namespace: clusterConfiguration.Namespace,
+				Name:      clusterConfiguration.Name,
+			},
+			concurrentWriterCopy)).To(Succeed())
+		if concurrentWriterCopy.Labels == nil {
+			concurrentWriterCopy.Labels = map[string]string{}
+		}
+		concurrentWriterCopy.Labels[randomString()] = randomString()
+		Expect(testEnv.Update(context.TODO(), concurrentWriterCopy)).To(Succeed())
+
+		Expect(staleClusterConfiguration.ResourceVersion).ToNot(Equal(concurrentWriterCopy.ResourceVersion))
+
+		// CleanClusterConfiguration is called with the stale copy. Before the fix, the
+		// Update/Delete call inside cleanClusterConfigurationOwnerReferences used this stale
+		// object directly and failed with a conflict error. It must now succeed by refetching
+		// the current version internally and retrying.
+		Expect(controllers.CleanClusterConfiguration(context.TODO(), testEnv, currentClusterProfile,
+			staleClusterConfiguration)).To(Succeed())
+
+		Eventually(func() bool {
+			err := testEnv.Get(context.TODO(),
+				types.NamespacedName{
+					Namespace: clusterConfiguration.Namespace,
+					Name:      clusterConfiguration.Name,
+				},
+				staleClusterConfiguration)
+			if err != nil {
+				return false
+			}
+			return len(staleClusterConfiguration.OwnerReferences) == 1
+		}, timeout, pollingInterval).Should(BeTrue())
+	})
+
+	It("CreateClusterSummary creates ClusterSummary with proper fields", func() {
+		initObjects := []client.Object{
+			clusterProfile,
+			matchingCluster,
+			nonMatchingCluster,
+		}
+
+		c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(initObjects...).WithObjects(initObjects...).Build()
+
+		clusterProfileScope, err := scope.NewProfileScope(scope.ProfileScopeParams{
+			Client:         c,
+			Logger:         logger,
+			Profile:        clusterProfile,
+			ControllerName: testControllerNameProfile,
+		})
+		Expect(err).To(BeNil())
+
+		err = controllers.CreateClusterSummary(context.TODO(), c, clusterProfileScope,
+			&corev1.ObjectReference{
+				Namespace:  matchingCluster.Namespace,
+				Name:       matchingCluster.Name,
+				APIVersion: clusterv1.GroupVersion.String(),
+				Kind:       clusterKind,
+			})
+		Expect(err).To(BeNil())
+
+		clusterSummaryList := &configv1beta1.ClusterSummaryList{}
+		Expect(c.List(context.TODO(), clusterSummaryList)).To(BeNil())
+		Expect(len(clusterSummaryList.Items)).To(Equal(1))
+		Expect(clusterSummaryList.Items[0].Spec.ClusterName).To(Equal(matchingCluster.Name))
+		Expect(clusterSummaryList.Items[0].Spec.ClusterNamespace).To(Equal(matchingCluster.Namespace))
+		Expect(reflect.DeepEqual(clusterSummaryList.Items[0].Spec.ClusterProfileSpec, clusterProfile.Spec)).To(BeTrue())
+		Expect(len(clusterSummaryList.Items[0].ObjectMeta.OwnerReferences)).To(Equal(1))
+		owner := clusterSummaryList.Items[0].OwnerReferences[0]
+		Expect(owner.Name).To(Equal(clusterProfile.Name))
+		Expect(owner.Kind).To(Equal(clusterProfile.Kind))
+	})
+
+	It("UpdateClusterSummary updates ClusterSummary with proper fields when ClusterProfile syncmode set to continuous", func() {
+		sveltosCluster := &libsveltosv1beta1.SveltosCluster{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      randomString(),
+				Namespace: randomString(),
+				Labels:    matchingCluster.Labels,
+			},
+		}
+
+		clusterSummaryName := clusterops.GetClusterSummaryName(configv1beta1.ClusterProfileKind,
+			sveltosCluster.Name, sveltosCluster.Name, false)
+		clusterSummary := &configv1beta1.ClusterSummary{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      clusterSummaryName,
+				Namespace: sveltosCluster.Namespace,
+			},
+			Spec: configv1beta1.ClusterSummarySpec{
+				ClusterNamespace: sveltosCluster.Namespace,
+				ClusterName:      sveltosCluster.Name,
+				ClusterType:      libsveltosv1beta1.ClusterTypeSveltos,
+				ClusterProfileSpec: configv1beta1.Spec{
+					SyncMode: configv1beta1.SyncModeOneTime,
+					PolicyRefs: []configv1beta1.PolicyRef{
+						{
+							Kind:      string(libsveltosv1beta1.SecretReferencedResourceKind),
+							Namespace: randomString(),
+							Name:      randomString(),
+						},
+					},
+				},
+			},
+		}
+		addLabelsToClusterSummary(clusterSummary, clusterProfile.Name, sveltosCluster.Name, libsveltosv1beta1.ClusterTypeSveltos)
+
+		clusterProfile.Spec.SyncMode = configv1beta1.SyncModeContinuous
+		clusterProfile.Spec.PolicyRefs = []configv1beta1.PolicyRef{
+			{
+				Kind:      string(libsveltosv1beta1.SecretReferencedResourceKind),
+				Namespace: randomString(),
+				Name:      randomString(),
+			},
+			{
+				Kind:      string(libsveltosv1beta1.SecretReferencedResourceKind),
+				Namespace: randomString(),
+				Name:      randomString(),
+			},
+		}
+
+		initObjects := []client.Object{
+			clusterProfile,
+			sveltosCluster,
+			clusterSummary,
+		}
+
+		c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(initObjects...).WithObjects(initObjects...).Build()
+
+		clusterProfileScope, err := scope.NewProfileScope(scope.ProfileScopeParams{
+			Client:         c,
+			Logger:         logger,
+			Profile:        clusterProfile,
+			ControllerName: testControllerNameProfile,
+		})
+		Expect(err).To(BeNil())
+
+		_, err = controllers.UpdateClusterSummary(context.TODO(), c,
+			clusterProfileScope, clusterSummary, &corev1.ObjectReference{
+				Namespace: sveltosCluster.Namespace, Name: sveltosCluster.Name,
+				Kind: libsveltosv1beta1.SveltosClusterKind, APIVersion: libsveltosv1beta1.GroupVersion.String()})
+		Expect(err).To(BeNil())
+
+		clusterSummaryList := &configv1beta1.ClusterSummaryList{}
+		Expect(c.List(context.TODO(), clusterSummaryList)).To(BeNil())
+		Expect(len(clusterSummaryList.Items)).To(Equal(1))
+		Expect(clusterSummaryList.Items[0].Spec.ClusterName).To(Equal(sveltosCluster.Name))
+		Expect(clusterSummaryList.Items[0].Spec.ClusterNamespace).To(Equal(sveltosCluster.Namespace))
+		Expect(reflect.DeepEqual(clusterSummaryList.Items[0].Spec.ClusterProfileSpec, clusterProfile.Spec)).To(BeTrue())
+	})
+
+	It("UpdateClusterSummary preserves redeploy annotation set on ClusterSummary unless ClusterProfile sets it", func() {
+		sveltosCluster := &libsveltosv1beta1.SveltosCluster{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      randomString(),
+				Namespace: randomString(),
+				Labels:    matchingCluster.Labels,
+			},
+		}
+		clusterRef := &corev1.ObjectReference{
+			Namespace: sveltosCluster.Namespace, Name: sveltosCluster.Name,
+			Kind: libsveltosv1beta1.SveltosClusterKind, APIVersion: libsveltosv1beta1.GroupVersion.String()}
+
+		clusterSummary := &configv1beta1.ClusterSummary{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      clusterops.GetClusterSummaryName(configv1beta1.ClusterProfileKind, clusterProfile.Name, sveltosCluster.Name, false),
+				Namespace: sveltosCluster.Namespace,
+				Annotations: map[string]string{
+					configv1beta1.ProfileRedeployAnnotation: "summary-value",
+				},
+			},
+			Spec: configv1beta1.ClusterSummarySpec{
+				ClusterNamespace:   sveltosCluster.Namespace,
+				ClusterName:        sveltosCluster.Name,
+				ClusterType:        libsveltosv1beta1.ClusterTypeSveltos,
+				ClusterProfileSpec: clusterProfile.Spec,
+			},
+		}
+		addLabelsToClusterSummary(clusterSummary, clusterProfile.Name, sveltosCluster.Name, libsveltosv1beta1.ClusterTypeSveltos)
+
+		clusterProfile.Spec.SyncMode = configv1beta1.SyncModeContinuous
+		clusterSummary.Spec.ClusterProfileSpec = clusterProfile.Spec
+
+		initObjects := []client.Object{clusterProfile, sveltosCluster, clusterSummary}
+		c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(initObjects...).WithObjects(initObjects...).Build()
+
+		getProfileScope := func() *scope.ProfileScope {
+			profileScope, err := scope.NewProfileScope(scope.ProfileScopeParams{
+				Client:         c,
+				Logger:         logger,
+				Profile:        clusterProfile,
+				ControllerName: testControllerNameProfile,
+			})
+			Expect(err).To(BeNil())
+			return profileScope
+		}
+
+		// ClusterProfile does not set the annotation: value set on the ClusterSummary is preserved
+		_, err := controllers.UpdateClusterSummary(context.TODO(), c, getProfileScope(), clusterSummary, clusterRef)
+		Expect(err).To(BeNil())
+		current := &configv1beta1.ClusterSummary{}
+		Expect(c.Get(context.TODO(), client.ObjectKeyFromObject(clusterSummary), current)).To(Succeed())
+		Expect(current.Annotations[configv1beta1.ProfileRedeployAnnotation]).To(Equal("summary-value"))
+
+		// Other ClusterProfile annotations are still copied and redeploy annotation is still preserved
+		clusterProfile.Annotations = map[string]string{
+			configv1beta1.ProfilePausedAnnotation: testTrueValue,
+		}
+		_, err = controllers.UpdateClusterSummary(context.TODO(), c, getProfileScope(), current, clusterRef)
+		Expect(err).To(BeNil())
+		Expect(c.Get(context.TODO(), client.ObjectKeyFromObject(clusterSummary), current)).To(Succeed())
+		Expect(current.Annotations[configv1beta1.ProfileRedeployAnnotation]).To(Equal("summary-value"))
+		Expect(current.Annotations[configv1beta1.ProfilePausedAnnotation]).To(Equal(testTrueValue))
+
+		// ClusterProfile sets the annotation: its value takes precedence
+		clusterProfile.Annotations[configv1beta1.ProfileRedeployAnnotation] = "profile-value"
+		_, err = controllers.UpdateClusterSummary(context.TODO(), c, getProfileScope(), current, clusterRef)
+		Expect(err).To(BeNil())
+		Expect(c.Get(context.TODO(), client.ObjectKeyFromObject(clusterSummary), current)).To(Succeed())
+		Expect(current.Annotations[configv1beta1.ProfileRedeployAnnotation]).To(Equal("profile-value"))
+	})
+
+	It("UpdateClusterSummary does not update ClusterSummary when ClusterProfile syncmode set to one time", func() {
+		clusterProfile.Spec.SyncMode = configv1beta1.SyncModeOneTime
+		clusterProfile.Spec.PolicyRefs = []configv1beta1.PolicyRef{
+			{
+				Kind:      string(libsveltosv1beta1.ConfigMapReferencedResourceKind),
+				Namespace: randomString(),
+				Name:      randomString(),
+			},
+			{
+				Kind:      string(libsveltosv1beta1.ConfigMapReferencedResourceKind),
+				Namespace: randomString(),
+				Name:      randomString(),
+			},
+		}
+
+		clusterSummaryName := clusterops.GetClusterSummaryName(configv1beta1.ClusterProfileKind,
+			clusterProfile.Name, matchingCluster.Name, false)
+		clusterSummary := &configv1beta1.ClusterSummary{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      clusterSummaryName,
+				Namespace: matchingCluster.Namespace,
+			},
+			Spec: configv1beta1.ClusterSummarySpec{
+				ClusterNamespace:   matchingCluster.Namespace,
+				ClusterName:        matchingCluster.Name,
+				ClusterProfileSpec: clusterProfile.Spec,
+				ClusterType:        libsveltosv1beta1.ClusterTypeCapi,
+			},
+		}
+		addLabelsToClusterSummary(clusterSummary, clusterProfile.Name, matchingCluster.Name, libsveltosv1beta1.ClusterTypeCapi)
+
+		initObjects := []client.Object{
+			clusterProfile,
+			matchingCluster,
+			clusterSummary,
+		}
+
+		c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(initObjects...).WithObjects(initObjects...).Build()
+
+		clusterProfile.Spec.PolicyRefs = []configv1beta1.PolicyRef{
+			{
+				Kind:      string(libsveltosv1beta1.ConfigMapReferencedResourceKind),
+				Namespace: randomString(),
+				Name:      randomString(),
+			},
+		}
+
+		Expect(c.Update(context.TODO(), clusterProfile)).To(Succeed())
+		Expect(addTypeInformationToObject(scheme, clusterProfile)).To(Succeed())
+
+		clusterProfileScope, err := scope.NewProfileScope(scope.ProfileScopeParams{
+			Client:         c,
+			Logger:         logger,
+			Profile:        clusterProfile,
+			ControllerName: testControllerNameProfile,
+		})
+		Expect(err).To(BeNil())
+
+		_, err = controllers.UpdateClusterSummary(context.TODO(), c, clusterProfileScope,
+			clusterSummary, &corev1.ObjectReference{Namespace: matchingCluster.Namespace, Name: matchingCluster.Name})
+		Expect(err).To(BeNil())
+
+		clusterSummaryList := &configv1beta1.ClusterSummaryList{}
+		Expect(c.List(context.TODO(), clusterSummaryList)).To(BeNil())
+		Expect(len(clusterSummaryList.Items)).To(Equal(1))
+		Expect(clusterSummaryList.Items[0].Spec.ClusterName).To(Equal(matchingCluster.Name))
+		Expect(clusterSummaryList.Items[0].Spec.ClusterNamespace).To(Equal(matchingCluster.Namespace))
+		Expect(reflect.DeepEqual(clusterSummaryList.Items[0].Spec.ClusterProfileSpec, clusterProfile.Spec)).ToNot(BeTrue())
+		Expect(len(clusterSummaryList.Items[0].Spec.ClusterProfileSpec.PolicyRefs)).To(Equal(2))
+	})
+
+	It("cleanClusterSummaries removes ClusterSummary for non-matching cluster", func() {
+		clusterProfile.Spec.SyncMode = configv1beta1.SyncModeOneTime
+		clusterProfile.Spec.PolicyRefs = []configv1beta1.PolicyRef{
+			{
+				Kind:      string(libsveltosv1beta1.ConfigMapReferencedResourceKind),
+				Namespace: randomString(),
+				Name:      randomString(),
+			},
+			{
+
+				Kind:      string(libsveltosv1beta1.ConfigMapReferencedResourceKind),
+				Namespace: randomString(),
+				Name:      randomString(),
+			},
+		}
+
+		clusterSummaryName := clusterops.GetClusterSummaryName(configv1beta1.ClusterProfileKind,
+			clusterProfile.Name, nonMatchingCluster.Name, false)
+		clusterSummary := &configv1beta1.ClusterSummary{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      clusterSummaryName,
+				Namespace: nonMatchingCluster.Namespace,
+				OwnerReferences: []metav1.OwnerReference{
+					{
+						APIVersion: clusterProfile.APIVersion,
+						Kind:       clusterProfile.Kind,
+						Name:       clusterProfile.Name,
+					},
+				},
+			},
+			Spec: configv1beta1.ClusterSummarySpec{
+				ClusterNamespace:   nonMatchingCluster.Namespace,
+				ClusterName:        nonMatchingCluster.Name,
+				ClusterProfileSpec: clusterProfile.Spec,
+				ClusterType:        libsveltosv1beta1.ClusterTypeCapi,
+			},
+		}
+		addLabelsToClusterSummary(clusterSummary, clusterProfile.Name, matchingCluster.Name,
+			libsveltosv1beta1.ClusterTypeCapi)
+
+		initObjects := []client.Object{
+			clusterProfile,
+			nonMatchingCluster,
+			clusterSummary,
+		}
+
+		c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(initObjects...).WithObjects(initObjects...).Build()
+
+		profileScope, err := scope.NewProfileScope(scope.ProfileScopeParams{
+			Client:         c,
+			Logger:         logger,
+			Profile:        clusterProfile,
+			ControllerName: testControllerNameProfile,
+		})
+		Expect(err).To(BeNil())
+
+		err = controllers.CleanClusterSummaries(context.TODO(), c, profileScope)
+		Expect(err).ToNot(BeNil())
+		Expect(err.Error()).To(Equal("clusterSummaries still present"))
+
+		clusterSummaryList := &configv1beta1.ClusterSummaryList{}
+		Expect(c.List(context.TODO(), clusterSummaryList)).To(BeNil())
+		Expect(len(clusterSummaryList.Items)).To(BeZero())
+	})
+
+	It("reconcileDeleteCommon waits when all ClusterSummaries still present are for paused clusters", func() {
+		paused := true
+		nonMatchingCluster.Spec.Paused = &paused
+
+		clusterSummary := getClusterSummaryWithFinalizer(configv1beta1.ClusterProfileKind, clusterProfile, nonMatchingCluster)
+
+		initObjects := []client.Object{clusterProfile, nonMatchingCluster, clusterSummary}
+		c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(initObjects...).WithObjects(initObjects...).Build()
+
+		profileScope, err := scope.NewProfileScope(scope.ProfileScopeParams{
+			Client:         c,
+			Logger:         logger,
+			Profile:        clusterProfile,
+			ControllerName: testControllerNameProfile,
+		})
+		Expect(err).To(BeNil())
+
+		err = controllers.ReconcileDeleteCommon(context.TODO(), c, profileScope,
+			configv1beta1.ClusterProfileFinalizer, logger)
+
+		var waitErr *controllers.WaitingForPausedClustersError
+		Expect(errors.As(err, &waitErr)).To(BeTrue())
+		Expect(waitErr.Clusters).To(HaveLen(1))
+		Expect(waitErr.Clusters[0].Namespace).To(Equal(nonMatchingCluster.Namespace))
+		Expect(waitErr.Clusters[0].Name).To(Equal(nonMatchingCluster.Name))
+		Expect(waitErr.Clusters[0].Kind).To(Equal(clusterv1.ClusterKind))
+
+		// ClusterSummary has been marked for deletion
+		currentClusterSummary := &configv1beta1.ClusterSummary{}
+		Expect(c.Get(context.TODO(), client.ObjectKeyFromObject(clusterSummary), currentClusterSummary)).To(Succeed())
+		Expect(currentClusterSummary.DeletionTimestamp.IsZero()).To(BeFalse())
+	})
+
+	It("reconcileDeleteCommon keeps reconciling when a ClusterSummary still present is for a cluster not paused", func() {
+		paused := true
+		nonMatchingCluster.Spec.Paused = &paused
+		// matchingCluster is not paused
+		notPausedCluster := matchingCluster
+
+		pausedClusterSummary := getClusterSummaryWithFinalizer(configv1beta1.ClusterProfileKind, clusterProfile, nonMatchingCluster)
+		notPausedClusterSummary := getClusterSummaryWithFinalizer(configv1beta1.ClusterProfileKind, clusterProfile, notPausedCluster)
+
+		initObjects := []client.Object{
+			clusterProfile, nonMatchingCluster, notPausedCluster, pausedClusterSummary, notPausedClusterSummary,
+		}
+		c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(initObjects...).WithObjects(initObjects...).Build()
+
+		profileScope, err := scope.NewProfileScope(scope.ProfileScopeParams{
+			Client:         c,
+			Logger:         logger,
+			Profile:        clusterProfile,
+			ControllerName: testControllerNameProfile,
+		})
+		Expect(err).To(BeNil())
+
+		err = controllers.ReconcileDeleteCommon(context.TODO(), c, profileScope,
+			configv1beta1.ClusterProfileFinalizer, logger)
+		Expect(err).ToNot(BeNil())
+
+		var waitErr *controllers.WaitingForPausedClustersError
+		Expect(errors.As(err, &waitErr)).To(BeFalse())
+		Expect(err.Error()).To(Equal("clusterSummaries still present"))
+	})
+
+	It("reconcileDeleteCommon keeps reconciling when the cluster of a ClusterSummary is not found", func() {
+		// nonMatchingCluster is not in the fake client
+		clusterSummary := getClusterSummaryWithFinalizer(configv1beta1.ClusterProfileKind, clusterProfile, nonMatchingCluster)
+
+		initObjects := []client.Object{clusterProfile, clusterSummary}
+		c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(initObjects...).WithObjects(initObjects...).Build()
+
+		profileScope, err := scope.NewProfileScope(scope.ProfileScopeParams{
+			Client:         c,
+			Logger:         logger,
+			Profile:        clusterProfile,
+			ControllerName: testControllerNameProfile,
+		})
+		Expect(err).To(BeNil())
+
+		err = controllers.ReconcileDeleteCommon(context.TODO(), c, profileScope,
+			configv1beta1.ClusterProfileFinalizer, logger)
+		Expect(err).ToNot(BeNil())
+
+		var waitErr *controllers.WaitingForPausedClustersError
+		Expect(errors.As(err, &waitErr)).To(BeFalse())
+		Expect(err.Error()).To(Equal("clusterSummaries still present"))
+	})
+
+	It("cleanClusterSummaries in DryRun mode keeps ClusterSummary alive with cleared refs when cluster stops matching", func() {
+		clusterProfile.Spec.SyncMode = configv1beta1.SyncModeDryRun
+		clusterProfile.Spec.PolicyRefs = []configv1beta1.PolicyRef{
+			{
+				Kind:      string(libsveltosv1beta1.ConfigMapReferencedResourceKind),
+				Namespace: randomString(),
+				Name:      randomString(),
+			},
+		}
+
+		// ClusterSummary has Continuous syncMode and non-empty refs — as it was before the profile changed
+		clusterSummaryName := clusterops.GetClusterSummaryName(configv1beta1.ClusterProfileKind,
+			clusterProfile.Name, nonMatchingCluster.Name, false)
+		clusterSummary := &configv1beta1.ClusterSummary{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      clusterSummaryName,
+				Namespace: nonMatchingCluster.Namespace,
+				OwnerReferences: []metav1.OwnerReference{
+					{
+						APIVersion: clusterProfile.APIVersion,
+						Kind:       clusterProfile.Kind,
+						Name:       clusterProfile.Name,
+					},
+				},
+			},
+			Spec: configv1beta1.ClusterSummarySpec{
+				ClusterNamespace: nonMatchingCluster.Namespace,
+				ClusterName:      nonMatchingCluster.Name,
+				ClusterProfileSpec: configv1beta1.Spec{
+					SyncMode:   configv1beta1.SyncModeContinuous,
+					PolicyRefs: clusterProfile.Spec.PolicyRefs,
+				},
+				ClusterType: libsveltosv1beta1.ClusterTypeCapi,
+			},
+		}
+		addLabelsToClusterSummary(clusterSummary, clusterProfile.Name, nonMatchingCluster.Name,
+			libsveltosv1beta1.ClusterTypeCapi)
+
+		initObjects := []client.Object{
+			clusterProfile,
+			nonMatchingCluster,
+			clusterSummary,
+		}
+
+		c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(initObjects...).WithObjects(initObjects...).Build()
+
+		profileScope, err := scope.NewProfileScope(scope.ProfileScopeParams{
+			Client:         c,
+			Logger:         logger,
+			Profile:        clusterProfile,
+			ControllerName: testControllerNameProfile,
+		})
+		Expect(err).To(BeNil())
+
+		// DryRun: cleanClusterSummaries must not delete the ClusterSummary and must not return an error
+		Expect(controllers.CleanClusterSummaries(context.TODO(), c, profileScope)).To(Succeed())
+
+		// ClusterSummary is still present
+		currentClusterSummary := &configv1beta1.ClusterSummary{}
+		Expect(c.Get(context.TODO(),
+			types.NamespacedName{Namespace: clusterSummary.Namespace, Name: clusterSummary.Name},
+			currentClusterSummary)).To(Succeed())
+
+		// Refs are cleared and syncMode is updated to DryRun
+		Expect(currentClusterSummary.Spec.ClusterProfileSpec.PolicyRefs).To(BeNil())
+		Expect(currentClusterSummary.Spec.ClusterProfileSpec.HelmCharts).To(BeNil())
+		Expect(currentClusterSummary.Spec.ClusterProfileSpec.KustomizationRefs).To(BeNil())
+		Expect(currentClusterSummary.Spec.ClusterProfileSpec.SyncMode).To(Equal(configv1beta1.SyncModeDryRun))
+
+		// A ClusterReport is created for the deselected cluster
+		clusterReportList := &configv1beta1.ClusterReportList{}
+		Expect(c.List(context.TODO(), clusterReportList)).To(Succeed())
+		Expect(len(clusterReportList.Items)).To(Equal(1))
+	})
+
+	It("cleanClusterConfigurations in DryRun mode keeps ClusterConfiguration intact when cluster stops matching", func() {
+		clusterProfile.Spec.SyncMode = configv1beta1.SyncModeDryRun
+
+		clusterConfiguration := &configv1beta1.ClusterConfiguration{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: nonMatchingCluster.Namespace,
+				Name:      controllers.GetClusterConfigurationName(nonMatchingCluster.Name, libsveltosv1beta1.ClusterTypeCapi),
+				OwnerReferences: []metav1.OwnerReference{
+					{
+						Kind:       clusterProfile.Kind,
+						Name:       clusterProfile.Name,
+						APIVersion: clusterProfile.APIVersion,
+						UID:        clusterProfile.UID,
+					},
+				},
+			},
+		}
+
+		initObjects := []client.Object{
+			clusterProfile,
+			nonMatchingCluster,
+			clusterConfiguration,
+		}
+
+		c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(initObjects...).WithObjects(initObjects...).Build()
+
+		// No matching clusters: the ClusterConfiguration is not in the matching set
+		profileScope, err := scope.NewProfileScope(scope.ProfileScopeParams{
+			Client:         c,
+			Logger:         logger,
+			Profile:        clusterProfile,
+			ControllerName: testControllerNameProfile,
+		})
+		Expect(err).To(BeNil())
+
+		Expect(controllers.CleanClusterConfigurations(context.TODO(), c, profileScope)).To(Succeed())
+
+		// ClusterConfiguration must still exist — the DryRun reconciler needs it
+		currentClusterConfiguration := &configv1beta1.ClusterConfiguration{}
+		Expect(c.Get(context.TODO(),
+			types.NamespacedName{Namespace: clusterConfiguration.Namespace, Name: clusterConfiguration.Name},
+			currentClusterConfiguration)).To(Succeed())
+	})
+
+	It("updateClusterSummarySyncMode updates ClusterSummary SyncMode", func() {
+		clusterSummary := &configv1beta1.ClusterSummary{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: randomString(),
+				Name:      clusterProfileNamePrefix + randomString(),
+				Labels: map[string]string{
+					clusterops.ClusterProfileLabelName: clusterProfile.Name,
+				},
+				Finalizers: []string{configv1beta1.ClusterSummaryFinalizer},
+			},
+			Spec: configv1beta1.ClusterSummarySpec{
+				ClusterProfileSpec: configv1beta1.Spec{
+					SyncMode: configv1beta1.SyncModeDryRun,
+				},
+				ClusterType: libsveltosv1beta1.ClusterTypeCapi,
+			},
+		}
+
+		// Make sure to have clustersummary marked as deleted.
+		// ClusterProfile will update SyncMode for ClusterSummary representing CAPI Clusters
+		// not matching anymore. So deleted ClusterSummaries.
+		now := metav1.NewTime(time.Now())
+		clusterSummary.DeletionTimestamp = &now
+
+		ns := &corev1.Namespace{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: clusterSummary.Namespace,
+			},
+		}
+
+		Expect(testEnv.Create(context.TODO(), ns)).To(Succeed())
+		Expect(waitForObject(context.TODO(), testEnv.Client, ns)).To(Succeed())
+
+		Expect(testEnv.Create(context.TODO(), clusterSummary)).To(Succeed())
+		Expect(waitForObject(context.TODO(), testEnv.Client, clusterSummary)).To(Succeed())
+
+		clusterProfile.Spec.SyncMode = configv1beta1.SyncModeContinuous
+
+		Expect(controllers.UpdateClusterSummarySyncMode(context.TODO(), testEnv.Client, clusterSummary,
+			clusterProfile.Spec.SyncMode)).To(Succeed())
+
+		// Eventual loop so testEnv Cache is synced
+		Eventually(func() bool {
+			currentClusterSummary := &configv1beta1.ClusterSummary{}
+			err := testEnv.Get(context.TODO(),
+				types.NamespacedName{Namespace: clusterSummary.Namespace, Name: clusterSummary.Name}, currentClusterSummary)
+			if err != nil {
+				return false
+			}
+			return currentClusterSummary.Spec.ClusterProfileSpec.SyncMode == clusterProfile.Spec.SyncMode
+		}, timeout, pollingInterval).Should(BeTrue())
+	})
+
+	It("updateClusterSummaries does not create ClusterSummary for matching CAPI Cluster not ready", func() {
+		clusterProfile.Status.MatchingClusterRefs = []corev1.ObjectReference{
+			{
+				Namespace:  matchingCluster.Namespace,
+				Name:       matchingCluster.Name,
+				Kind:       clusterKind,
+				APIVersion: clusterv1.GroupVersion.String(),
+			},
+		}
+
+		initialized := false
+		matchingCluster.Status.Initialization.ControlPlaneInitialized = &initialized
+
+		initObjects := []client.Object{
+			clusterProfile,
+			nonMatchingCluster,
+			matchingCluster,
+		}
+
+		c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(initObjects...).WithObjects(initObjects...).Build()
+
+		clusterProfileScope, err := scope.NewProfileScope(scope.ProfileScopeParams{
+			Client:         c,
+			Logger:         logger,
+			Profile:        clusterProfile,
+			ControllerName: testControllerNameProfile,
+		})
+		Expect(err).To(BeNil())
+
+		err = controllers.UpdateClusterSummaries(context.TODO(), c, clusterProfileScope)
+		Expect(err).To(BeNil())
+
+		clusterSummaryList := &configv1beta1.ClusterSummaryList{}
+		Expect(c.List(context.TODO(), clusterSummaryList)).To(BeNil())
+		Expect(len(clusterSummaryList.Items)).To(Equal(0))
+	})
+
+	It("updateClusterSummaries does not create ClusterSummary for matching Paused Cluster", func() {
+		maxUpdate := int32(3)
+		clusterProfile.Spec.MaxUpdate = &intstr.IntOrString{Type: intstr.Int, IntVal: maxUpdate}
+		clusterProfile.Status.MatchingClusterRefs = []corev1.ObjectReference{
+			{
+				Namespace:  matchingCluster.Namespace,
+				Name:       matchingCluster.Name,
+				Kind:       clusterKind,
+				APIVersion: clusterv1.GroupVersion.String(),
+			},
+		}
+
+		initialized := true
+		matchingCluster.Status.Initialization.ControlPlaneInitialized = &initialized
+		paused := true
+		matchingCluster.Spec.Paused = &paused
+
+		initObjects := []client.Object{
+			clusterProfile,
+			nonMatchingCluster,
+			matchingCluster,
+		}
+
+		c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(initObjects...).WithObjects(initObjects...).Build()
+
+		clusterProfileScope, err := scope.NewProfileScope(scope.ProfileScopeParams{
+			Client:         c,
+			Logger:         logger,
+			Profile:        clusterProfile,
+			ControllerName: testControllerNameProfile,
+		})
+		Expect(err).To(BeNil())
+
+		err = controllers.UpdateClusterSummaries(context.TODO(), c, clusterProfileScope)
+		Expect(err).To(BeNil())
+
+		clusterSummaryList := &configv1beta1.ClusterSummaryList{}
+		Expect(c.List(context.TODO(), clusterSummaryList)).To(BeNil())
+		Expect(len(clusterSummaryList.Items)).To(Equal(0))
+	})
+
+	It("updateClusterSummaries does not let a paused cluster hold the only maxUpdate slot", func() {
+		clusterProfile.Spec.MaxUpdate = &intstr.IntOrString{Type: intstr.Int, IntVal: 1}
+		// The paused cluster comes first: it must not take the slot of the cluster which is not paused
+		clusterProfile.Status.MatchingClusterRefs = []corev1.ObjectReference{
+			{
+				Namespace:  matchingCluster.Namespace,
+				Name:       matchingCluster.Name,
+				Kind:       clusterKind,
+				APIVersion: clusterv1.GroupVersion.String(),
+			},
+			{
+				Namespace:  nonMatchingCluster.Namespace,
+				Name:       nonMatchingCluster.Name,
+				Kind:       clusterKind,
+				APIVersion: clusterv1.GroupVersion.String(),
+			},
+		}
+
+		initialized := true
+		paused := true
+		matchingCluster.Status.Initialization.ControlPlaneInitialized = &initialized
+		matchingCluster.Spec.Paused = &paused
+		nonMatchingCluster.Status.Initialization.ControlPlaneInitialized = &initialized
+		nonMatchingCluster.Status.Conditions = matchingCluster.Status.Conditions
+
+		initObjects := []client.Object{
+			clusterProfile,
+			nonMatchingCluster,
+			matchingCluster,
+		}
+
+		c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(initObjects...).WithObjects(initObjects...).Build()
+
+		clusterProfileScope, err := scope.NewProfileScope(scope.ProfileScopeParams{
+			Client:         c,
+			Logger:         logger,
+			Profile:        clusterProfile,
+			ControllerName: testControllerNameProfile,
+		})
+		Expect(err).To(BeNil())
+
+		Expect(controllers.UpdateClusterSummaries(context.TODO(), c, clusterProfileScope)).To(Succeed())
+
+		// Only the cluster which is not paused gets a ClusterSummary
+		clusterSummaryList := &configv1beta1.ClusterSummaryList{}
+		Expect(c.List(context.TODO(), clusterSummaryList)).To(Succeed())
+		Expect(clusterSummaryList.Items).To(HaveLen(1))
+		Expect(clusterSummaryList.Items[0].Spec.ClusterName).To(Equal(nonMatchingCluster.Name))
+
+		// The paused cluster is not tracked: nothing was done for it
+		for _, cluster := range clusterProfile.Status.UpdatingClusters.Clusters {
+			Expect(cluster.Name).ToNot(Equal(matchingCluster.Name))
+		}
+	})
+
+	It("updateClusterSummaries creates ClusterSummary for each matching CAPI Cluster", func() {
+		initialized := true
+		matchingCluster.Status.Initialization.ControlPlaneInitialized = &initialized
+		nonMatchingCluster.Status.Conditions = matchingCluster.Status.Conditions
+
+		clusterProfile.Status.MatchingClusterRefs = []corev1.ObjectReference{
+			{
+				Namespace:  matchingCluster.Namespace,
+				Name:       matchingCluster.Name,
+				Kind:       clusterKind,
+				APIVersion: clusterv1.GroupVersion.String(),
+			},
+		}
+		initObjects := []client.Object{
+			clusterProfile,
+			nonMatchingCluster,
+			matchingCluster,
+		}
+
+		c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(initObjects...).WithObjects(initObjects...).Build()
+
+		clusterProfileScope, err := scope.NewProfileScope(scope.ProfileScopeParams{
+			Client:         c,
+			Logger:         logger,
+			Profile:        clusterProfile,
+			ControllerName: testControllerNameProfile,
+		})
+		Expect(err).To(BeNil())
+
+		err = controllers.UpdateClusterSummaries(context.TODO(), c, clusterProfileScope)
+		Expect(err).To(BeNil())
+
+		clusterSummaryList := &configv1beta1.ClusterSummaryList{}
+		Expect(c.List(context.TODO(), clusterSummaryList)).To(BeNil())
+		Expect(len(clusterSummaryList.Items)).To(Equal(1))
+		Expect(clusterSummaryList.Items[0].Spec.ClusterName).To(Equal(matchingCluster.Name))
+		Expect(clusterSummaryList.Items[0].Spec.ClusterNamespace).To(Equal(matchingCluster.Namespace))
+	})
+
+	It("updateClusterSummaries updates existing ClusterSummary for each matching CAPI Cluster", func() {
+		initialized := true
+		matchingCluster.Status.Initialization.ControlPlaneInitialized = &initialized
+
+		clusterProfile.Status.MatchingClusterRefs = []corev1.ObjectReference{
+			{
+				Namespace:  matchingCluster.Namespace,
+				Name:       matchingCluster.Name,
+				Kind:       clusterKind,
+				APIVersion: clusterv1.GroupVersion.String(),
+			},
+		}
+		clusterProfile.Spec.PolicyRefs = []configv1beta1.PolicyRef{
+			{
+				Kind:      string(libsveltosv1beta1.ConfigMapReferencedResourceKind),
+				Namespace: "x-" + randomString(),
+				Name:      "y-" + randomString(),
+			},
+		}
+		clusterProfile.Spec.SyncMode = configv1beta1.SyncModeContinuous
+
+		clusterSummaryName := clusterops.GetClusterSummaryName(configv1beta1.ClusterProfileKind,
+			clusterProfile.Name, matchingCluster.Name, false)
+		clusterSummary := &configv1beta1.ClusterSummary{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      clusterSummaryName,
+				Namespace: matchingCluster.Namespace,
+			},
+			Spec: configv1beta1.ClusterSummarySpec{
+				ClusterNamespace: matchingCluster.Namespace,
+				ClusterName:      matchingCluster.Name,
+				ClusterType:      libsveltosv1beta1.ClusterTypeCapi,
+				ClusterProfileSpec: configv1beta1.Spec{
+					SyncMode: configv1beta1.SyncModeContinuous,
+					PolicyRefs: []configv1beta1.PolicyRef{
+						{
+							Kind:      string(libsveltosv1beta1.ConfigMapReferencedResourceKind),
+							Namespace: randomString(),
+							Name:      randomString(),
+						},
+					},
+				},
+			},
+		}
+		addLabelsToClusterSummary(clusterSummary, clusterProfile.Name, matchingCluster.Name, libsveltosv1beta1.ClusterTypeCapi)
+
+		initObjects := []client.Object{
+			clusterProfile,
+			nonMatchingCluster,
+			matchingCluster,
+			clusterSummary,
+		}
+
+		c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(initObjects...).WithObjects(initObjects...).Build()
+
+		clusterProfileScope, err := scope.NewProfileScope(scope.ProfileScopeParams{
+			Client:         c,
+			Logger:         logger,
+			Profile:        clusterProfile,
+			ControllerName: testControllerNameProfile,
+		})
+		Expect(err).To(BeNil())
+
+		err = controllers.UpdateClusterSummaries(context.TODO(), c, clusterProfileScope)
+		Expect(err).To(BeNil())
+
+		clusterSummaryList := &configv1beta1.ClusterSummaryList{}
+		Expect(c.List(context.TODO(), clusterSummaryList)).To(BeNil())
+		Expect(len(clusterSummaryList.Items)).To(Equal(1))
+		Expect(clusterSummaryList.Items[0].Spec.ClusterName).To(Equal(matchingCluster.Name))
+		Expect(clusterSummaryList.Items[0].Spec.ClusterNamespace).To(Equal(matchingCluster.Namespace))
+		Expect(reflect.DeepEqual(clusterSummaryList.Items[0].Spec.ClusterProfileSpec, clusterProfile.Spec)).To(BeTrue())
+	})
+
+	It("updateClusterReports creates ClusterReport for matching cluster in DryRun mode", func() {
+		clusterProfile.Spec.SyncMode = configv1beta1.SyncModeDryRun
+		clusterProfile.Status.MatchingClusterRefs = []corev1.ObjectReference{
+			{
+				Namespace:  matchingCluster.Namespace,
+				Name:       matchingCluster.Name,
+				Kind:       clusterKind,
+				APIVersion: clusterv1.GroupVersion.String(),
+			},
+		}
+		initObjects := []client.Object{
+			clusterProfile,
+			nonMatchingCluster,
+			matchingCluster,
+		}
+
+		c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(initObjects...).WithObjects(initObjects...).Build()
+
+		clusterProfileScope, err := scope.NewProfileScope(scope.ProfileScopeParams{
+			Client:         c,
+			Logger:         logger,
+			Profile:        clusterProfile,
+			ControllerName: testControllerNameProfile,
+		})
+		Expect(err).To(BeNil())
+
+		Expect(controllers.UpdateClusterReports(context.TODO(), c, clusterProfileScope)).To(Succeed())
+
+		// ClusterReport for matching cluster is created
+		currentClusterReportList := &configv1beta1.ClusterReportList{}
+		listOptions := []client.ListOption{
+			client.MatchingLabels{
+				clusterops.ClusterProfileLabelName: clusterProfile.Name,
+			},
+		}
+		err = c.List(context.TODO(), currentClusterReportList, listOptions...)
+		Expect(err).To(BeNil())
+		// No other ClusterReports are created
+		Expect(len(currentClusterReportList.Items)).To(Equal(1))
+	})
+
+	It("updateClusterReports does not create ClusterReport for matching cluster in non dryRun mode", func() {
+		clusterProfile.Spec.SyncMode = configv1beta1.SyncModeContinuous
+		clusterProfile.Status.MatchingClusterRefs = []corev1.ObjectReference{
+			{
+				Namespace:  matchingCluster.Namespace,
+				Name:       matchingCluster.Name,
+				Kind:       clusterKind,
+				APIVersion: clusterv1.GroupVersion.String(),
+			},
+		}
+		initObjects := []client.Object{
+			clusterProfile,
+			nonMatchingCluster,
+			matchingCluster,
+		}
+
+		c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(initObjects...).WithObjects(initObjects...).Build()
+
+		clusterProfileScope, err := scope.NewProfileScope(scope.ProfileScopeParams{
+			Client:         c,
+			Logger:         logger,
+			Profile:        clusterProfile,
+			ControllerName: testControllerNameProfile,
+		})
+		Expect(err).To(BeNil())
+
+		Expect(controllers.UpdateClusterReports(context.TODO(), c, clusterProfileScope)).To(Succeed())
+
+		// No ClusterReports are created
+		currentClusterReportList := &configv1beta1.ClusterReportList{}
+		Expect(c.List(context.TODO(), currentClusterReportList)).To(Succeed())
+		Expect(len(currentClusterReportList.Items)).To(Equal(0))
+	})
+
+	It("cleanClusterReports removes all ClusterReports created for a ClusterProfile instance", func() {
+		clusterReport1 := &configv1beta1.ClusterReport{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: matchingCluster.Namespace,
+				Name:      randomString(),
+				Labels: map[string]string{
+					clusterops.ClusterProfileLabelName: clusterProfile.Name,
+				},
+			},
+		}
+
+		clusterReport2 := &configv1beta1.ClusterReport{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: matchingCluster.Namespace,
+				Name:      randomString(),
+				Labels: map[string]string{
+					clusterops.ClusterProfileLabelName: clusterProfile.Name + randomString(),
+				},
+			},
+		}
+
+		initObjects := []client.Object{
+			clusterReport1,
+			clusterReport2,
+		}
+
+		c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(initObjects...).WithObjects(initObjects...).Build()
+
+		clusterProfileScope, err := scope.NewProfileScope(scope.ProfileScopeParams{
+			Client:         c,
+			Logger:         logger,
+			Profile:        clusterProfile,
+			ControllerName: testControllerNameProfile,
+		})
+		Expect(err).To(BeNil())
+
+		Expect(controllers.CleanClusterReports(context.TODO(), c, clusterProfileScope)).To(Succeed())
+		// ClusterReport1 is gone
+		currentClusterReport := &configv1beta1.ClusterReport{}
+		err = c.Get(context.TODO(),
+			types.NamespacedName{Namespace: clusterReport1.Namespace, Name: clusterReport1.Name}, currentClusterReport)
+		Expect(err).ToNot(BeNil())
+		Expect(apierrors.IsNotFound(err)).To(BeTrue())
+
+		// ClusterReport2 is still present
+		err = c.Get(context.TODO(),
+			types.NamespacedName{Namespace: clusterReport2.Namespace, Name: clusterReport2.Name}, currentClusterReport)
+		Expect(err).To(BeNil())
+	})
+
+	It("cleanClusterReports removes all ClusterReports instances created for a Profile instance", func() {
+		profile := configv1beta1.Profile{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: randomString(),
+				Name:      randomString(),
+			},
+		}
+		Expect(addTypeInformationToObject(scheme, &profile)).To(Succeed())
+
+		clusterReport1 := &configv1beta1.ClusterReport{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: profile.Namespace,
+				Name:      randomString(),
+				Labels: map[string]string{
+					clusterops.ProfileLabelName: profile.Name,
+				},
+				OwnerReferences: []metav1.OwnerReference{
+					{
+						Name:       profile.Name,
+						Kind:       configv1beta1.ProfileKind,
+						APIVersion: configv1beta1.GroupVersion.String(),
+					},
+				},
+			},
+		}
+
+		clusterReport2 := &configv1beta1.ClusterReport{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: randomString(),
+				Name:      randomString(),
+				Labels: map[string]string{
+					clusterops.ProfileLabelName: profile.Name,
+				},
+				OwnerReferences: []metav1.OwnerReference{
+					{
+						Name:       profile.Name,
+						Kind:       configv1beta1.ProfileKind,
+						APIVersion: configv1beta1.GroupVersion.String(),
+					},
+				},
+			},
+		}
+
+		clusterReport3 := &configv1beta1.ClusterReport{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: randomString(),
+				Name:      randomString(),
+				Labels: map[string]string{
+					clusterops.ClusterProfileLabelName: profile.Name,
+				},
+				OwnerReferences: []metav1.OwnerReference{
+					{
+						Name:       profile.Name,
+						Kind:       configv1beta1.ClusterProfileKind,
+						APIVersion: configv1beta1.GroupVersion.String(),
+					},
+				},
+			},
+		}
+
+		initObjects := []client.Object{
+			clusterReport1,
+			clusterReport2,
+			clusterReport3,
+		}
+
+		c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(initObjects...).WithObjects(initObjects...).Build()
+
+		profileScope, err := scope.NewProfileScope(scope.ProfileScopeParams{
+			Client:         c,
+			Logger:         logger,
+			Profile:        &profile,
+			ControllerName: testControllerNameProfileShort,
+		})
+		Expect(err).To(BeNil())
+
+		Expect(controllers.CleanClusterReports(context.TODO(), c, profileScope)).To(Succeed())
+		// ClusterReport1 is gone
+		currentClusterReport := &configv1beta1.ClusterReport{}
+		err = c.Get(context.TODO(),
+			types.NamespacedName{Namespace: clusterReport1.Namespace, Name: clusterReport1.Name}, currentClusterReport)
+		Expect(err).ToNot(BeNil())
+		Expect(apierrors.IsNotFound(err)).To(BeTrue())
+
+		// ClusterReport2 is still present
+		err = c.Get(context.TODO(),
+			types.NamespacedName{Namespace: clusterReport2.Namespace, Name: clusterReport2.Name}, currentClusterReport)
+		Expect(err).To(BeNil())
+
+		// ClusterReport3 is still present
+		err = c.Get(context.TODO(),
+			types.NamespacedName{Namespace: clusterReport3.Namespace, Name: clusterReport3.Name}, currentClusterReport)
+		Expect(err).To(BeNil())
+	})
+
+	It("cleanClusterSummaries removes all ClusterSummary instances created for a Profile instance", func() {
+		profile := configv1beta1.Profile{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: randomString(),
+				Name:      randomString(),
+			},
+		}
+		Expect(addTypeInformationToObject(scheme, &profile)).To(Succeed())
+
+		clusterSummary1 := &configv1beta1.ClusterSummary{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: profile.Namespace,
+				Name:      randomString(),
+				Labels: map[string]string{
+					clusterops.ProfileLabelName: profile.Name,
+				},
+				OwnerReferences: []metav1.OwnerReference{
+					{
+						Name:       profile.Name,
+						Kind:       configv1beta1.ProfileKind,
+						APIVersion: configv1beta1.GroupVersion.String(),
+					},
+				},
+			},
+		}
+
+		// clusterSummary2 is created by a Profile in a different namespace with same name as Profile
+		clusterSummary2 := &configv1beta1.ClusterSummary{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: randomString(),
+				Name:      randomString(),
+				Labels: map[string]string{
+					clusterops.ProfileLabelName: profile.Name,
+				},
+				OwnerReferences: []metav1.OwnerReference{
+					{
+						Name:       profile.Name,
+						Kind:       configv1beta1.ProfileKind,
+						APIVersion: configv1beta1.GroupVersion.String(),
+					},
+				},
+			},
+		}
+
+		// clusterSummary3 is created by a ClusterProfile with same name as Profile
+		clusterSummary3 := &configv1beta1.ClusterSummary{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: randomString(),
+				Name:      randomString(),
+				Labels: map[string]string{
+					clusterops.ClusterProfileLabelName: profile.Name,
+				},
+				OwnerReferences: []metav1.OwnerReference{
+					{
+						Name:       profile.Name,
+						Kind:       configv1beta1.ClusterProfileKind,
+						APIVersion: configv1beta1.GroupVersion.String(),
+					},
+				},
+			},
+		}
+
+		initObjects := []client.Object{
+			clusterSummary1,
+			clusterSummary2,
+			clusterSummary3,
+		}
+
+		c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(initObjects...).WithObjects(initObjects...).Build()
+
+		profileScope, err := scope.NewProfileScope(scope.ProfileScopeParams{
+			Client:         c,
+			Logger:         logger,
+			Profile:        &profile,
+			ControllerName: testControllerNameProfileShort,
+		})
+		Expect(err).To(BeNil())
+
+		err = controllers.CleanClusterSummaries(context.TODO(), c, profileScope)
+		Expect(err).ToNot(BeNil())
+		Expect(err.Error()).To(Equal("clusterSummaries still present"))
+
+		// ClusterSummary1 is gone
+		currentClusterSummary := &configv1beta1.ClusterSummary{}
+		err = c.Get(context.TODO(),
+			types.NamespacedName{Namespace: clusterSummary1.Namespace, Name: clusterSummary1.Name},
+			currentClusterSummary)
+		Expect(err).ToNot(BeNil())
+		Expect(apierrors.IsNotFound(err)).To(BeTrue())
+
+		// ClusterSummary2 is still present as in different namespace
+		err = c.Get(context.TODO(),
+			types.NamespacedName{Namespace: clusterSummary2.Namespace, Name: clusterSummary2.Name},
+			currentClusterSummary)
+		Expect(err).To(BeNil())
+
+		// ClusterSummary3 is still present as created by ClusterProfile
+		err = c.Get(context.TODO(),
+			types.NamespacedName{Namespace: clusterSummary3.Namespace, Name: clusterSummary3.Name},
+			currentClusterSummary)
+		Expect(err).To(BeNil())
+	})
+
+	It("getMaxUpdate returns max value of clusters that can be updated (fixed)", func() {
+		const maxUpdate = int32(10)
+		clusterProfile.Spec.MaxUpdate = &intstr.IntOrString{Type: intstr.Int, IntVal: maxUpdate}
+
+		c := fake.NewClientBuilder().WithScheme(scheme).Build()
+
+		clusterProfileScope, err := scope.NewProfileScope(scope.ProfileScopeParams{
+			Client:         c,
+			Logger:         logger,
+			Profile:        clusterProfile,
+			ControllerName: testControllerNameProfile,
+		})
+		Expect(err).To(BeNil())
+
+		Expect(controllers.GetMaxUpdate(clusterProfileScope)).To(Equal(maxUpdate))
+	})
+
+	It("getMaxUpdate returns max value of clusters that can be updated (percentage)", func() {
+		const maxUpdate = 50
+		clusterProfile.Spec.MaxUpdate = &intstr.IntOrString{Type: intstr.String, StrVal: fmt.Sprintf("%d%%", maxUpdate)}
+		clusterProfile.Status.MatchingClusterRefs = []corev1.ObjectReference{
+			{Namespace: randomString(), Name: randomString(), Kind: libsveltosv1beta1.SveltosClusterKind},
+			{Namespace: randomString(), Name: randomString(), Kind: libsveltosv1beta1.SveltosClusterKind},
+			{Namespace: randomString(), Name: randomString(), Kind: libsveltosv1beta1.SveltosClusterKind},
+			{Namespace: randomString(), Name: randomString(), Kind: libsveltosv1beta1.SveltosClusterKind},
+		}
+
+		c := fake.NewClientBuilder().WithScheme(scheme).Build()
+
+		clusterProfileScope, err := scope.NewProfileScope(scope.ProfileScopeParams{
+			Client:         c,
+			Logger:         logger,
+			Profile:        clusterProfile,
+			ControllerName: testControllerNameProfile,
+		})
+		Expect(err).To(BeNil())
+
+		Expect(controllers.GetMaxUpdate(clusterProfileScope)).To(Equal(int32(2)))
+	})
+
+	It("getMaxUpdate returns max value of clusters that can be updated (percentage)", func() {
+		const maxUpdate = 30
+		clusterProfile.Spec.MaxUpdate = &intstr.IntOrString{Type: intstr.String, StrVal: fmt.Sprintf("%d%%", maxUpdate)}
+		clusterProfile.Status.MatchingClusterRefs = []corev1.ObjectReference{
+			{Namespace: randomString(), Name: randomString(), Kind: libsveltosv1beta1.SveltosClusterKind},
+			{Namespace: randomString(), Name: randomString(), Kind: libsveltosv1beta1.SveltosClusterKind},
+		}
+
+		c := fake.NewClientBuilder().WithScheme(scheme).Build()
+
+		clusterProfileScope, err := scope.NewProfileScope(scope.ProfileScopeParams{
+			Client:         c,
+			Logger:         logger,
+			Profile:        clusterProfile,
+			ControllerName: testControllerNameProfile,
+		})
+		Expect(err).To(BeNil())
+
+		Expect(controllers.GetMaxUpdate(clusterProfileScope)).To(Equal(int32(1)))
+	})
+
+	It("reviseUpdatedAndUpdatingClusters removes non matching clusters from ClusterProfile Updated/Updating Clusters",
+		func() {
+			cluster1 := types.NamespacedName{Namespace: randomString(), Name: randomString()}
+			cluster2 := types.NamespacedName{Namespace: randomString(), Name: randomString()}
+			clusterProfile.Status.MatchingClusterRefs = []corev1.ObjectReference{
+				{
+					Namespace: cluster1.Namespace, Name: cluster1.Name,
+					Kind: libsveltosv1beta1.SveltosClusterKind, APIVersion: libsveltosv1beta1.GroupVersion.String(),
+				},
+				{
+					Namespace: cluster2.Namespace, Name: cluster2.Name,
+					Kind: libsveltosv1beta1.SveltosClusterKind, APIVersion: libsveltosv1beta1.GroupVersion.String(),
+				},
+				{
+					Namespace: randomString(), Name: randomString(),
+					Kind: libsveltosv1beta1.SveltosClusterKind, APIVersion: libsveltosv1beta1.GroupVersion.String(),
+				},
+			}
+			clusterProfile.Status.UpdatedClusters = configv1beta1.Clusters{
+				Hash: []byte(randomString()),
+				Clusters: []corev1.ObjectReference{
+					{
+						Namespace: cluster1.Namespace, Name: cluster1.Name,
+						Kind: libsveltosv1beta1.SveltosClusterKind, APIVersion: libsveltosv1beta1.GroupVersion.String(),
+					},
+					{
+						Namespace: randomString(), Name: randomString(),
+						Kind: libsveltosv1beta1.SveltosClusterKind, APIVersion: libsveltosv1beta1.GroupVersion.String(),
+					},
+				},
+			}
+			clusterProfile.Status.UpdatingClusters = configv1beta1.Clusters{
+				Hash: []byte(randomString()),
+				Clusters: []corev1.ObjectReference{
+					{
+						Namespace: cluster2.Namespace, Name: cluster2.Name,
+						Kind: libsveltosv1beta1.SveltosClusterKind, APIVersion: libsveltosv1beta1.GroupVersion.String(),
+					},
+					{
+						Namespace: randomString(), Name: randomString(),
+						Kind: libsveltosv1beta1.SveltosClusterKind, APIVersion: libsveltosv1beta1.GroupVersion.String(),
+					},
+				},
+			}
+
+			c := fake.NewClientBuilder().WithScheme(scheme).Build()
+
+			clusterProfileScope, err := scope.NewProfileScope(scope.ProfileScopeParams{
+				Client:         c,
+				Logger:         logger,
+				Profile:        clusterProfile,
+				ControllerName: testControllerNameProfile,
+			})
+			Expect(err).To(BeNil())
+			controllers.ReviseUpdatedAndUpdatingClusters(clusterProfileScope)
+
+			Expect(len(clusterProfile.Status.UpdatedClusters.Clusters)).To(Equal(1))
+			Expect(clusterProfile.Status.UpdatedClusters.Clusters).To(ContainElement(corev1.ObjectReference{
+				Namespace: cluster1.Namespace, Name: cluster1.Name,
+				Kind: libsveltosv1beta1.SveltosClusterKind, APIVersion: libsveltosv1beta1.GroupVersion.String(),
+			}))
+
+			Expect(len(clusterProfile.Status.UpdatingClusters.Clusters)).To(Equal(1))
+			Expect(clusterProfile.Status.UpdatingClusters.Clusters).To(ContainElement(corev1.ObjectReference{
+				Namespace: cluster2.Namespace, Name: cluster2.Name,
+				Kind: libsveltosv1beta1.SveltosClusterKind, APIVersion: libsveltosv1beta1.GroupVersion.String(),
+			}))
+		})
+
+	It("getUpdatedAndUpdatingClusters returns list of clusters already updated and being updated", func() {
+		cluster1 := types.NamespacedName{Namespace: randomString(), Name: randomString()}
+		cluster2 := types.NamespacedName{Namespace: randomString(), Name: randomString()}
+
+		clusterProfile.Status.UpdatedClusters = configv1beta1.Clusters{
+			Hash: []byte(randomString()),
+			Clusters: []corev1.ObjectReference{
+				{
+					Namespace: cluster1.Namespace, Name: cluster1.Name,
+					Kind: libsveltosv1beta1.SveltosClusterKind, APIVersion: libsveltosv1beta1.GroupVersion.String(),
+				},
+			},
+		}
+		clusterProfile.Status.UpdatingClusters = configv1beta1.Clusters{
+			Hash: []byte(randomString()),
+			Clusters: []corev1.ObjectReference{
+				{
+					Namespace: cluster2.Namespace, Name: cluster2.Name,
+					Kind: libsveltosv1beta1.SveltosClusterKind, APIVersion: libsveltosv1beta1.GroupVersion.String(),
+				},
+			},
+		}
+
+		c := fake.NewClientBuilder().WithScheme(scheme).Build()
+
+		clusterProfileScope, err := scope.NewProfileScope(scope.ProfileScopeParams{
+			Client:         c,
+			Logger:         logger,
+			Profile:        clusterProfile,
+			ControllerName: testControllerNameProfile,
+		})
+		Expect(err).To(BeNil())
+
+		// Not all Features are marked as provisioned
+		updated, updating := controllers.GetUpdatedAndUpdatingClusters(clusterProfileScope)
+		Expect(updated.Len()).To(Equal(1))
+		Expect(updated.Has(&clusterProfile.Status.UpdatedClusters.Clusters[0])).To(BeTrue())
+
+		Expect(updating.Len()).To(Equal(1))
+		Expect(updating.Has(&clusterProfile.Status.UpdatingClusters.Clusters[0])).To(BeTrue())
+	})
+
+	It("updateClusterSummaries respects MaxUpdate field", func() {
+		cluster1 := corev1.ObjectReference{
+			Namespace:  randomString(),
+			Name:       randomString(),
+			Kind:       libsveltosv1beta1.SveltosClusterKind,
+			APIVersion: libsveltosv1beta1.GroupVersion.String(),
+		}
+		sveltosCluster1 := libsveltosv1beta1.SveltosCluster{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: cluster1.Namespace,
+				Name:      cluster1.Name,
+			},
+			Status: libsveltosv1beta1.SveltosClusterStatus{
+				Ready: true,
+			},
+		}
+
+		cluster2 := corev1.ObjectReference{
+			Namespace:  randomString(),
+			Name:       randomString(),
+			Kind:       libsveltosv1beta1.SveltosClusterKind,
+			APIVersion: libsveltosv1beta1.GroupVersion.String(),
+		}
+		sveltosCluster2 := libsveltosv1beta1.SveltosCluster{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: cluster2.Namespace,
+				Name:      cluster2.Name,
+			},
+			Status: libsveltosv1beta1.SveltosClusterStatus{
+				Ready: true,
+			},
+		}
+
+		clusterProfile.Status.MatchingClusterRefs = []corev1.ObjectReference{
+			cluster1, cluster2,
+		}
+
+		clusterProfile.Spec.MaxUpdate = &intstr.IntOrString{Type: intstr.Int, IntVal: 1}
+
+		initObjects := []client.Object{
+			clusterProfile,
+			&sveltosCluster1,
+			&sveltosCluster2,
+		}
+		c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(initObjects...).WithObjects(initObjects...).Build()
+
+		clusterProfileScope, err := scope.NewProfileScope(scope.ProfileScopeParams{
+			Client:         c,
+			Logger:         logger,
+			Profile:        clusterProfile,
+			ControllerName: testControllerNameProfile,
+		})
+		Expect(err).To(BeNil())
+
+		// Reports an error that not all clusters are being updated due to MaxUpdate policy
+		Expect(controllers.UpdateClusterSummaries(context.TODO(), c, clusterProfileScope)).ToNot(BeNil())
+
+		// Since MaxUpdate is set to 1 expect only one clusterSummary is created
+		clusterSummaries := &configv1beta1.ClusterSummaryList{}
+		Expect(c.List(context.TODO(), clusterSummaries)).To(Succeed())
+		Expect(len(clusterSummaries.Items)).To(Equal(1))
+
+		// Reset MaxUpdate to 2
+		clusterProfile.Spec.MaxUpdate = &intstr.IntOrString{Type: intstr.Int, IntVal: 2}
+		Expect(c.Update(context.TODO(), clusterProfile)).To(Succeed())
+		Expect(addTypeInformationToObject(scheme, clusterProfile)).To(Succeed())
+
+		Expect(controllers.UpdateClusterSummaries(context.TODO(), c, clusterProfileScope)).To(BeNil())
+
+		// Since MaxUpdate is set to 2 expect two clusterSummaries are created
+		Expect(c.List(context.TODO(), clusterSummaries)).To(Succeed())
+		Expect(len(clusterSummaries.Items)).To(Equal(2))
+	})
+
+	It("reviseUpdatingClusterList drops cluster whose ClusterSummary was deleted out of band", func() {
+		currentHash := []byte(randomString())
+
+		cluster := corev1.ObjectReference{
+			Namespace:  randomString(),
+			Name:       randomString(),
+			Kind:       libsveltosv1beta1.SveltosClusterKind,
+			APIVersion: libsveltosv1beta1.GroupVersion.String(),
+		}
+
+		// UpdatingClusters.Hash matches currentHash so the function proceeds past the early return.
+		// The cluster is listed in UpdatingClusters but has no corresponding ClusterSummary.
+		clusterProfile.Status.UpdatingClusters = configv1beta1.Clusters{
+			Hash:     currentHash,
+			Clusters: []corev1.ObjectReference{cluster},
+		}
+
+		// No ClusterSummary objects exist — simulates an out-of-band deletion.
+		c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(clusterProfile).Build()
+
+		clusterProfileScope, err := scope.NewProfileScope(scope.ProfileScopeParams{
+			Client:         c,
+			Logger:         logger,
+			Profile:        clusterProfile,
+			ControllerName: testControllerNameProfile,
+		})
+		Expect(err).To(BeNil())
+
+		// Must return an error to force a requeue so the main loop recreates the missing ClusterSummary.
+		Expect(controllers.ReviseUpdatingClusterList(context.TODO(), c, clusterProfileScope, currentHash)).ToNot(Succeed())
+
+		// The cluster must have been dropped from UpdatingClusters so the main loop recreates its ClusterSummary.
+		Expect(clusterProfile.Status.UpdatingClusters.Clusters).To(BeEmpty())
+	})
+
+	It("reviseUpdatingClusterList drops a paused cluster from UpdatingClusters when MaxUpdate is set", func() {
+		currentHash := []byte(randomString())
+
+		sveltosCluster := &libsveltosv1beta1.SveltosCluster{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: randomString(),
+				Name:      randomString(),
+			},
+			Spec: libsveltosv1beta1.SveltosClusterSpec{
+				Paused: true,
+			},
+		}
+
+		cluster := corev1.ObjectReference{
+			Namespace:  sveltosCluster.Namespace,
+			Name:       sveltosCluster.Name,
+			Kind:       libsveltosv1beta1.SveltosClusterKind,
+			APIVersion: libsveltosv1beta1.GroupVersion.String(),
+		}
+
+		// ClusterSummary of the paused cluster is not provisioned (helm chart requested but no
+		// FeatureSummary reported) and, being paused, will never be
+		clusterSummary := &configv1beta1.ClusterSummary{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      clusterops.GetClusterSummaryName(configv1beta1.ClusterProfileKind, clusterProfile.Name, cluster.Name, false),
+				Namespace: cluster.Namespace,
+			},
+			Spec: configv1beta1.ClusterSummarySpec{
+				ClusterNamespace: cluster.Namespace,
+				ClusterName:      cluster.Name,
+				ClusterType:      libsveltosv1beta1.ClusterTypeSveltos,
+				ClusterProfileSpec: configv1beta1.Spec{
+					HelmCharts: []configv1beta1.HelmChart{
+						{RepositoryURL: randomString(), ChartName: randomString(), ChartVersion: randomString(),
+							ReleaseName: randomString(), ReleaseNamespace: randomString()},
+					},
+				},
+			},
+		}
+		addLabelsToClusterSummary(clusterSummary, clusterProfile.Name, cluster.Name, libsveltosv1beta1.ClusterTypeSveltos)
+
+		clusterProfile.Spec.MaxUpdate = &intstr.IntOrString{Type: intstr.Int, IntVal: 1}
+		clusterProfile.Status.UpdatingClusters = configv1beta1.Clusters{
+			Hash:     currentHash,
+			Clusters: []corev1.ObjectReference{cluster},
+		}
+
+		c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(clusterProfile, sveltosCluster, clusterSummary).Build()
+
+		clusterProfileScope, err := scope.NewProfileScope(scope.ProfileScopeParams{
+			Client:         c,
+			Logger:         logger,
+			Profile:        clusterProfile,
+			ControllerName: testControllerNameProfile,
+		})
+		Expect(err).To(BeNil())
+
+		Expect(controllers.ReviseUpdatingClusterList(context.TODO(), c, clusterProfileScope, currentHash)).To(Succeed())
+
+		// The paused cluster must not hold a MaxUpdate slot, nor be reported as updated
+		Expect(clusterProfile.Status.UpdatingClusters.Clusters).To(BeEmpty())
+		Expect(clusterProfile.Status.UpdatedClusters.Clusters).To(BeEmpty())
+
+		// Without MaxUpdate the cluster is left in UpdatingClusters
+		clusterProfile.Spec.MaxUpdate = nil
+		clusterProfile.Status.UpdatingClusters.Clusters = []corev1.ObjectReference{cluster}
+		Expect(controllers.ReviseUpdatingClusterList(context.TODO(), c, clusterProfileScope, currentHash)).To(Succeed())
+		Expect(clusterProfile.Status.UpdatingClusters.Clusters).To(HaveLen(1))
+	})
+})

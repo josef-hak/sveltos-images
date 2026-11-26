@@ -1,0 +1,5 @@
+upstream: https://github.com/projectsveltos/addon-controller
+tag: v1.17.0
+commit: c537e2354f1c9235e813d5dad7039ee46c84148e
+vendored: 2026-11-26T11:49:13Z
+pruned: .git doc/
