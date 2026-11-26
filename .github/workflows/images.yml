@@ -1,0 +1,57 @@
+# Build every vendored component and push it to this repository's GHCR
+# namespace. The job token already carries packages:write, so no PAT is
+# involved -- which is also why this, rather than a laptop, is where the
+# published images should come from.
+name: images
+
+on:
+  push:
+    branches: [main]
+    paths: ['src/**', 'VERSION', 'components.env', 'scripts/**', '.github/workflows/images.yml']
+  workflow_dispatch:
+    inputs:
+      components:
+        description: 'Components to build (space separated, empty = all)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      components: ${{ steps.list.outputs.components }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: list
+        # One job per component: they are independent, and a single job would
+        # spend half an hour compiling eleven Go trees in series.
+        run: |
+          want='${{ inputs.components }}'
+          all=$(grep -v '^#' components.env | grep . | cut -d'|' -f1)
+          [ -n "$want" ] && all="$want"
+          echo "components=$(printf '%s\n' $all | jq -Rsc 'split("\n") | map(select(. != ""))')" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: matrix
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        component: ${{ fromJson(needs.matrix.outputs.components) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push
+        env:
+          REGISTRY: ghcr.io/${{ github.repository_owner }}/projectsveltos
+        run: |
+          bash scripts/build.sh '${{ matrix.component }}'
+          bash scripts/push.sh '${{ matrix.component }}'
